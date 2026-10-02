@@ -2,12 +2,13 @@
 
 A SYCL fast path for **MiniMax H3** (text/image -> video + audio) on an **Intel Arc Pro B70 (32 GB, Xe2)**.
 
-Status: **assessment only** (2026-10-02). No engine code yet. The running PyTorch pipeline is the
+Status: **Phase 0 measured** (2026-10-02, docs/PHASE0-RESULTS.md). No engine code yet. The running PyTorch pipeline is the
 reference everything here is measured against.
 
 | document | what it covers |
 |---|---|
 | [docs/ASSESSMENT.md](docs/ASSESSMENT.md) | What it would take, in which order, what each step should buy, and where to stop |
+| [docs/PHASE0-RESULTS.md](docs/PHASE0-RESULTS.md) | The first measurements on the card: int8 vs float multiply, the first-step split, the first quality pair |
 | [docs/BASELINE.md](docs/BASELINE.md) | Today's measured numbers: stage times, the step-time model, where the time goes |
 | [docs/LESSONS-FROM-STRATA.md](docs/LESSONS-FROM-STRATA.md) | What the Strata CUDA->SYCL port taught us that applies here |
 | [bench/README.md](bench/README.md) | The comparison harness to build first |

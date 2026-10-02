@@ -1,5 +1,10 @@
 # What it would take to give MiniMax H3 a SYCL engine on the B70
 
+> **Phase 0 has run (docs/PHASE0-RESULTS.md) and changes this document's conclusions.** int8 on the matrix engine
+> is 1.8-2.0x for the linear layers but gives nothing for attention, and attention is already within 1.2x of what
+> a perfect dense kernel could do. The realistic gain is ~1.3x per clip, most of it from removing per-clip
+> overhead rather than from kernels. The sections below are the plan as written before those measurements.
+
 2026-10-02. Based on the measured baseline (BASELINE.md) and on what the Strata port taught us
 (LESSONS-FROM-STRATA.md).
 

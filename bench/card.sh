@@ -13,10 +13,15 @@ card_take() {
   PREV=$(rpc llm.mode '{}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["mode"])' 2>/dev/null || echo none)
   echo "$PREV" > /mnt/2TBSSD/minimaxh3/sycl-exp/.prev-mode
   rpc llm.mode '{"mode":"none"}' >/dev/null
-  for i in $(seq 1 80); do
+  # wait until the card is really empty - never start beside another model (the xe driver has no out-of-memory: a
+  # second model evicts VRAM into host RAM and hangs the box). No timeout: a front end that is mid-start finishes
+  # the start first and only then honours "none".
+  while true; do
     u=$(python3 -c 'import json; print(json.load(open("/run/gpustat.json"))["vram_used_mb"])' 2>/dev/null || echo 99999)
     s=$(pgrep -fc "server(_intel)?[.]py --engine" || true)
-    [ "$u" -lt 2000 ] && [ "${s:-0}" = 0 ] && break; sleep 3
+    c=$(docker ps --format '{{.Names}}' | grep -c 'strata-sycl\|vllm\|h3gen' || true)
+    [ "$u" -lt 2000 ] && [ "${s:-0}" = 0 ] && [ "${c:-0}" = 0 ] && break
+    sleep 5
   done
 }
 card_release() {
