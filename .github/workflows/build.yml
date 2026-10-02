@@ -1,6 +1,6 @@
 # Build everything in the project's own container, test it, and publish.
 #
-#   every push and pull request   build image -> ./build.sh -> ./build.sh test -> the dist/ tarball as a workflow artifact
+#   every push (any branch) and pull request   build image -> ./build.sh -> ./build.sh test -> tarball artifact
 #   pushes to main                also publish the build image to the GitHub container registry
 #   tags v<VERSION>               also publish a GitHub release with the tarball (e.g. v26.1002.001)
 #
@@ -10,7 +10,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -73,7 +73,7 @@ jobs:
             ${{ env.PKG }}.sha256
 
       - name: Publish the build image
-        if: github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: |
           podman tag h3-build "$IMAGE_REF:$IMAGE_TAG"
           podman push "$IMAGE_REF:$IMAGE_TAG"
