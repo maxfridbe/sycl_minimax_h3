@@ -79,7 +79,7 @@ struct Ctx {
     dnnl::stream strm;
     int8_t* xq = nullptr; size_t xq_cap = 0;       // quantized activations [M, K]
     float* rs = nullptr; size_t rs_cap = 0;        // per-row scale times the scalar weight scale [M]
-    float* gmax = nullptr; size_t gmax_cap = 0;    // per-(row, group) absmax
+    float* gmax = nullptr; size_t gmax_cap = 0;    // per (row, lane) partial absmax of the row-scale pass
     float* xr = nullptr; size_t xr_cap = 0;        // rotated activations [M, K], float32 (see pass 1)
     int32_t* acc = nullptr; size_t acc_cap = 0;    // fallback path: one chunk of int32 products [C, N]
     float* inv = nullptr; size_t inv_cap = 0;      // 1 / rms per row (norms)
@@ -105,6 +105,11 @@ struct Ctx {
     float sdpa_scale = 0.0f;                       // 1 / sqrt(D): a host scalar oneDNN reads when the kernel runs
     bool sdpa_ok = true;                           // false once oneDNN has refused the fused form
     size_t attn_table_bytes = 1536ull << 20;       // the most score-table memory a chunk of attention may take
+    // query rows per call of the fused kernel (H3S_ATTN_ROWS). At 47k keys: 1024 rows 749 ms a call, 2048 739,
+    // 8192 719, all 47k 707 - and all of them is 2 GiB more of copies; 8192 is the trade.
+    int64_t attn_rows = 8192;
+    double lin_ms[4] = {0, 0, 0, 0};               // H3S_PROFILE: int8 linear time by pass (rotation, scales, quantize, GEMM)
+    int64_t lin_calls = 0;
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Attn> attn;                   // (H, rows, S, D)
     void* had[3] = {nullptr, nullptr, nullptr};    // the normalized 256 x 256 Hadamard matrix per Dt
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int, int>, dnnl::matmul> gemm;   // (M, K, N, out, bias, per_n)
@@ -194,6 +199,7 @@ void init(Ctx& c) {
 #endif
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
+    if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
 
 }  // namespace
@@ -268,6 +274,9 @@ void h3s_destroy(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx);
     if (!c) return;
     c->q.wait();
+    if (c->profile && c->lin_calls)
+        std::fprintf(stderr, "h3sycl: int8 linear, %lld row chunks: rotation %.1f ms, row scales %.1f, quantize %.1f, int8 GEMM %.1f\n",
+                     (long long) c->lin_calls, c->lin_ms[0], c->lin_ms[1], c->lin_ms[2], c->lin_ms[3]);
     for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2],
                     (void*) c->inv, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao, (void*) c->part, (void*) c->rowv})
         if (p) sycl::free(p, c->q);
@@ -287,13 +296,26 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
                             const float* wscale, int64_t n_wscale, const float* bias, void* out, int out_dt, int group) {
     const bool rot = group > 0;
     const int g = rot ? group : 256;
-    const int64_t G = (K + g - 1) / g;
+    // the row-max pass: one value per work-item and a work-group reduction to one max per 256 features, then a
+    // short pass per row over those. At 47k tokens this pass, the rotation before it and the quantize after it take
+    // ~110 ms a block between them, against ~190 for the int8 GEMM: three passes over a float32 copy of the input.
+    constexpr int64_t kWg = 256;
+    const int64_t G = (K + kWg - 1) / kWg;
     int8_t* xq = c.grow(c.xq, c.xq_cap, (size_t) M * K);
     float* rs = c.grow(c.rs, c.rs_cap, (size_t) M);
     float* gmax = c.grow(c.gmax, c.gmax_cap, (size_t) M * G);
     if (!xq || !rs || !gmax) return -1;
     sycl::queue& q = c.q;
     using dnnl::memory;
+    auto clock = std::chrono::steady_clock::now();
+    auto lap = [&](int i) {
+        if (!c.profile) return;
+        q.wait();
+        const auto now = std::chrono::steady_clock::now();
+        c.lin_ms[i] += std::chrono::duration<double, std::milli>(now - clock).count();
+        clock = now;
+    };
+    if (c.profile) { q.wait(); clock = std::chrono::steady_clock::now(); ++c.lin_calls; }
 
     // ---- 1. rotation on the matrix engine
     const void* xs = x;          // what the quantizer reads
@@ -327,21 +349,23 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
                                     {DNNL_ARG_DST, usm(dmd, c.eng, xr)}});
         xs = xr; xs_dt = r_dt;
     }
+    lap(0);
     // ---- 2. row scales
-    q.parallel_for(sycl::range<2>((size_t) M, (size_t) G), [=](sycl::id<2> id) {
-        const size_t r = id[0], gi = id[1];
-        const int n = (int) std::min<int64_t>(g, K - (int64_t) gi * g);
-        float m = 0.0f;
-        for (int i = 0; i < n; ++i) m = sycl::fmax(m, sycl::fabs(load(xs, xs_dt, r * K + gi * g + i)));
-        gmax[r * G + gi] = m;
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) M, (size_t) (G * kWg)), sycl::range<2>(1, (size_t) kWg)),
+                   [=](sycl::nd_item<2> it) {
+        const size_t r = it.get_global_id(0), i = it.get_global_id(1);
+        const float v = i < (size_t) K ? sycl::fabs(load(xs, xs_dt, r * K + i)) : 0.0f;
+        const float m = sycl::reduce_over_group(it.get_group(), v, sycl::maximum<float>());
+        if (it.get_local_id(1) == 0) gmax[r * G + it.get_group(1)] = m;
     });
     const bool per_n = n_wscale > 1;
     q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) {
         float m = 0.0f;
-        for (int64_t gi = 0; gi < G; ++gi) m = sycl::fmax(m, gmax[r[0] * G + gi]);
+        for (int64_t j = 0; j < G; ++j) m = sycl::fmax(m, gmax[r[0] * G + j]);
         // the row's quantization step; times the scalar weight scale it is the whole rescale factor
         rs[r[0]] = sycl::fmax(m / 127.0f, 1e-30f);
     });
+    lap(1);
     // ---- 3. quantize
     q.parallel_for(sycl::range<2>((size_t) M, (size_t) K), [=](sycl::id<2> id) {
         const size_t i = id[0] * K + id[1];
@@ -352,6 +376,7 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
         (void) ws;
         q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) { rs[r[0]] *= wscale[0]; });
     }
+    lap(2);
     // ---- 4. int8 GEMM with the rescale and the bias as post-ops
     memory::desc smd({M, K}, memory::data_type::s8, memory::format_tag::ab);
     memory::desc wmd({K, N}, memory::data_type::s8, memory::format_tag::ba);     // the [N, K] buffer, read transposed
@@ -378,6 +403,7 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
             if (per_n) args.insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(po_i++) | DNNL_ARG_SRC_1, usm(col_md, c.eng, wscale)});
             if (bias) args.insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(po_i++) | DNNL_ARG_SRC_1, usm(col_md, c.eng, bias)});
             it->second.execute(c.strm, args);
+            lap(3);
             return 0;
         } catch (const dnnl::error& e) {
             std::fprintf(stderr, "h3sycl: oneDNN refused the fused int8 GEMM (%s); using the int32 + rescale path\n", e.what());
@@ -646,8 +672,8 @@ static bool attention_fused(Ctx& c, const void* q, const void* k, const void* v,
     sycl::queue& qu = c.q;
 #ifdef H3S_SDPA_NO_FALLBACK
     // This oneDNN cannot fall back (see init): the fused kernel or an error. So the chunk is sized for speed alone -
-    // measured at 16.5k keys: 174 rows per call 156 ms, 464 rows 99 ms, 1859 rows 89 ms.
-    const int64_t rows_max = std::min<int64_t>(S, 2048);
+    // measured at 16.5k keys: 174 rows per call 156 ms, 464 rows 99 ms, 1859 rows 89 ms (and see attn_rows).
+    const int64_t rows_max = std::min<int64_t>(S, c.attn_rows);
 #else
     // rows per chunk: if oneDNN falls back to separate steps it holds scores and scaled scores in float32 and the
     // weights in half - 10 bytes per score. Keep that under the table budget (1.5 GiB unless H3S_ATTN_TABLE_MB says
