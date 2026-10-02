@@ -38,7 +38,7 @@ The kernels H3 needs, in the order of what they are worth:
 
 | kernel | share of a production step today | what a SYCL version must do | difficulty |
 |---|---|---|---|
-| `int8_attention` (Sage) | 73% | int8 Q.K^T on XMX, fp16 P.V, online softmax, tiled; never an N x N buffer | **hard** - the project's main risk |
+| `int8_attention` (Sage) | ~70% | int8 Q.K^T on XMX, fp16 P.V, online softmax, tiled; never an N x N buffer | **hard** - the project's main risk |
 | `int8_linear` (+ ConvRot weights) | ~25% | int8 x int8 GEMM on XMX with per-row scales; oneDNN's int8 matmul is the first candidate, a `joint_matrix` kernel the second | medium |
 | `rms_rope_split_half_`, `adaln`, `rms_adaln`, fused SwiGLU | ~2-5% (elementwise passes) | straight ports, one pass over the tokens each | easy |
 | `group_norm_silu_pad3d`, `fp16_conv3d`, int8 attention in the ViT decoder | video decode, 11% of a clip | ports + oneDNN conv3d | medium |
@@ -49,7 +49,7 @@ int8 kernels read), which changes the output slightly. That is one of the qualit
 
 ## 3. What a perfect result would be (ceilings, not promises)
 
-Production step, N = 51,992 tokens, today 69.4 s:
+A large step, N = 51,992 tokens (896x672, 12 s), today 69.4 s (production's 47k-token step scales the same way):
 
 | | attention | linears | step | vs today |
 |---|---|---|---|---|

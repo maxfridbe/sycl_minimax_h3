@@ -17,7 +17,7 @@ Measured on the Arc Pro B70 (32 GB, PCIe 3.0 x8 slot, Ryzen 7 1700X, 23 GiB RAM)
 
 Sampling is Euler, cfg 1 (one forward per step), 8 steps with the turbo LoRA.
 
-## One production clip (896x672, Q8_0, 8 steps, ~15 s of video, 362 frames)
+## One production clip (sampled at 768x576, Q8_0 + a realism LoRA at 0.5, 8 steps, 15 s = 362 frames, latent-upscaled 1.5x to 1152x864 before decoding)
 
 From a real job record (seconds):
 
@@ -41,8 +41,8 @@ the 21 GB reaching the card - that happens inside step 1, on a 23 GiB host that 
 and every clip has its own frame count, so every clip is a new latent shape for `torch.compile` and the kernel
 caches. Separating the two is the first measurement in ASSESSMENT.md.
 
-Throughput: ~70-76 s of GPU per second of video, ~4.3 Wh per second of video, the card at its 275 W cap while
-sampling.
+Throughput: ~55-58 s of GPU per second of video for these clips (the 70-76 s/s figure in the film notes is the
+older 896x672 setting), ~3.2 Wh per second of video, the card at its 275 W cap while sampling.
 
 ## The step-time model
 
@@ -59,8 +59,9 @@ What the two terms are, from the architecture:
 | N^2 (attention: 50 blocks x 4 * 56 * 128 * N^2 FLOP) | 1.43e6 * N^2 FLOP | **78 TFLOPS** | 155 TFLOPS | 2.0x |
 | N (linears: 38.5 GFLOP per token over 50 blocks) | 3.85e10 * N FLOP | **111 TFLOPS** | 155 TFLOPS | 1.4x |
 
-At production size (N = 51,992): attention 49.4 s + linears 18.0 s = 67.4 s (measured 69.4). **Attention is 73%
-of a step.** At 640x480 / 10 s (N = 22,649) it is 44%.
+At production size (768x576, 15 s: N = 47,173): attention 40.7 s + linears 16.3 s = 57.0 s (measured 58.0 without
+the LoRA, 63.5 with it). **Attention is 71% of a step.** At 896x672 / 12 s (N = 51,992) it is 73%; at 640x480 /
+10 s (N = 22,649), 44%.
 
 ## What was already tried (and closed)
 

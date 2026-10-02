@@ -14,8 +14,8 @@ reference everything here is measured against.
 
 ## The short version
 
-- H3's denoiser is a plain 50-block single-stream DiT. One step at production size (52k tokens) is 69 s, and
-  **73% of it is attention**.
+- H3's denoiser is a plain 50-block single-stream DiT. One step at production size (47k tokens) is about 60 s, and
+  **70% of it is attention**.
 - There is no native H3 engine to port, as there was with Strata. But the model's own code calls a kernel
   library, **comfy-kitchen** (Apache-2.0), that has a CUDA backend and an AMD HIP backend and **nothing for
   Intel**: int8 linear, int8 ("Sage") attention, block-sparse attention, fused RMSNorm+RoPE, fused GroupNorm
