@@ -731,6 +731,11 @@ def cmd_gen(args):
     if dit_path.endswith(".safetensors"):
         # h3x: a comfy-native checkpoint (bf16 / fp8 / int8_convrot / w6a8): comfy's own loader and quantized ops,
         # which call comfy-kitchen (int8_linear etc.) - no GGUF ops, no GGUF patcher
+        if os.environ.get("H3X_SYCL") or os.environ.get("H3X_INT8_NATIVE"):
+            # h3x: ComfyUI answers "no int8 compute" for an Intel GPU (model_management.supports_int8_compute), and
+            # then turns every int8 weight back into bf16 on each call. Say yes, so the linears reach comfy-kitchen.
+            comfy.model_management.supports_int8_compute = lambda device=None: True
+            print("  int8 linears : native (comfy-kitchen int8_linear)", flush=True)
         if os.environ.get("H3X_SYCL"):
             # h3x: our kernels (kernels/kitchen_sycl.py) ahead of comfy-kitchen's own backends
             sys.path.insert(0, os.environ.get("H3X_SYCL_DIR", "/work/kernels"))
@@ -818,6 +823,8 @@ def cmd_gen(args):
                                   positive, negative, latent["samples"], denoise=1.0,
                                   seed=args.seed, callback=_cb)
     _t(f"sampled {args.steps} steps", t0)
+    if "kitchen_sycl" in sys.modules:
+        print("  sycl backend calls:", {k: (v[0], round(v[1], 1)) for k, v in sys.modules["kitchen_sycl"].STATS.items()}, flush=True)
     # comfy's own accounting: was the DiT fully resident or partially streamed?
     try:
         ls = model.loaded_size() / 1024**3
