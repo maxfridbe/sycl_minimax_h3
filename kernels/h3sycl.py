@@ -27,12 +27,22 @@ def _load():
     lib.h3s_int8_linear.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
                                     ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
                                     ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-    cap = torch.xpu.current_stream().sycl_queue              # a PyCapsule around sycl::queue*
-    ctypes.pythonapi.PyCapsule_GetName.restype = ctypes.c_char_p
-    ctypes.pythonapi.PyCapsule_GetName.argtypes = [ctypes.py_object]
-    ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
-    ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
-    qptr = ctypes.pythonapi.PyCapsule_GetPointer(cap, ctypes.pythonapi.PyCapsule_GetName(cap))
+    h = torch.xpu.current_stream().sycl_queue                # sycl::queue* - as an int, a c_void_p or a PyCapsule
+    if isinstance(h, int):
+        qptr = h
+    elif isinstance(h, ctypes.c_void_p):
+        qptr = h.value
+    else:
+        ctypes.pythonapi.PyCapsule_GetName.restype = ctypes.c_char_p
+        ctypes.pythonapi.PyCapsule_GetName.argtypes = [ctypes.py_object]
+        ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+        ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        try:
+            qptr = ctypes.pythonapi.PyCapsule_GetPointer(h, ctypes.pythonapi.PyCapsule_GetName(h))
+        except Exception as e:
+            raise RuntimeError(f"h3sycl: cannot read PyTorch's SYCL queue handle ({type(h).__name__}: {h!r})") from e
+    if not qptr:
+        raise RuntimeError("h3sycl: PyTorch's SYCL queue handle is null")
     ctx = lib.h3s_create(qptr)
     if not ctx:
         raise RuntimeError("h3sycl: " + lib.h3s_last_error().decode())
@@ -60,7 +70,7 @@ def int8_linear(x, weight, weight_scale, bias=None, out_dtype=torch.bfloat16, co
     M = x2.shape[0]
     w = weight if (weight.device == dev and weight.is_contiguous()) else weight.to(dev).contiguous()
     ws = weight_scale.to(device=dev, dtype=torch.float32).reshape(-1).contiguous()
-    b = None if bias is None else bias.to(device=dev, dtype=out_dtype).contiguous()
+    b = None if bias is None else bias.to(device=dev, dtype=torch.float32).contiguous()
     out = torch.empty((M, N), device=dev, dtype=out_dtype)
     rc = lib.h3s_int8_linear(_ctx, x2.data_ptr(), _DT[x.dtype], M, K, w.data_ptr(), N, ws.data_ptr(), ws.numel(),
                              0 if b is None else b.data_ptr(), out.data_ptr(), _DT[out_dtype],

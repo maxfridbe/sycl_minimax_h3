@@ -731,6 +731,11 @@ def cmd_gen(args):
     if dit_path.endswith(".safetensors"):
         # h3x: a comfy-native checkpoint (bf16 / fp8 / int8_convrot / w6a8): comfy's own loader and quantized ops,
         # which call comfy-kitchen (int8_linear etc.) - no GGUF ops, no GGUF patcher
+        if os.environ.get("H3X_SYCL"):
+            # h3x: our kernels (kernels/kitchen_sycl.py) ahead of comfy-kitchen's own backends
+            sys.path.insert(0, os.environ.get("H3X_SYCL_DIR", "/work/kernels"))
+            import kitchen_sycl
+            print("  sycl backend :", kitchen_sycl.register(sync=bool(os.environ.get("H3X_SYCL_SYNC"))) or "NOT AVAILABLE", flush=True)
         model = comfy.sd.load_diffusion_model(dit_path)
         sd = None
         try:
