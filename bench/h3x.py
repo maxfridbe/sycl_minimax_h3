@@ -774,7 +774,9 @@ def cmd_gen(args):
     def _cb(step, x0, x, total):
         print(f"  step {step+1}/{total}  {time.time()-_t0s:6.1f}s", flush=True)
         if _dump:   # h3x: the denoised estimate after every step, for step-by-step comparisons between engines
-            torch.save(x0.detach().float().cpu(), f"{_dump}.step{step+1:02d}.pt")
+            _tt = getattr(x0, "tensors", None)          # video + audio travel as a nested pair
+            _tt = list(_tt) if _tt is not None else [x0]
+            torch.save([t.detach().float().cpu() for t in _tt], f"{_dump}.step{step+1:02d}.pt")
     samples = comfy.sample.sample(model, noise, args.steps, 1.0, "euler", "simple",
                                   positive, negative, latent["samples"], denoise=1.0,
                                   seed=args.seed, callback=_cb)

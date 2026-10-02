@@ -66,6 +66,29 @@ static void run(engine& eng, stream& s, const char* what, memory::dims a, memory
     std::fflush(stdout);
 }
 
+// softmax over the last axis of [heads, T, T] scores: attention's "turn scores into weights" step (one exp per score)
+static void run_softmax(engine& eng, stream& s, long T, dt t, int reps) {
+    try {
+        memory::desc md({56, T, T}, t, memory::format_tag::abc);
+        softmax_forward::primitive_desc pd(eng, prop_kind::forward_inference, algorithm::softmax_accurate, md, md, 2);
+        softmax_forward prim(pd);
+        memory A(md, eng), C(md, eng);
+        fill(A, t);
+        std::unordered_map<int, memory> args{{DNNL_ARG_SRC, A}, {DNNL_ARG_DST, C}};
+        prim.execute(s, args); s.wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) prim.execute(s, args);
+        s.wait();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+        const double scores = 56.0 * T * T;
+        std::printf("softmax 56 heads, tile %-10ld %4s                 %9.2f ms  %7.2f G scores/s  (%s)\n", T, name(t), ms,
+                    scores / (ms * 1e-3) / 1e9, pd.impl_info_str());
+    } catch (const dnnl::error& e) {
+        std::printf("softmax tile %ld %s not supported: %s\n", T, name(t), e.what());
+    }
+    std::fflush(stdout);
+}
+
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 5;
     engine eng(engine::kind::gpu, 0);
@@ -74,7 +97,9 @@ int main(int argc, char** argv) {
     struct L { const char* n; long k, o; } lin[] = {
         {"linear qkv   5376 -> 21504", 5376, 21504}, {"linear fc1   5376 -> 28672", 5376, 28672},
         {"linear fc2  14336 ->  5376", 14336, 5376}, {"linear out   7168 ->  5376", 7168, 5376}};
+    const bool attn_only = argc > 2 && std::string(argv[2]) == "attn";
     for (const auto& l : lin) {
+        if (attn_only) break;
         run(eng, s, l.n, {M, l.k}, {l.k, l.o}, {M, l.o}, dt::f16, dt::f16, dt::f16, reps);
         run(eng, s, l.n, {M, l.k}, {l.k, l.o}, {M, l.o}, dt::bf16, dt::bf16, dt::bf16, reps);
         run(eng, s, l.n, {M, l.k}, {l.k, l.o}, {M, l.o}, dt::s8, dt::s8, dt::s32, reps);
@@ -92,5 +117,8 @@ int main(int argc, char** argv) {
         const std::string w = "P.V   56 heads, tile " + std::to_string(T);
         run(eng, s, w.c_str(), {56, T, T}, {56, T, 128}, {56, T, 128}, dt::f16, dt::f16, dt::f16, reps);
     }
+    for (long T : {2048L, 4096L}) { run_softmax(eng, s, T, dt::f16, reps); run_softmax(eng, s, T, dt::f32, reps); }
+    // for scale: the same tiles' two matmuls, as scores per second (a score = one query-key pair of one head)
+    std::printf("(a score costs 256 multiply-adds in Q.K^T and 256 in P.V: at 90 and 136 T-ops/s that is 0.35 and 0.53 G scores/s)\n");
     return 0;
 }
