@@ -76,7 +76,7 @@ it takes computing fewer scores.
       h3-sys/       bindings to libh3sycl, loaded at run time
       h3-core/      device memory, checkpoints, loading, kernels with checked shapes, the denoiser's blocks,
                     CPU reference arithmetic
-      h3/           the command line
+      h3/           the command line, the daemon (serve), the engine process (worker), the jobs
     wfe/          the web front end (TSX + snabbdom, vendored compiler, no node_modules)
     container/    the build-and-run image (podman)
     reference/    the PyTorch pipeline's harness, for comparisons only
@@ -101,6 +101,34 @@ reach the GPU) and nothing else.
 
     ./teardown.sh                   # stop a running engine, gracefully
     ./teardown.sh --all             # ... and remove the build output and the image
+
+### As a service: `h3-sycl`
+
+The way to use the engine day to day: a resident daemon, so the model is loaded once and stays loaded between jobs,
+with the web front end on the same port.
+
+    ./h3-sycl start                 # the daemon and the front end (http://127.0.0.1:8095/)
+    ./h3-sycl runjob bench-blocks --tokens 47173      # queue a job and follow its log
+    ./h3-sycl runjob check-block --dump /out/blockdump.safetensors
+    ./h3-sycl status | jobs | job <id> | killjob <id>
+    ./h3-sycl unload                # give the GPU back now; the next job loads again
+    ./h3-sycl stop                  # the running job stops at its next block boundary, the engine unloads
+    ./h3-sycl logs
+
+Two processes. `h3 serve` (the daemon) serves the front end and the API, keeps the job queue, and never opens the
+GPU. The GPU belongs to `h3 worker`, a child process the daemon starts when a job needs the engine and ends after a
+while without jobs (`H3_IDLE`, 600 s by default), on `unload`, or on `stop` - the memory comes back with the process,
+and a crash in the engine leaves the daemon and the front end up. They talk over the worker's stdin and stdout, one
+JSON object per line (job, cancel, exit; log lines, progress, results); tensors and video never cross the pipe.
+A cancel lands at the next block boundary, never inside a kernel (measured: 1.1 s at production size).
+
+Sharing the GPU with another program: `H3_GPU_LOCK` names a lock file the daemon waits on and holds while the engine
+is loaded; `H3_LLM_SWITCHER` names a front end's model switcher whose model is stopped before loading and restored
+after unloading; and either way the worker waits until the card really has the memory free before it loads.
+
+The front end is the same TSX/snabbdom build as before. Its calls for the clip queue, projects, scenes and films are
+not ported to Rust yet: the daemon passes them through to the server they were written for (`H3_LEGACY_API`), so the
+front end works whole while those pieces move over. Settings go in `./h3-sycl.conf` (see the top of `h3-sycl`).
 
 ### Versions and releases
 

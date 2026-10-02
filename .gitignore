@@ -12,3 +12,4 @@ __pycache__/
 *.gguf
 *.mp4
 !engine/h3-core/tests/data/*.safetensors
+h3-sycl.conf

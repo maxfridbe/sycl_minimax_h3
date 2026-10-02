@@ -222,6 +222,11 @@ void* h3s_open(void) try {
 
 const char* h3s_device_name(void* ctx) { return static_cast<Ctx*>(ctx)->name.c_str(); }
 uint64_t h3s_mem_cap(void* ctx) { return static_cast<Ctx*>(ctx)->mem_cap; }
+uint64_t h3s_mem_free(void* ctx) try {
+    const auto dev = static_cast<Ctx*>(ctx)->q.get_device();
+    if (!dev.has(sycl::aspect::ext_intel_free_memory)) return 0;
+    return dev.get_info<sycl::ext::intel::info::device::free_memory>();
+} catch (const std::exception&) { return 0; }
 uint64_t h3s_mem_used(void* ctx) {
     auto& c = *static_cast<Ctx*>(ctx);
     std::lock_guard<std::mutex> l(c.mem_mu);

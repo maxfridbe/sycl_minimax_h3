@@ -44,6 +44,13 @@ impl Device {
     pub fn mem_cap(&self) -> u64 {
         unsafe { (self.api.mem_cap)(self.ctx) }
     }
+    /// What the whole card has free now, every process counted; `None` when the driver cannot tell.
+    pub fn mem_free(&self) -> Option<u64> {
+        match unsafe { (self.api.mem_free)(self.ctx) } {
+            0 => None,
+            n => Some(n),
+        }
+    }
 
     /// Device memory. Refused (an error, not a stall) when it would pass the cap.
     pub fn alloc(self: &Arc<Self>, bytes: usize) -> Result<Buf> {

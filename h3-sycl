@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# h3-sycl - the engine as a resident service, in the podman container.
+#
+#   h3-sycl start                 start the daemon (the model loads on the first job and stays loaded) and the
+#                                 web front end on the same port
+#   h3-sycl runjob <kind> [--name value ...] [--no-wait]
+#                                 queue a job and follow its log; kinds: bench-blocks (--tokens N --blocks N),
+#                                 check-block (--dump /out/<file>)
+#   h3-sycl status | jobs | job <id> | killjob <id>
+#   h3-sycl unload                give the GPU back now (the daemon keeps running; the next job loads again)
+#   h3-sycl stop                  stop: the running job stops at its next block boundary, the engine unloads
+#   h3-sycl logs                  the daemon's log, followed
+#
+# Settings: environment variables, or the same names in ./h3-sycl.conf or ~/.config/h3-sycl.conf
+#   H3_MODELS         host directory with the checkpoints, seen as /models          (required for start)
+#   H3_MODEL          the checkpoint, as seen in the container
+#                     (default /models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors)
+#   H3_OUT            host directory for job files, seen as /out                    (default ./out)
+#   H3_PORT           the daemon's port                                             (default 8095)
+#   H3_LISTEN         the address it listens on: 127.0.0.1 (this machine only, the default) or 0.0.0.0
+#                     (the front end reachable from the network - nothing on it asks for a password)
+#   H3_LEGACY_API     the clip-production server the front end was written for (e.g. http://127.0.0.1:8090):
+#                     front-end calls the daemon does not handle yet go there
+#   H3_IDLE           seconds without a job before the engine unloads; 0 = never    (default 600)
+#   H3_GPU_LOCK       a lock file shared with the GPU's other users (wait while it names someone else, hold it
+#                     while loaded)
+#   H3_LLM_SWITCHER   a front end's model switcher URL: its model is stopped before loading and restored after
+#                     unloading (e.g. http://localhost:8090/rpc/llm.mode)
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+for f in "$HERE/h3-sycl.conf" "$HOME/.config/h3-sycl.conf"; do [ -f "$f" ] && source "$f"; done
+source "$HERE/container/common.sh"
+NAME=h3-sycl
+PORT=${H3_PORT:-8095}
+MODEL=${H3_MODEL:-/models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors}
+
+running() { [ "$($CE container inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
+client() { $CE exec -e H3_DAEMON=127.0.0.1:$PORT $NAME /app/h3 "$@"; }
+
+cmd=${1:-}; [ $# -gt 0 ] && shift
+case $cmd in
+  start)
+    if running; then echo "already running"; client status; exit 0; fi
+    need_image
+    [ -x "$HERE/dist/h3" ] || { echo "dist/h3 is not built yet: run ./build.sh" >&2; exit 1; }
+    [ -n "${H3_MODELS:-}" ] || { echo "set H3_MODELS (the host directory with the checkpoints)" >&2; exit 1; }
+    $CE rm -f $NAME >/dev/null 2>&1 || true            # a stopped one from before
+    OUT=${H3_OUT:-$HERE/out}; mkdir -p "$OUT"
+    mounts=(-v "$HERE/dist:/app:ro" -v "$H3_MODELS:/models:ro" -v "$OUT:/out")
+    args=(--model "$MODEL" --listen "${H3_LISTEN:-127.0.0.1}:$PORT" --idle "${H3_IDLE:-600}" --ui /app/wfe)
+    [ -n "${H3_LEGACY_API:-}" ] && args+=(--legacy-api "$H3_LEGACY_API")
+    if [ -n "${H3_GPU_LOCK:-}" ]; then
+      d=$(dirname "$H3_GPU_LOCK"); mounts+=(-v "$d:$d"); args+=(--gpu-lock "$H3_GPU_LOCK")
+    fi
+    [ -n "${H3_LLM_SWITCHER:-}" ] && args+=(--llm-switcher "$H3_LLM_SWITCHER")
+    # --stop-timeout: a stop waits for the running job's next block boundary (about a second at production size)
+    $CE run -d --name $NAME --network host --stop-timeout 150 "${AS_USER[@]}" "${GPU[@]}" "${mounts[@]}" \
+      -e H3SYCL_LIB=/app/libh3sycl.so ${H3S_MEM_FRACTION:+-e H3S_MEM_FRACTION=$H3S_MEM_FRACTION} \
+      "$IMAGE" bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/h3 serve "$@"' h3 "${args[@]}" >/dev/null
+    for _ in $(seq 1 50); do client status >/dev/null 2>&1 && break; sleep 0.2; done
+    client status
+    echo "front end: http://$( [ "${H3_LISTEN:-127.0.0.1}" = 0.0.0.0 ] && hostname || echo 127.0.0.1 ):$PORT/"
+    ;;
+  stop)
+    if ! running; then echo "not running"; exit 0; fi
+    client shutdown >/dev/null 2>&1 || true
+    # the daemon exits by itself once the engine has unloaded; podman stop is the backstop (SIGTERM, then 150 s)
+    for _ in $(seq 1 150); do running || break; sleep 1; done
+    running && $CE stop -t 150 $NAME >/dev/null
+    $CE rm $NAME >/dev/null 2>&1 || true
+    echo "stopped"
+    ;;
+  status|jobs|job|killjob|unload|runjob)
+    running || { echo "not running: h3-sycl start" >&2; exit 1; }
+    client "$cmd" "$@"
+    ;;
+  logs)
+    exec $CE logs -f $NAME
+    ;;
+  *)
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+    ;;
+esac

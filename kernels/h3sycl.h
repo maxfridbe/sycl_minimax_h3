@@ -42,6 +42,9 @@ void* h3s_alloc(void* ctx, uint64_t bytes);
 void h3s_free(void* ctx, void* p);              /* waits for the queue first */
 uint64_t h3s_mem_used(void* ctx);
 uint64_t h3s_mem_cap(void* ctx);
+/* What the whole card has free right now, every process counted (0 when the driver cannot tell: it needs
+ * ZES_ENABLE_SYSMAN=1, which the image sets). For deciding whether to load beside whatever else holds the card. */
+uint64_t h3s_mem_free(void* ctx);
 
 /* Host <-> device copies; both wait for the copy (the host buffer may be released on return). Thread-safe. */
 int h3s_write(void* ctx, void* dst, const void* src_host, uint64_t bytes);
