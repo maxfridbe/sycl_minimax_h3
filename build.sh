@@ -5,6 +5,7 @@
 #     dist/wfe/                            the web front end     (wfe/)
 #   ./build.sh                  all three
 #   ./build.sh kernels|engine|wfe ...     only those
+#   ./build.sh tools            the oneDNN probes (dist/gemm_bench, dist/sdpa_probe)
 #   ./build.sh test             the Rust tests and lints
 # Do not build while a model is running on a small-memory box: the SYCL compile alone takes several GB of RAM.
 set -euo pipefail

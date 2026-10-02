@@ -20,6 +20,12 @@ wfe() {
   NODE=$(command -v node) wfe/build.sh
   rm -rf dist/wfe && cp -r wfe/build dist/wfe
 }
+tools() {
+  echo "==> tools: oneDNN probes (gemm_bench, sdpa_probe)"
+  for t in gemm_bench sdpa_probe; do
+    icpx -O2 -fsycl -std=c++20 -I"$DNNL/include" kernels/$t.cpp -L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN' -o dist/$t
+  done
+}
 tests() {
   echo "==> engine: tests and lints"
   cargo test --release --locked --manifest-path engine/Cargo.toml
@@ -32,8 +38,9 @@ for what in "$@"; do
     kernels) kernels ;;
     engine) engine ;;
     wfe) wfe ;;
+    tools) tools ;;
     test) tests ;;
-    *) echo "build.sh: unknown target '$what' (kernels, engine, wfe, test)" >&2; exit 2 ;;
+    *) echo "build.sh: unknown target '$what' (kernels, engine, wfe, tools, test)" >&2; exit 2 ;;
   esac
 done
 ls -la dist
