@@ -1,9 +1,25 @@
 //! The kernels, with types and shapes checked on the way in. Each call queues work on the device and returns; the
 //! result is there for the next call that uses it (the queue is in order).
 
+use std::ffi::c_void;
+
 use crate::device::Tensor;
 use crate::dtype::DType;
 use crate::{Error, Result};
+
+fn floats(t: &Tensor, what: &str, n: usize) -> Result<*const f32> {
+    if t.dtype != DType::F32 || t.elements() < n {
+        return Err(Error(format!("{what} must be float32 with at least {n} values, got {:?} {:?}", t.dtype, t.shape)));
+    }
+    Ok(t.buf.ptr().cast_const().cast())
+}
+
+fn row_table(t: &Tensor, m: usize) -> Result<*const i32> {
+    if t.dtype != DType::I32 || t.elements() != m {
+        return Err(Error(format!("the row table must be int32 [{m}], got {:?} {:?}", t.dtype, t.shape)));
+    }
+    Ok(t.buf.ptr().cast_const().cast())
+}
 
 /// A linear layer with int8 weights (one layer of an `int8_convrot` checkpoint), on the device.
 pub struct Int8Linear {
@@ -39,11 +55,10 @@ impl Int8Linear {
         if ns != 1 && ns != n {
             return Err(Error(format!("int8_linear: {ns} weight scales for {n} outputs")));
         }
-        if let Some(b) = &self.bias {
-            if b.dtype != DType::F32 || b.elements() != n {
-                return Err(Error("int8_linear: the bias must be float32 [N]".into()));
-            }
-        }
+        let bias = match &self.bias {
+            Some(b) => floats(b, "the bias", n)?,
+            None => std::ptr::null(),
+        };
         let dev = x.buf.device();
         // SAFETY: every pointer is device memory of this device, with the sizes checked above.
         let rc = unsafe {
@@ -57,7 +72,7 @@ impl Int8Linear {
                 n as i64,
                 self.scale.buf.ptr().cast(),
                 ns as i64,
-                self.bias.as_ref().map_or(std::ptr::null(), |b| b.buf.ptr().cast()),
+                bias,
                 out.buf.ptr(),
                 out.dtype.kernel_code()?,
                 self.group.unwrap_or(0) as i32,
@@ -65,4 +80,165 @@ impl Int8Linear {
         };
         dev.check(rc)
     }
+}
+
+/// How a denoiser block's tokens are modulated: which table row each token uses, and the tables.
+pub struct Mod<'a> {
+    /// int32 [M]
+    pub rows: &'a Tensor,
+    /// float32 [R, C] each
+    pub scale: &'a Tensor,
+    pub shift: &'a Tensor,
+}
+
+/// Row-wise RMS norm of x [M, C] (weight float32 [C]), then `* (1 + scale[row]) + shift[row]` when `m` is given.
+/// `out` may be `x`.
+pub fn rms_norm_mod(x: &Tensor, weight: &Tensor, eps: f32, m: Option<&Mod>, out: &Tensor) -> Result<()> {
+    let c = weight.elements();
+    let rows = x.elements() / c;
+    if x.elements() != rows * c || out.elements() != x.elements() {
+        return Err(Error(format!("rms_norm: x {:?}, out {:?}, {c} features", x.shape, out.shape)));
+    }
+    let (r, sc, sh) = match m {
+        None => (std::ptr::null(), std::ptr::null(), std::ptr::null()),
+        Some(m) => (row_table(m.rows, rows)?, floats(m.scale, "scale", c)?, floats(m.shift, "shift", c)?),
+    };
+    let dev = x.buf.device();
+    // SAFETY: device pointers of this device; sizes checked above (the tables' row count is the caller's contract).
+    let rc = unsafe {
+        (dev.api.rms_norm_mod)(
+            dev.ctx,
+            x.buf.ptr(),
+            x.dtype.kernel_code()?,
+            rows as i64,
+            c as i64,
+            floats(weight, "the norm weight", c)?,
+            eps,
+            r,
+            sc,
+            sh,
+            out.buf.ptr(),
+            out.dtype.kernel_code()?,
+        )
+    };
+    dev.check(rc)
+}
+
+/// Token rows of `heads` x `dim` features inside a wider row-major buffer: row s starts at element
+/// `offset + s * stride`. This is how q, k and v sit inside the qkv linear's output.
+#[derive(Clone, Copy)]
+pub struct Rows<'a> {
+    pub t: &'a Tensor,
+    pub offset: usize,
+    pub stride: usize,
+    pub tokens: usize,
+    pub heads: usize,
+    pub dim: usize,
+}
+
+impl Rows<'_> {
+    fn layout(&self) -> (usize, usize, usize, usize) {
+        (self.tokens, self.heads, self.dim, self.stride)
+    }
+
+    fn ptr(&self) -> Result<*mut c_void> {
+        let last = self.offset + (self.tokens.max(1) - 1) * self.stride + self.heads * self.dim;
+        if self.stride < self.heads * self.dim || last > self.t.elements() {
+            return Err(Error(format!(
+                "rows of {} x {} at offset {} with stride {} do not fit {:?}",
+                self.heads, self.dim, self.offset, self.stride, self.t.shape
+            )));
+        }
+        // SAFETY: in bounds, checked above.
+        Ok(unsafe { self.t.buf.ptr().cast::<u8>().add(self.offset * self.t.dtype.size()).cast() })
+    }
+}
+
+/// Per-head RMS norm (weight float32 [dim]) and the rotary rotation, in place. `cs` float32 [tokens, rot_dim/2, 2].
+pub fn rms_rope(x: Rows, weight: &Tensor, eps: f32, cs: &Tensor, rot_dim: usize) -> Result<()> {
+    let dev = x.t.buf.device();
+    // SAFETY: device pointers of this device; `Rows::ptr` and `floats` check the sizes.
+    let rc = unsafe {
+        (dev.api.rms_rope)(
+            dev.ctx,
+            x.ptr()?,
+            x.t.dtype.kernel_code()?,
+            x.tokens as i64,
+            x.heads as i64,
+            x.dim as i64,
+            x.stride as i64,
+            floats(weight, "the norm weight", x.dim)?,
+            eps,
+            floats(cs, "the rotation table", x.tokens * rot_dim)?,
+            rot_dim as i32,
+        )
+    };
+    dev.check(rc)
+}
+
+/// `out[r, i] = silu(x[r, i]) * x[r, C + i]`: x [M, 2C], out [M, C].
+pub fn swiglu(x: &Tensor, out: &Tensor) -> Result<()> {
+    let c = *out.shape.last().ok_or("swiglu: out has no shape")?;
+    if x.elements() != out.elements() * 2 || c == 0 {
+        return Err(Error(format!("swiglu: x {:?} is not twice out {:?}", x.shape, out.shape)));
+    }
+    let dev = x.buf.device();
+    // SAFETY: device pointers of this device; sizes checked above.
+    let rc = unsafe {
+        (dev.api.swiglu)(dev.ctx, x.buf.ptr(), x.dtype.kernel_code()?, (out.elements() / c) as i64, c as i64, out.buf.ptr(), out.dtype.kernel_code()?)
+    };
+    dev.check(rc)
+}
+
+/// `x[r] += other[r] * gate[rows[r]]`, in place. x, other [M, C]; rows int32 [M]; gate float32 [R, C].
+pub fn gate_add(x: &Tensor, other: &Tensor, rows: &Tensor, gate: &Tensor) -> Result<()> {
+    let c = *x.shape.last().ok_or("gate_add: x has no shape")?;
+    let m = x.elements() / c.max(1);
+    if other.elements() != x.elements() {
+        return Err(Error(format!("gate_add: x {:?} and other {:?} differ", x.shape, other.shape)));
+    }
+    let dev = x.buf.device();
+    // SAFETY: device pointers of this device; sizes checked above.
+    let rc = unsafe {
+        (dev.api.gate_add)(
+            dev.ctx,
+            x.buf.ptr(),
+            x.dtype.kernel_code()?,
+            m as i64,
+            c as i64,
+            other.buf.ptr(),
+            other.dtype.kernel_code()?,
+            row_table(rows, m)?,
+            floats(gate, "the gate", c)?,
+        )
+    };
+    dev.check(rc)
+}
+
+/// `out = softmax(q . k^T / sqrt(dim)) . v` per head; out [tokens, heads * dim].
+pub fn attention(q: Rows, k: Rows, v: Rows, out: &Tensor) -> Result<()> {
+    if q.layout() != k.layout() || q.layout() != v.layout() {
+        return Err(Error("attention: q, k and v must have the same layout".into()));
+    }
+    if out.elements() != q.tokens * q.heads * q.dim {
+        return Err(Error(format!("attention: out {:?} for {} tokens of {} x {}", out.shape, q.tokens, q.heads, q.dim)));
+    }
+    let dev = out.buf.device();
+    // SAFETY: device pointers of this device; `Rows::ptr` checks the sizes.
+    let rc = unsafe {
+        (dev.api.attention)(
+            dev.ctx,
+            q.ptr()?,
+            k.ptr()?,
+            v.ptr()?,
+            q.t.dtype.kernel_code()?,
+            q.tokens as i64,
+            q.heads as i64,
+            q.dim as i64,
+            q.stride as i64,
+            out.buf.ptr(),
+            out.dtype.kernel_code()?,
+        )
+    };
+    dev.check(rc)
 }

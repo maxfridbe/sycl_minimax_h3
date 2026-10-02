@@ -50,6 +50,62 @@ pub struct Api {
         c_int,          // out_dt
         c_int,          // group
     ) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub rms_norm_mod: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *const c_void,  // x
+        c_int,          // x_dt
+        i64,            // M
+        i64,            // C
+        *const f32,     // weight
+        f32,            // eps
+        *const i32,     // rows
+        *const f32,     // scale
+        *const f32,     // shift
+        *mut c_void,    // out
+        c_int,          // out_dt
+    ) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub rms_rope: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *mut c_void,    // x
+        c_int,          // x_dt
+        i64,            // M
+        i64,            // H
+        i64,            // D
+        i64,            // stride
+        *const f32,     // weight
+        f32,            // eps
+        *const f32,     // cs
+        c_int,          // rot_dim
+    ) -> c_int,
+    pub swiglu: unsafe extern "C" fn(*mut c_void, *const c_void, c_int, i64, i64, *mut c_void, c_int) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub gate_add: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *mut c_void,    // x
+        c_int,          // x_dt
+        i64,            // M
+        i64,            // C
+        *const c_void,  // other
+        c_int,          // other_dt
+        *const i32,     // rows
+        *const f32,     // gate
+    ) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub attention: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *const c_void,  // q
+        *const c_void,  // k
+        *const c_void,  // v
+        c_int,          // dt
+        i64,            // S
+        i64,            // H
+        i64,            // D
+        i64,            // stride
+        *mut c_void,    // out
+        c_int,          // out_dt
+    ) -> c_int,
 }
 
 fn dl_error() -> String {
@@ -130,6 +186,11 @@ impl Api {
             read: sym!("h3s_read"),
             wait: sym!("h3s_wait"),
             int8_linear: sym!("h3s_int8_linear"),
+            rms_norm_mod: sym!("h3s_rms_norm_mod"),
+            rms_rope: sym!("h3s_rms_rope"),
+            swiglu: sym!("h3s_swiglu"),
+            gate_add: sym!("h3s_gate_add"),
+            attention: sym!("h3s_attention"),
         })
     }
 

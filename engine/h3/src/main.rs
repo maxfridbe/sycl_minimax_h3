@@ -5,6 +5,10 @@
 //!     h3 load <checkpoint> [--threads 8]      load it onto the GPU, timed
 //!     h3 check-linear <checkpoint> [--block 0] [--rows 64] [--bench-rows 16384]
 //!                                             a block's int8 linears: the GPU against the CPU reference, and timed
+//!     h3 check-block <checkpoint> <dump> [--blocks N]
+//!                                             the denoiser.s blocks against a dump of the reference pipeline
+//!     h3 bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
+//!                                             what a denoiser step costs at a sequence length, stage by stage
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -16,13 +20,15 @@ use h3_core::dtype::{f32_to_bf16, DType};
 use h3_core::ops::Int8Linear;
 use h3_core::rng::Rng;
 use h3_core::safetensors::Checkpoint;
-use h3_core::{load, reference, Error, Result};
+use h3_core::{dit, load, reference, Error, Result};
 
 const USAGE: &str = "usage:
   h3 device
   h3 info <checkpoint.safetensors>
   h3 load <checkpoint.safetensors> [--threads 8]
-  h3 check-linear <checkpoint.safetensors> [--block 0] [--rows 64] [--bench-rows 16384]";
+  h3 check-linear <checkpoint.safetensors> [--block 0] [--rows 64] [--bench-rows 16384]
+  h3 check-block <checkpoint.safetensors> <dump.safetensors> [--blocks N] [--threads 8]
+  h3 bench-blocks <checkpoint.safetensors> [--tokens 16500] [--blocks N]";
 
 /// `--name value` options after the positional arguments.
 struct Args {
@@ -204,6 +210,185 @@ fn cmd_check_linear(args: &Args) -> Result<()> {
     }
 }
 
+/// One line of a comparison: how far `got` is from the reference's `want`.
+fn report(what: &str, got: &[f32], want: &[f32]) -> (f64, f64) {
+    let (rel, cos) = reference::compare(got, want);
+    println!("  {what:34} rel err {rel:.2e}  cosine {cos:.6}");
+    (rel, cos)
+}
+
+/// Columns [from, from + width) of every `stride`-wide row.
+fn columns(v: &[f32], stride: usize, from: usize, width: usize) -> Vec<f32> {
+    v.chunks_exact(stride).flat_map(|r| r[from..from + width].iter().copied()).collect()
+}
+
+/// The denoiser's blocks against a dump of the reference pipeline (reference/h3x.py, H3X_DUMP_BLOCK): the host-side
+/// tables, every stage of block 0, then the stream after later blocks.
+fn cmd_check_block(args: &Args) -> Result<()> {
+    let ck = Checkpoint::open(args.path(0)?)?;
+    let dump = Checkpoint::open(args.path(1)?)?;
+    let dev = Device::open()?;
+    println!("device : {}", dev.name());
+    let count = args.options.get("blocks").map(|_| args.number("blocks", 1)).transpose()?;
+    let mut model = dit::Blocks::load(&dev, &ck, count, args.number("threads", 8)?)?;
+    println!("blocks : {} loaded, {:.2} GiB in {:.1} s", model.blocks.len(), gib(model.load_bytes), model.load_seconds);
+    for (key, eps) in [("norm_eps", &mut model.cfg.norm_eps), ("qk_eps", &mut model.cfg.qk_eps)] {
+        if let Some(v) = dump.metadata.get(key) {
+            *eps = v.parse().map_err(|_| Error(format!("the dump's {key} is not a number: {v}")))?;
+        }
+    }
+    let cfg = model.cfg;
+    let f32s = |name: &str| -> Result<Vec<f32>> { h3_core::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
+
+    // what the step fixes: table rows, positions, the timestep embedding
+    let rows: Vec<i32> = dump.read("mod_rows")?.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let positions: Vec<f64> = dump.read("position_ids")?.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+    let inv_freq = h3_core::dtype::bytes_to_f32(&ck.read("rope.inv_freq")?, ck.get("rope.inv_freq")?.dtype)?;
+    let t_emb = f32s("t_emb")?;
+    let tokens = rows.len();
+    println!("dump   : {tokens} tokens, {} timestep rows", t_emb.len() / cfg.t_dim);
+
+    println!("host side, against the reference:");
+    let tables = model.blocks[0].tables(&cfg, &t_emb);
+    let mut worst = 0f64;
+    for (t, name) in tables.iter().zip(["shift_msa", "scale_msa", "gate_msa", "shift_mlp", "scale_mlp", "gate_mlp"]) {
+        worst = worst.max(reference::compare(t, &f32s(&format!("b0.{name}"))?).0);
+    }
+    println!("  {:34} rel err {worst:.2e}  (worst of six)", "block 0's tables");
+    // the dump's rotation matrices are [S, pairs, 2, 2] = (cos, -sin, sin, cos)
+    let cs = dit::rotations(&positions, &inv_freq);
+    let want_cs: Vec<f32> = f32s("rope_table")?.chunks_exact(4).flat_map(|m| [m[0], m[2]]).collect();
+    report("position rotations (cos, sin)", &cs, &want_cs);
+
+    let step = dit::Step::new(&dev, &model, &rows, &positions, &inv_freq, &t_emb)?;
+    let scratch = dit::Scratch::new(&dev, &cfg, tokens, DType::BF16)?;
+    let x_in = dump.read("x_in")?;
+    let x = Tensor::from_bytes(&dev, DType::BF16, &[tokens, cfg.hidden], &x_in)?;
+
+    println!("block 0, stage by stage (each stage runs on this engine's own previous stage):");
+    let w = cfg.heads * cfg.head_dim;
+    let mut worst_cos = 1f64;
+    let mut tap = |name: &str, t: &Tensor| -> Result<()> {
+        let got = t.to_f32()?;
+        let c = match name {
+            "qkv_rotated" => {
+                let (_, cq) = report("q after norm + rotation", &columns(&got, 3 * w, 0, w), &f32s("b0.q_rope")?);
+                let (_, ck) = report("k after norm + rotation", &columns(&got, 3 * w, w, w), &f32s("b0.k_rope")?);
+                cq.min(ck)
+            }
+            _ => report(name, &got, &f32s(&format!("b0.{name}"))?).1,
+        };
+        worst_cos = worst_cos.min(c);
+        Ok(())
+    };
+    model.block(0, &x, &step, &scratch, Some(&mut tap))?;
+
+    println!("the stream after later blocks:");
+    let last = model.blocks.len() - 1;
+    for i in 1..=last {
+        model.block(i, &x, &step, &scratch, None)?;
+        let key = if dump.metadata.get("last_block").is_some_and(|l| *l == i.to_string()) { "out.last".to_string() } else { format!("out.{i}") };
+        if dump.entries.contains_key(&key) {
+            let c = report(&format!("after block {i}"), &x.to_f32()?, &f32s(&key)?).1;
+            worst_cos = worst_cos.min(c);
+        }
+    }
+
+    // speed: the whole stack again, one wait at the end
+    x.buf.write(0, &x_in)?;
+    dev.wait()?;
+    let t0 = Instant::now();
+    for i in 0..=last {
+        model.block(i, &x, &step, &scratch, None)?;
+    }
+    dev.wait()?;
+    let s = t0.elapsed().as_secs_f64();
+    println!("speed  : {} blocks on {tokens} tokens in {:.2} s ({:.1} ms per block)", last + 1, s, s * 1e3 / (last + 1) as f64);
+    if worst_cos > 0.99 {
+        Ok(())
+    } else {
+        Err(Error(format!("the engine's result drifts from the reference (worst cosine {worst_cos:.4})")))
+    }
+}
+
+/// The block stack on made-up tokens at a chosen sequence length: what one denoiser step costs, and where.
+fn cmd_bench_blocks(args: &Args) -> Result<()> {
+    let ck = Checkpoint::open(args.path(0)?)?;
+    let tokens = args.number("tokens", 16500)?;
+    let dev = Device::open()?;
+    println!("device : {}", dev.name());
+    let count = args.options.get("blocks").map(|_| args.number("blocks", 1)).transpose()?;
+    let model = dit::Blocks::load(&dev, &ck, count, args.number("threads", 8)?)?;
+    let cfg = model.cfg;
+    println!("blocks : {} loaded, {:.2} GiB in {:.1} s", model.blocks.len(), gib(model.load_bytes), model.load_seconds);
+
+    let mut rng = Rng::new(0);
+    let rows: Vec<i32> = (0..tokens).map(|i| if i < tokens / 20 { 1 } else { 0 }).collect();
+    let positions: Vec<f64> = (0..tokens * 3).map(|_| (rng.uniform() * 64.0) as f64).collect();
+    let inv_freq = h3_core::dtype::bytes_to_f32(&ck.read("rope.inv_freq")?, ck.get("rope.inv_freq")?.dtype)?;
+    let t_emb: Vec<f32> = (0..cfg.t_dim).map(|_| rng.normal()).collect();
+    let step = dit::Step::new(&dev, &model, &rows, &positions, &inv_freq, &t_emb)?;
+    let scratch = dit::Scratch::new(&dev, &cfg, tokens, DType::BF16)?;
+    let (xb, _) = activations(&mut rng, tokens * cfg.hidden);
+    let x = Tensor::from_bytes(&dev, DType::BF16, &[tokens, cfg.hidden], &xb)?;
+    let n = model.blocks.len();
+
+    // warm-up: the first call of each kernel shape compiles it
+    model.block(0, &x, &step, &scratch, None)?;
+    dev.wait()?;
+    x.buf.write(0, &xb)?;
+    let t0 = Instant::now();
+    for i in 0..n {
+        model.block(i, &x, &step, &scratch, None)?;
+    }
+    dev.wait()?;
+    let total = t0.elapsed().as_secs_f64();
+    println!("speed  : {n} blocks on {tokens} tokens in {total:.2} s ({:.1} ms per block), {:.1} of {:.1} GiB in use", total * 1e3 / n as f64, gib(dev.mem_used()), gib(dev.mem_cap()));
+
+    // where it goes: the same again, waiting for the device after every stage
+    x.buf.write(0, &xb)?;
+    let mut stages: Vec<(String, f64)> = Vec::new();
+    let mut mark = Instant::now();
+    let mut tap = |name: &str, t: &Tensor| -> Result<()> {
+        t.buf.device().wait()?;
+        let dt = mark.elapsed().as_secs_f64();
+        match stages.iter_mut().find(|(n, _)| n == name) {
+            Some(s) => s.1 += dt,
+            None => stages.push((name.to_string(), dt)),
+        }
+        mark = Instant::now();
+        Ok(())
+    };
+    for i in 0..n {
+        model.block(i, &x, &step, &scratch, Some(&mut tap))?;
+    }
+    let sum: f64 = stages.iter().map(|s| s.1).sum();
+    let label = |n: &str| match n {
+        "h1" | "h2" => "norm + scale/shift",
+        "qkv" => "linear: q, k, v",
+        "qkv_rotated" => "per-head norm + rotation (q, k)",
+        "att" => "attention",
+        "attn_out" => "linear: attention out",
+        "x1" | "x2" => "gated add",
+        "fc1" => "linear: MLP in",
+        "mlp" => "gated activation + linear: MLP out",
+        _ => "other",
+    };
+    let mut merged: Vec<(&str, f64)> = Vec::new();
+    for (n, s) in &stages {
+        match merged.iter_mut().find(|(l, _)| *l == label(n)) {
+            Some(m) => m.1 += s,
+            None => merged.push((label(n), *s)),
+        }
+    }
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1));
+    println!("stages (a wait after each, so the sum is a little above the run without):");
+    for (l, s) in merged {
+        println!("  {l:36} {:7.1} ms per block  {:4.1}%", s * 1e3 / n as f64, s / sum * 100.0);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = raw.first() else {
@@ -215,6 +400,8 @@ fn run() -> Result<()> {
         "info" => cmd_info(&args),
         "load" => cmd_load(&args),
         "check-linear" => cmd_check_linear(&args),
+        "check-block" => cmd_check_block(&args),
+        "bench-blocks" => cmd_bench_blocks(&args),
         _ => Err(Error(USAGE.into())),
     }
 }

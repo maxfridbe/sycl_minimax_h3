@@ -18,6 +18,7 @@
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +69,16 @@ struct Ctx {
     float* gmax = nullptr; size_t gmax_cap = 0;    // per-(row, group) absmax
     float* xr = nullptr; size_t xr_cap = 0;        // rotated activations [M, K], float32 (see pass 1)
     int32_t* acc = nullptr; size_t acc_cap = 0;    // fallback path: one chunk of int32 products [C, N]
+    float* inv = nullptr; size_t inv_cap = 0;      // 1 / rms per row (norms)
+    // attention, all in IEEE half: a chunk of q by head [H, rows, D]; k transposed [H, D, S]; v by head [H, S, D];
+    // one chunk of scores [H, rows, S]; one chunk of results [H, rows, D]
+    uint16_t* hq = nullptr; size_t hq_cap = 0;
+    uint16_t* hk = nullptr; size_t hk_cap = 0;
+    uint16_t* hv = nullptr; size_t hv_cap = 0;
+    uint16_t* sc = nullptr; size_t sc_cap = 0;
+    uint16_t* ao = nullptr; size_t ao_cap = 0;
+    struct Attn { dnnl::matmul qk; dnnl::softmax_forward sm; dnnl::matmul pv; };
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Attn> attn;                   // (H, rows, S, D)
     void* had[3] = {nullptr, nullptr, nullptr};    // the normalized 256 x 256 Hadamard matrix per Dt
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int, int>, dnnl::matmul> gemm;   // (M, K, N, out, bias, per_n)
     std::map<std::tuple<int64_t, int, int>, dnnl::matmul> rot;                            // (rows, group, dt)
@@ -80,12 +91,23 @@ struct Ctx {
     size_t mem_used = 0, mem_cap = 0;
     std::string name;
 
+    // A scratch buffer of at least n elements; counted against the same cap as h3s_alloc. NULL (with the reason in
+    // g_err) when it would pass the cap or the device refuses.
     template <typename T> T* grow(T*& p, size_t& cap, size_t n) {
-        if (n > cap) {
-            if (p) { q.wait(); sycl::free(p, q); }
-            p = sycl::malloc_device<T>(n + (n >> 3), q);
-            cap = p ? n + (n >> 3) : 0;
+        if (n <= cap) return p;
+        const size_t want = n + (n >> 3);
+        std::lock_guard<std::mutex> l(mem_mu);
+        if (mem_used - cap * sizeof(T) + want * sizeof(T) > mem_cap) {
+            g_err = "a scratch buffer of " + std::to_string((want * sizeof(T)) >> 20) + " MiB would pass the device memory cap (" +
+                    std::to_string(mem_used >> 20) + " of " + std::to_string(mem_cap >> 20) + " MiB in use)";
+            return nullptr;
         }
+        if (p) { q.wait(); sycl::free(p, q); }
+        mem_used -= cap * sizeof(T);
+        p = sycl::malloc_device<T>(want, q);
+        cap = p ? want : 0;
+        mem_used += cap * sizeof(T);
+        if (!p) g_err = "the device refused a scratch buffer of " + std::to_string((want * sizeof(T)) >> 20) + " MiB";
         return p;
     }
 };
@@ -135,7 +157,7 @@ void init(Ctx& c) {
     c.strm = dnnl::sycl_interop::make_stream(c.eng, c.q);
     c.name = c.q.get_device().get_info<sycl::info::device::name>();
     const uint64_t total = c.q.get_device().get_info<sycl::info::device::global_mem_size>();
-    double frac = 0.92;                            // of the card; the kernels' scratch buffers come on top
+    double frac = 0.94;                            // of the card, for h3s_alloc and the kernels' scratch together
     if (const char* e = std::getenv("H3S_MEM_FRACTION")) frac = std::min(0.97, std::max(0.05, std::atof(e)));
     c.mem_cap = (size_t) ((double) total * frac);
 }
@@ -212,7 +234,8 @@ void h3s_destroy(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx);
     if (!c) return;
     c->q.wait();
-    for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2]})
+    for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2],
+                    (void*) c->inv, (void*) c->hq, (void*) c->hk, (void*) c->hv, (void*) c->sc, (void*) c->ao})
         if (p) sycl::free(p, c->q);
     for (auto& [p, n] : c->mem) sycl::free(p, c->q);
     delete c;
@@ -238,7 +261,7 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
     int8_t* xq = c.grow(c.xq, c.xq_cap, (size_t) M * K);
     float* rs = c.grow(c.rs, c.rs_cap, (size_t) M);
     float* gmax = c.grow(c.gmax, c.gmax_cap, (size_t) M * G);
-    if (!xq || !rs || !gmax) { g_err = "h3s_int8_linear: device allocation failed"; return -1; }
+    if (!xq || !rs || !gmax) return -1;
     sycl::queue& q = c.q;
     using dnnl::memory;
 
@@ -247,7 +270,7 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
     int xs_dt = x_dt;
     if (rot) {
         float* xr = c.grow(c.xr, c.xr_cap, (size_t) M * K);
-        if (!xr) { g_err = "h3s_int8_linear: device allocation failed"; return -1; }
+        if (!xr) return -1;
         // The rotated copy is float32. In bfloat16 (8 significant bits) its rounding moves ~5% of the values to the
         // neighbouring int8 level in pass 3: 0.7% error on the layer's output, measured against exact arithmetic,
         // next to the 0.9% the 8-bit quantization costs by itself.
@@ -334,7 +357,7 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
     // ---- fallback: int32 products in row chunks, rescaled by a kernel of ours
     const int64_t C = std::max<int64_t>(1, std::min<int64_t>(M, (int64_t) (384ull << 20) / (N * 4)));
     int32_t* acc = c.grow(c.acc, c.acc_cap, (size_t) C * N);
-    if (!acc) { g_err = "h3s_int8_linear: device allocation failed"; return -1; }
+    if (!acc) return -1;
     for (int64_t r0 = 0; r0 < M; r0 += C) {
         const int64_t rows = std::min(C, M - r0);
         memory::desc s2({rows, K}, memory::data_type::s8, memory::format_tag::ab);
@@ -349,6 +372,175 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
             float v = (float) acc[r * N + n] * rs[r0 + r] * (per_n ? wscale[n] : 1.0f);
             if (bias) v += bias[n];
             store(out, out_dt, (size_t) (r0 + r) * N + n, v);
+        });
+    }
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// 1 / sqrt(mean(x[r]^2) + eps) per row of x [M, C] into c.inv. Summed in float32, in a fixed order per row.
+static float* row_inv_rms(Ctx& c, const void* x, int x_dt, int64_t M, int64_t C, float eps) {
+    float* inv = c.grow(c.inv, c.inv_cap, (size_t) M);
+    if (!inv) return nullptr;
+    c.q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) {
+        float s = 0.0f;
+        for (int64_t i = 0; i < C; ++i) {
+            const float v = load(x, x_dt, r[0] * C + i);
+            s += v * v;
+        }
+        inv[r[0]] = sycl::rsqrt(s / (float) C + eps);
+    });
+    return inv;
+}
+
+int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, float eps,
+                     const int32_t* rows, const float* scale, const float* shift, void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    const float* inv = row_inv_rms(c, x, x_dt, M, C, eps);
+    if (!inv) return -1;
+    const bool mod = rows && scale && shift;
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t r = id[0], i = id[1];
+        float v = load(x, x_dt, r * C + i) * inv[r] * weight[i];
+        if (mod) {
+            const size_t m = (size_t) rows[r] * C + i;
+            v = v * (1.0f + scale[m]) + shift[m];
+        }
+        store(out, out_dt, r * C + i, v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* weight,
+                 float eps, const float* cs, int rot_dim) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || H <= 0 || D <= 0) return 0;
+    if (rot_dim < 0 || rot_dim > D || rot_dim % 2 != 0 || (D - rot_dim) % 2 != 0) {
+        g_err = "h3s_rms_rope: rot_dim must be even, at most D, and leave an even remainder"; return -1;
+    }
+    if (stride < H * D) { g_err = "h3s_rms_rope: the row stride is shorter than a row"; return -1; }
+    float* inv = c.grow(c.inv, c.inv_cap, (size_t) (M * H));
+    if (!inv) return -1;
+    c.q.parallel_for(sycl::range<1>((size_t) (M * H)), [=](sycl::id<1> mh) {
+        const size_t base = (mh[0] / H) * stride + (mh[0] % H) * D;
+        float s = 0.0f;
+        for (int64_t i = 0; i < D; ++i) {
+            const float v = load(x, x_dt, base + i);
+            s += v * v;
+        }
+        inv[mh[0]] = sycl::rsqrt(s / (float) D + eps);
+    });
+    const int64_t half = rot_dim / 2;                  // rotated pairs: (i, half + i)
+    const int64_t slots = half + (D - rot_dim) / 2;    // then pairs of the features passed through
+    // one work-item per pair: it owns its two values, so the update is in place
+    c.q.parallel_for(sycl::range<2>((size_t) (M * H), (size_t) slots), [=](sycl::id<2> id) {
+        const size_t mh = id[0], j = id[1], base = (mh / H) * stride + (mh % H) * D;
+        const float s = inv[mh];
+        if ((int64_t) j < half) {
+            const size_t ia = base + j, ib = base + half + j;
+            const float a = load(x, x_dt, ia) * s * weight[j], b = load(x, x_dt, ib) * s * weight[half + j];
+            const size_t t = (mh / H) * half + j;      // the token's angle for this pair
+            const float co = cs[2 * t], si = cs[2 * t + 1];
+            store(x, x_dt, ia, a * co - b * si);
+            store(x, x_dt, ib, b * co + a * si);
+        } else {
+            const size_t i0 = rot_dim + 2 * (j - half);
+            store(x, x_dt, base + i0, load(x, x_dt, base + i0) * s * weight[i0]);
+            store(x, x_dt, base + i0 + 1, load(x, x_dt, base + i0 + 1) * s * weight[i0 + 1]);
+        }
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_swiglu(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t r = id[0], i = id[1];
+        const float g = load(x, x_dt, r * 2 * C + i), u = load(x, x_dt, r * 2 * C + C + i);
+        store(out, out_dt, r * C + i, g / (1.0f + sycl::exp(-g)) * u);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void* other, int other_dt,
+                 const int32_t* rows, const float* gate) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t r = id[0], i = id[1], p = r * C + i;
+        const float g = gate ? gate[(size_t) rows[r] * C + i] : 1.0f;
+        store(x, x_dt, p, load(x, x_dt, p) + load(other, other_dt, p) * g);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// Attention with a bounded score table: oneDNN's batched matrix multiply and softmax, a chunk of query rows at a
+// time, so the scores held at once are heads x rows x S <= ~1.5 GiB whatever S is. q, k, v are stored by token; the
+// multiplies want them by head, so k and v are copied once and q a chunk at a time, in IEEE half (11 significant
+// bits where bfloat16 has 8).
+//
+// Why not oneDNN's fused attention (its graph interface, MatMul -> Divide -> SoftMax -> MatMul): when oneDNN does not
+// recognize the pattern as its fused kernel it runs the four steps with the WHOLE S x S table in device memory, and
+// nothing tells the caller which of the two it chose. At 16.5k tokens that table is 30 GiB; the xe driver has no
+// out-of-memory error, the card spilled into host RAM and the machine went down (2026-10-02). Memory here is bounded
+// by construction instead.
+//
+// Measured at 16.5k tokens: scores 126 ms, softmax 1005 ms, values 73 ms per call - oneDNN's stand-alone softmax is
+// the slow part on rows this long, and the next thing to replace.
+int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                  int64_t stride, void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (S <= 0 || H <= 0 || D <= 0) return 0;
+    if (stride < H * D) { g_err = "h3s_attention: the row stride is shorter than a row"; return -1; }
+    using dnnl::memory;
+    sycl::queue& qu = c.q;
+    const size_t n = (size_t) S * H * D;
+    // rows per chunk: the scores of a chunk take at most ~1.5 GiB
+    const int64_t rows_max = std::max<int64_t>(1, std::min<int64_t>(S, (int64_t) (1536ull << 20) / (H * S * 2)));
+    uint16_t* hq = c.grow(c.hq, c.hq_cap, (size_t) H * rows_max * D);
+    uint16_t* hk = c.grow(c.hk, c.hk_cap, n);
+    uint16_t* hv = c.grow(c.hv, c.hv_cap, n);
+    uint16_t* sc = c.grow(c.sc, c.sc_cap, (size_t) H * rows_max * S);
+    uint16_t* ao = c.grow(c.ao, c.ao_cap, (size_t) H * rows_max * D);
+    if (!hq || !hk || !hv || !sc || !ao) return -1;
+    qu.parallel_for(sycl::range<3>((size_t) H, (size_t) S, (size_t) D), [=](sycl::id<3> id) {
+        const size_t src = id[1] * stride + id[0] * D + id[2];
+        ((sycl::half*) hk)[(id[0] * D + id[2]) * S + id[1]] = (sycl::half) load(k, dt, src);
+        ((sycl::half*) hv)[(id[0] * S + id[1]) * D + id[2]] = (sycl::half) load(v, dt, src);
+    });
+    const float scale = 1.0f / std::sqrt((float) D);
+    const auto f16 = memory::data_type::f16;
+    for (int64_t r0 = 0; r0 < S; r0 += rows_max) {
+        const int64_t rows = std::min(rows_max, S - r0);
+        qu.parallel_for(sycl::range<3>((size_t) H, (size_t) rows, (size_t) D), [=](sycl::id<3> id) {
+            ((sycl::half*) hq)[(id[0] * rows + id[1]) * D + id[2]] = (sycl::half) load(q, dt, (r0 + id[1]) * stride + id[0] * D + id[2]);
+        });
+        memory::desc q_md({H, rows, D}, f16, memory::format_tag::abc);
+        memory::desc k_md({H, D, S}, f16, memory::format_tag::abc);
+        memory::desc s_md({H, rows, S}, f16, memory::format_tag::abc);
+        memory::desc v_md({H, S, D}, f16, memory::format_tag::abc);
+        memory::desc o_md({H, rows, D}, f16, memory::format_tag::abc);
+        auto key = std::make_tuple(H, rows, S, D);
+        auto it = c.attn.find(key);
+        if (it == c.attn.end()) {
+            dnnl::post_ops po;
+            po.append_eltwise(dnnl::algorithm::eltwise_linear, scale, 0.0f);
+            dnnl::primitive_attr attr;
+            attr.set_post_ops(po);
+            Ctx::Attn a{dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, q_md, k_md, s_md, attr)),
+                        dnnl::softmax_forward(dnnl::softmax_forward::primitive_desc(
+                            c.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::softmax_accurate, s_md, s_md, 2)),
+                        dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, s_md, v_md, o_md))};
+            it = c.attn.emplace(key, std::move(a)).first;
+        }
+        auto s_mem = usm(s_md, c.eng, sc);
+        it->second.qk.execute(c.strm, {{DNNL_ARG_SRC, usm(q_md, c.eng, hq)}, {DNNL_ARG_WEIGHTS, usm(k_md, c.eng, hk)}, {DNNL_ARG_DST, s_mem}});
+        it->second.sm.execute(c.strm, {{DNNL_ARG_SRC, s_mem}, {DNNL_ARG_DST, s_mem}});
+        it->second.pv.execute(c.strm, {{DNNL_ARG_SRC, s_mem}, {DNNL_ARG_WEIGHTS, usm(v_md, c.eng, hv)}, {DNNL_ARG_DST, usm(o_md, c.eng, ao)}});
+        // back to token order: out [S, H * D]
+        qu.parallel_for(sycl::range<3>((size_t) rows, (size_t) H, (size_t) D), [=](sycl::id<3> id) {
+            store(out, out_dt, ((r0 + id[0]) * H + id[1]) * D + id[2], (float) ((const sycl::half*) ao)[(id[1] * rows + id[0]) * D + id[2]]);
         });
     }
     return 0;

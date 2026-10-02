@@ -3,7 +3,6 @@ name = "h3-core"
 description = "The MiniMax H3 engine: device memory, checkpoint loading and the model, on libh3sycl"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
 
 [dependencies]
 h3-sys = { path = "../h3-sys" }

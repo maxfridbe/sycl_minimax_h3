@@ -443,6 +443,107 @@ def _graceful_sigterm():
     signal.signal(signal.SIGTERM, _bye)
 
 
+def _dump_block_install(path):
+    """h3x: on the first denoiser call, save everything the Rust engine needs to check a ported block against this
+    pipeline: block 0's input, every intermediate of block 0 (computed again here, step by step, as DiTBlock.forward
+    does it), and the last block's output. One .safetensors file."""
+    import torch
+    import comfy.ldm.minimax.model as M
+    import comfy.ops as ops
+    import comfy.model_management as mm
+    import comfy.quant_ops as qo
+    from safetensors.torch import save_file
+    orig = M.DiTBlock.forward
+    st = {"d": {}, "done": False}
+
+    def cpu(t):
+        return t.detach().to("cpu").contiguous()
+
+    def fwd(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None):
+        idx = transformer_options.get("block_index")
+        if st["done"] or attention is not None:
+            return orig(self, x, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options, attention=attention)
+        d = st["d"]
+        if idx == 0:
+            layout = transformer_options["minimax_h3_layout"]
+            xc = x.clone()
+            d["x_in"] = cpu(xc)
+            d["t_emb"] = cpu(t_emb.float())
+            rows = torch.empty(x.shape[0], dtype=torch.int32)
+            for a, b, row in mod_segments:
+                rows[a:b] = row.to("cpu", torch.int32) if torch.is_tensor(row) else int(row)
+            d["mod_rows"] = rows
+            d["position_ids"] = cpu(layout.position_ids)
+            d["rope_table"] = cpu(rope_freqs.float())
+            names = ("shift_msa", "scale_msa", "gate_msa", "shift_mlp", "scale_mlp", "gate_mlp")
+            mods = self.adaln_proj(t_emb)
+            for n, m in zip(names, mods):
+                d["b0." + n] = cpu(m.float())
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods
+            h1 = M._mod_scale_shift(self.norm1(xc), shift_msa, scale_msa, mod_segments)
+            d["b0.h1"] = cpu(h1)
+            at = self.attn
+            s = h1.shape[0]
+            qkv = at.qkv_proj(h1)
+            d["b0.qkv"] = cpu(qkv)
+            q, k, v = qkv.split(at.heads * at.head_dim, dim=-1)
+            v = v.view(s, at.heads, at.head_dim)
+            q = q.view(1, s, at.heads, at.head_dim)
+            k = k.view(1, s, at.heads, at.head_dim)
+            qw = mm.cast_to(at.q_norm.weight, device=x.device)
+            kw = mm.cast_to(at.k_norm.weight, device=x.device)
+            qo.ck.rms_rope_split_half_(q, k, rope_freqs, qw, kw, epsilon=at.q_norm.eps, rot_dim=rope_freqs.shape[-3] * 2)
+            d["b0.q_rope"] = cpu(q[0])
+            d["b0.k_rope"] = cpu(k[0])
+            att = M.optimized_attention(M.AttentionTensorContainer(q[0].transpose(0, 1).unsqueeze(0)),
+                                        M.AttentionTensorContainer(k[0].transpose(0, 1).unsqueeze(0)),
+                                        M.AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0)),
+                                        at.heads, mask=None, skip_reshape=True, transformer_options=transformer_options).squeeze(0)
+            d["b0.att"] = cpu(att)
+            attn_out = at.out_proj(att)
+            d["b0.attn_out"] = cpu(attn_out)
+            x1 = M._mod_gate(xc.clone(), gate_msa, attn_out, mod_segments)
+            d["b0.x1"] = cpu(x1)
+            h2 = M._mod_scale_shift(self.norm2(x1), shift_mlp, scale_mlp, mod_segments)
+            d["b0.h2"] = cpu(h2)
+            fc1 = self.mlp.fc1(h2)
+            d["b0.fc1"] = cpu(fc1)
+            mlp = ops.linear_input_act(self.mlp.fc2, fc1, "swiglu")
+            d["b0.mlp"] = cpu(mlp)
+            d["b0.x2"] = cpu(M._mod_gate(x1.clone(), gate_mlp, mlp, mod_segments))
+            st["meta"] = {"heads": str(at.heads), "head_dim": str(at.head_dim), "qk_eps": repr(float(at.q_norm.eps)),
+                          "norm_eps": repr(float(self.norm1.eps)), "rot_dim": str(rope_freqs.shape[-3] * 2),
+                          "segments": repr([(a, b, kind) for a, b, kind in layout.segments])}
+        out = orig(self, x, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options, attention=attention)
+        if idx == 0:
+            rel = float((out.float().cpu() - d["b0.x2"].float()).norm() / out.float().norm())
+            print(f"  block dump: block 0 recomputed step by step differs from the real call by {rel:.2e}", flush=True)
+        if idx in (0, 1, 24):
+            d[f"out.{idx}"] = cpu(out)
+        if idx is not None and idx >= 40:          # whichever block runs last
+            st["last"] = (idx, cpu(out))
+        return out
+
+    def finish():
+        if st["done"] or "x_in" not in st["d"]:
+            return
+        d = st["d"]
+        if st.get("last"):
+            d["out.last"] = st["last"][1]
+            st["meta"]["last_block"] = str(st["last"][0])
+        save_file(d, path, metadata=st["meta"])
+        st["done"] = True
+        print(f"  block dump -> {path}: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in d.items() if k in ("x_in", "b0.qkv", "out.last")), flush=True)
+
+    M.DiTBlock.forward = fwd
+    final = M.FinalLayer.forward
+
+    def final_fwd(self, *a, **k):
+        finish()
+        return final(self, *a, **k)
+    M.FinalLayer.forward = final_fwd
+
+
 def _profile_install():
     """h3x: where a denoiser step goes. Wraps the pieces of the DiT with a device sync on both sides and returns
     {name: [calls, seconds]}; the names nest (model > block > attention/mlp > their linears), so they do not add up."""
@@ -853,6 +954,8 @@ def cmd_gen(args):
             _tt = getattr(x0, "tensors", None)          # video + audio travel as a nested pair
             _tt = list(_tt) if _tt is not None else [x0]
             torch.save([t.detach().float().cpu() for t in _tt], f"{_dump}.step{step+1:02d}.pt")
+    if os.environ.get("H3X_DUMP_BLOCK"):
+        _dump_block_install(os.environ["H3X_DUMP_BLOCK"])
     _prof = _profile_install() if os.environ.get("H3X_PROFILE") else None
     samples = comfy.sample.sample(model, noise, args.steps, 1.0, "euler", "simple",
                                   positive, negative, latent["samples"], denoise=1.0,

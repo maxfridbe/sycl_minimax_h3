@@ -36,7 +36,8 @@ const char* h3s_device_name(void* ctx);
 /* ---- device memory -------------------------------------------------------------------------------------------- */
 
 /* The xe driver has no out-of-memory error: an over-commit stalls the whole machine. So allocations are counted, and
- * one that would pass the cap (0.92 of the card; H3S_MEM_FRACTION overrides) is refused here, with an error. */
+ * one that would pass the cap (0.94 of the card; H3S_MEM_FRACTION overrides) is refused here, with an error. The
+ * kernels' own scratch buffers count against the same cap: a kernel call that needs more fails the same way. */
 void* h3s_alloc(void* ctx, uint64_t bytes);
 void h3s_free(void* ctx, void* p);              /* waits for the queue first */
 uint64_t h3s_mem_used(void* ctx);
@@ -62,6 +63,41 @@ int h3s_wait(void* ctx);
  * or NULL; out [M, N] in out_dt. group = 0: no rotation, else a power of 4, at most 256, dividing K. */
 int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N,
                     const float* wscale, int64_t n_wscale, const float* bias, void* out, int out_dt, int group);
+
+/* Row-wise RMS norm, optionally followed by a per-row scale and shift picked from a table:
+ *
+ *   n   = x[r] / sqrt(mean(x[r]^2) + eps) * weight
+ *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
+ *
+ * x, out [M, C]; weight float32 [C]; rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
+int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, float eps,
+                     const int32_t* rows, const float* scale, const float* shift, void* out, int out_dt);
+
+/* Per-head RMS norm, then the rotary position rotation, in place. x holds M token rows of H heads x D features;
+ * row m starts at element m * stride (stride >= H * D: the rows may sit inside a wider buffer, as q and k do inside
+ * the qkv linear's output). Each head's D features are normalized (weight float32 [D]); then feature pairs
+ * (i, rot_dim/2 + i), i < rot_dim/2, are rotated by the token's angle:
+ *
+ *   a' = a * cos - b * sin,   b' = b * cos + a * sin
+ *
+ * cs float32 [M, rot_dim/2, 2] holds (cos, sin) per token and pair. Features from rot_dim on are only normalized. */
+int h3s_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, int64_t stride, const float* weight,
+                 float eps, const float* cs, int rot_dim);
+
+/* The gated activation between an MLP's two linears: out[r, i] = silu(x[r, i]) * x[r, C + i].
+ * x [M, 2 * C], out [M, C]. */
+int h3s_swiglu(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, void* out, int out_dt);
+
+/* x[r] += other[r] * gate[rows[r]], in place. x, other [M, C]; rows int32 [M]; gate float32 [R, C].
+ * gate NULL: a plain add. */
+int h3s_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void* other, int other_dt,
+                 const int32_t* rows, const float* gate);
+
+/* Attention: out = softmax(q . k^T / sqrt(D)) . v, per head. q, k, v: S token rows of H heads x D features, row s at
+ * element s * stride (as in h3s_rms_rope), in type dt; out [S, H * D] in out_dt. The S x S scores are never
+ * held whole: they are made, used and overwritten a block of query rows at a time (at most ~1.5 GiB of them). */
+int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                  int64_t stride, void* out, int out_dt);
 
 #ifdef __cplusplus
 }

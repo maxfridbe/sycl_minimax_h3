@@ -12,7 +12,7 @@ is deleted when the port has parity.
 | `kitchen/h3sycl.py`, `kitchen/kitchen_sycl.py` | `libh3sycl` loaded into the PyTorch process and registered as a backend of the model's kernel dispatch (comfy-kitchen), so the old pipeline runs with our kernels |
 | `tests/test_int8_linear.py` | the int8 linear on PyTorch tensors: against comfy-kitchen's and against exact float32 |
 | `card.sh`, `with-card.sh` | take and give back a GPU that another program normally holds |
-| `exp1.sh` ... `exp6.sh` | the experiments behind the numbers in `docs/` and the README |
+| `exp1.sh` ... `exp7.sh` | the experiments behind the numbers in `docs/` and the README; `exp7.sh` makes the block dump `h3 check-block` reads |
 | `h2d_bench.py` | host-to-device copy rates |
 | `prompts/` | the prompts the comparison clips use |
 
@@ -23,6 +23,7 @@ Switches of `h3x.py` (environment):
 | `H3X_PRELOAD=1` | put the denoiser's weights on the GPU before step 1, timed |
 | `H3X_PREFETCH=<threads>` | read the checkpoint ahead in parallel while the rest starts |
 | `H3X_DUMP_STEPS=<prefix>` | save the denoised estimate after every step (for `compare.py`) |
+| `H3X_DUMP_BLOCK=<file>` | save block 0's input, every intermediate of it, and later blocks' outputs (for `h3 check-block`) |
 | `H3X_INT8_NATIVE=1` | keep int8 weights int8 (ComfyUI turns them back into floats on an Intel GPU) |
 | `H3X_SYCL=1` | the above, with `libh3sycl` in front of comfy-kitchen's own backends |
 | `H3X_SYCL_SYNC=1`, `H3X_PROFILE=1` | time our kernels / the pieces of a denoiser step (synchronized, so slower) |

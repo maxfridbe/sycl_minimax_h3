@@ -3,6 +3,7 @@
 //! and the sampler.
 
 pub mod device;
+pub mod dit;
 pub mod dtype;
 pub mod load;
 pub mod ops;
