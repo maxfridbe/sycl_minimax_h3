@@ -107,7 +107,9 @@ reach the GPU) and nothing else.
 The way to use the engine day to day: a resident daemon, so the model is loaded once and stays loaded between jobs,
 with the web front end on the same port.
 
-    ./h3-sycl start                 # the daemon and the front end (http://127.0.0.1:8095/)
+    ./h3-sycl start                 # the daemon and the front end (http://127.0.0.1:8095/), in the background
+    ./h3-sycl start --bind 0.0.0.0 --port 9000      # any address and port (0.0.0.0: reachable from the network)
+    ./h3-sycl serve --port 9000     # the same in the foreground, log on the terminal, Ctrl-C to stop
     ./h3-sycl runjob bench-blocks --tokens 47173      # queue a job and follow its log
     ./h3-sycl runjob check-block --dump /out/blockdump.safetensors
     ./h3-sycl status | jobs | job <id> | killjob <id>

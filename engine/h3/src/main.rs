@@ -50,7 +50,8 @@ const USAGE: &str = "usage:
   h3 bench-blocks <checkpoint.safetensors> [--tokens 16500] [--blocks N]
 
 the engine as a resident daemon (the model stays loaded between jobs):
-  h3 serve --model <checkpoint.safetensors> [--listen 127.0.0.1:8095] [--idle 600]
+  h3 serve --model <checkpoint.safetensors> [--bind 127.0.0.1] [--port 8095] [--idle 600]
+           (or --listen ADDR:PORT in place of --bind/--port)
            [--gpu-lock <file>] [--llm-switcher <url>] [--threads 8]
            [--ui <dist/wfe>] [--legacy-api <url>]      the web front end on the same port
   h3 runjob <kind> [--name value ...] [--no-wait]     kinds: bench-blocks (--tokens N --blocks N),
@@ -250,7 +251,7 @@ fn cmd_serve(args: &Args) -> Result<()> {
     let model = args.options.get("model").ok_or("serve needs --model <checkpoint.safetensors>")?;
     let idle = args.number("idle", 600)?;
     daemon::serve(daemon::Options {
-        listen: args.options.get("listen").cloned().unwrap_or_else(daemon_addr),
+        listen: listen_addr(args)?,
         model: model.into(),
         idle: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
         gpu_lock: args.options.get("gpu-lock").map(Into::into),
@@ -259,6 +260,23 @@ fn cmd_serve(args: &Args) -> Result<()> {
         ui: args.options.get("ui").map(Into::into),
         legacy_api: args.options.get("legacy-api").cloned(),
     })
+}
+
+/// Where `h3 serve` listens: `--listen ADDR:PORT`, or `--bind ADDR` and `--port N` (each optional: 127.0.0.1, 8095).
+fn listen_addr(args: &Args) -> Result<String> {
+    if let Some(l) = args.options.get("listen") {
+        if args.options.contains_key("bind") || args.options.contains_key("port") {
+            return Err(Error("give --listen ADDR:PORT, or --bind / --port, not both".into()));
+        }
+        return Ok(l.clone());
+    }
+    let bind = args.options.get("bind").map_or("127.0.0.1", |b| b.as_str());
+    let port = args.number("port", 8095)?;
+    if port == 0 || port > 65535 {
+        return Err(Error(format!("--port {port}: not a port")));
+    }
+    // an IPv6 address needs brackets before the port
+    Ok(if bind.contains(':') && !bind.starts_with('[') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") })
 }
 
 /// Where the client finds the daemon: `$H3_DAEMON`, or the default port on the loopback interface.
