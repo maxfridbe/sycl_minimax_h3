@@ -11,3 +11,4 @@ __pycache__/
 *.safetensors
 *.gguf
 *.mp4
+!engine/h3-core/tests/data/*.safetensors

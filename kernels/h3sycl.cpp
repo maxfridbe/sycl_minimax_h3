@@ -281,14 +281,10 @@ void h3s_destroy(void* ctx) {
 //   3. quantize     one value per work-item
 //   4. int8 GEMM    oneDNN, the rescale (per-row scale, optional per-column weight scale) and the bias as post-ops,
 //                   written straight into the output in its own type - no int32 table, no second pass over it
-int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N,
-                    const float* wscale, int64_t n_wscale, const float* bias, void* out, int out_dt, int group) try {
-    auto& c = *static_cast<Ctx*>(ctx);
-    if (M <= 0 || K <= 0 || N <= 0) return 0;
+// M rows of the layer (h3s_int8_linear below hands it the rows a chunk at a time).
+static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N,
+                            const float* wscale, int64_t n_wscale, const float* bias, void* out, int out_dt, int group) {
     const bool rot = group > 0;
-    if (rot && (group > kMaxGroup || K % group != 0 || (group & (group - 1)) != 0)) {
-        g_err = "h3s_int8_linear: unsupported ConvRot group size"; return -1;
-    }
     const int g = rot ? group : 256;
     const int64_t G = (K + g - 1) / g;
     int8_t* xq = c.grow(c.xq, c.xq_cap, (size_t) M * K);
@@ -406,6 +402,27 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
             if (bias) v += bias[n];
             store(out, out_dt, (size_t) (r0 + r) * N + n, v);
         });
+    }
+    return 0;
+}
+
+int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, const int8_t* w, int64_t N,
+                    const float* wscale, int64_t n_wscale, const float* bias, void* out, int out_dt, int group) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+    if (group > 0 && (group > kMaxGroup || K % group != 0 || (group & (group - 1)) != 0)) {
+        g_err = "h3s_int8_linear: unsupported ConvRot group size"; return -1;
+    }
+    // Row chunks: the rotated float32 copy and the int8 copy of the activations are scratch, [rows, K] each. For a
+    // whole 47k-token input of the MLP's second linear that is 2.7 + 0.7 GiB; in chunks of 8192 rows, 0.6 GiB. The
+    // matrix engine's rate does not depend on the number of rows.
+    constexpr int64_t kRows = 8192;
+    const size_t xe = x_dt == F32 ? 4 : 2, oe = out_dt == F32 ? 4 : 2;
+    for (int64_t r0 = 0; r0 < M; r0 += kRows) {
+        const int64_t rows = std::min(kRows, M - r0);
+        const int rc = int8_linear_rows(c, (const char*) x + (size_t) r0 * K * xe, x_dt, rows, K, w, N, wscale, n_wscale, bias,
+                                        (char*) out + (size_t) r0 * N * oe, out_dt, group);
+        if (rc != 0) return rc;
     }
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
