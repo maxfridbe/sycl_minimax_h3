@@ -57,16 +57,16 @@ bfloat16 throughout; this engine keeps intermediate arithmetic in float32 or IEE
 
 | stage | reference (PyTorch), 16.5k tokens | this engine, 16.5k | this engine, 47k (a 15 s clip) |
 |---|---:|---:|---:|
-| the four int8 linears (+ gated activation) | 70 ms (with our kernel plugged in; 145 ms without) | 67 ms | 192 ms |
-| per-head norm + rotation | 22.7 ms | 6.2 ms | 20.9 ms |
+| the four int8 linears (+ gated activation) | 70 ms (with our kernel plugged in; 145 ms without) | 67 ms | 194 ms |
+| per-head norm + rotation | 22.7 ms | 6.2 ms | 20.8 ms |
 | norms, scale/shift, gated adds | ~6 ms | 10.5 ms | 28.1 ms |
-| attention | 102 ms | 96 ms | 756 ms |
-| **the block** | 222 ms as it runs in production (186 ms with our linear kernel plugged in) | **177 ms** | **997 ms** |
-| **50 blocks = one denoiser step** | 11.1 s as it runs in production (9.3 s with our linear kernel plugged in) | **8.95 s** | **~50 s** (10 blocks measured; reference 58-63 s) |
+| attention | 102 ms | 96 ms | 759 ms |
+| **the block** | 222 ms as it runs in production (186 ms with our linear kernel plugged in) | **177 ms** | **998 ms** |
+| **50 blocks = one denoiser step** | 11.1 s as it runs in production (9.3 s with our linear kernel plugged in) | **8.95 s** | **49.9 s** (reference 58-63 s) |
 
-At 47k tokens all 50 blocks do not fit yet: 18 GiB of weights plus ~13 GiB of work buffers pass the engine's own
-memory cap by about 1 GiB (it refuses; it does not spill). The MLP's inner buffer (2.7 GiB) and the linear's rotation
-scratch (2.7 GiB) are the two to shrink - both by working in row chunks.
+At 47k tokens the whole step takes 27.8 of the engine's 30 GiB cap: 18 GiB of weights, the rest work buffers. It
+fits since the int8 linear works in row chunks of 8192 (its scratch was 3.4 GiB, now 0.6). The MLP's inner buffer
+(2.7 GiB) is the next one to shrink the same way, if room is needed.
 
 ### Attention: how it got there
 

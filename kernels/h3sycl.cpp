@@ -109,6 +109,7 @@ struct Ctx {
     void* had[3] = {nullptr, nullptr, nullptr};    // the normalized 256 x 256 Hadamard matrix per Dt
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int, int>, dnnl::matmul> gemm;   // (M, K, N, out, bias, per_n)
     std::map<std::tuple<int64_t, int, int>, dnnl::matmul> rot;                            // (rows, group, dt)
+    std::map<std::tuple<int64_t, int64_t, int64_t, int, int>, dnnl::matmul> lin;          // (M, K, N, dt, bias)
     bool fused_ok = true;                          // oneDNN took the post-op form (else: int32 + our rescale kernel)
     bool rot_f32 = true;                           // oneDNN took a float32 result for the 16-bit rotation
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
@@ -423,6 +424,51 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
         const int rc = int8_linear_rows(c, (const char*) x + (size_t) r0 * K * xe, x_dt, rows, K, w, N, wscale, n_wscale, bias,
                                         (char*) out + (size_t) r0 * N * oe, out_dt, group);
         if (rc != 0) return rc;
+    }
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias,
+               void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+    using dnnl::memory;
+    constexpr int64_t kRows = 8192;                 // row chunks, so the scratch of a type change stays small
+    const size_t xe = dt == F32 ? 4 : 2, oe = out_dt == F32 ? 4 : 2;
+    const bool convert = out_dt != dt;              // oneDNN multiplies within one type; another output type is a pass of ours
+    void* tmp = nullptr;
+    if (convert) {
+        tmp = c.grow(c.xr, c.xr_cap, (size_t) std::min(kRows, M) * N);      // float32-sized slots: enough for any type
+        if (!tmp) return -1;
+    }
+    memory::desc wmd({K, N}, ddt(dt), memory::format_tag::ba);              // the [N, K] buffer, read transposed
+    memory::desc col_md({1, N}, memory::data_type::f32, memory::format_tag::ab);
+    for (int64_t r0 = 0; r0 < M; r0 += kRows) {
+        const int64_t rows = std::min(kRows, M - r0);
+        memory::desc smd({rows, K}, ddt(dt), memory::format_tag::ab);
+        memory::desc dmd({rows, N}, ddt(dt), memory::format_tag::ab);
+        auto key = std::make_tuple(rows, K, N, dt, bias ? 1 : 0);
+        auto it = c.lin.find(key);
+        if (it == c.lin.end()) {
+            dnnl::primitive_attr attr;
+            if (bias) {
+                dnnl::post_ops po;
+                po.append_binary(dnnl::algorithm::binary_add, col_md);
+                attr.set_post_ops(po);
+            }
+            it = c.lin.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
+        }
+        void* dst = convert ? tmp : (char*) out + (size_t) r0 * N * oe;
+        std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, (const char*) x + (size_t) r0 * K * xe)},
+                                             {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)}, {DNNL_ARG_DST, usm(dmd, c.eng, dst)}};
+        if (bias) args.insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, usm(col_md, c.eng, bias)});
+        it->second.execute(c.strm, args);
+        if (convert) {
+            const size_t base = (size_t) r0 * N;
+            c.q.parallel_for(sycl::range<1>((size_t) (rows * N)), [=](sycl::id<1> i) {
+                store(out, out_dt, base + i[0], load(tmp, dt, i[0]));
+            });
+        }
     }
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }

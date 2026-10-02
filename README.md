@@ -57,7 +57,7 @@ The denoiser's 50 blocks run from the Rust engine alone and track the reference 
 | | reference | Rust + SYCL engine | |
 |---|---:|---:|---:|
 | 16.5k tokens (a 5 s clip) | 11.1 s | 8.95 s | 1.24x |
-| 47k tokens (a 15 s clip) | 58-63 s | ~50 s (10 of 50 blocks measured) | ~1.2x |
+| 47k tokens (a 15 s clip) | 58-63 s | 49.9 s | 1.16-1.27x |
 | of which attention, per block, 16.5k tokens | 102 ms | 96 ms | |
 | of which everything else, per block, 16.5k tokens | ~99 ms | 81 ms | |
 

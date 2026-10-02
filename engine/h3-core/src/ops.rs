@@ -82,6 +82,45 @@ impl Int8Linear {
     }
 }
 
+/// A plain linear layer with float weights, on the device.
+pub struct Linear {
+    /// [N, K], float32, half or bfloat16
+    pub weight: Tensor,
+    /// float32 [N]
+    pub bias: Option<Tensor>,
+}
+
+impl Linear {
+    pub fn inputs(&self) -> usize {
+        self.weight.shape[1]
+    }
+    pub fn outputs(&self) -> usize {
+        self.weight.shape[0]
+    }
+
+    /// `out = linear(x)`: x [M, K] in the weight's type, out [M, N] in `out`'s type.
+    pub fn forward(&self, x: &Tensor, out: &Tensor) -> Result<()> {
+        let (n, k) = (self.outputs(), self.inputs());
+        let m = x.elements() / k;
+        if x.dtype != self.weight.dtype {
+            return Err(Error(format!("linear: x is {:?} and the weight {:?}; they must be the same type", x.dtype, self.weight.dtype)));
+        }
+        if x.elements() != m * k || out.elements() != m * n {
+            return Err(Error(format!("linear: x {:?} and out {:?} do not fit a [{n}, {k}] weight", x.shape, out.shape)));
+        }
+        let bias = match &self.bias {
+            Some(b) => floats(b, "the bias", n)?,
+            None => std::ptr::null(),
+        };
+        let dev = x.buf.device();
+        // SAFETY: device pointers of this device, sizes checked above.
+        let rc = unsafe {
+            (dev.api.linear)(dev.ctx, x.buf.ptr(), x.dtype.kernel_code()?, m as i64, k as i64, self.weight.buf.ptr(), n as i64, bias, out.buf.ptr(), out.dtype.kernel_code()?)
+        };
+        dev.check(rc)
+    }
+}
+
 /// How a denoiser block's tokens are modulated: which table row each token uses, and the tables.
 pub struct Mod<'a> {
     /// int32 [M]
