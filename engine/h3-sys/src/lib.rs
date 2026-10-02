@@ -1,0 +1,141 @@
+//! Raw bindings to `libh3sycl.so`: one function pointer per declaration in `kernels/h3sycl.h`.
+//!
+//! The library is opened at run time (`dlopen`), not linked: the Rust side then builds anywhere, without the SYCL
+//! toolchain, and the kernels can be rebuilt without relinking the engine. Nothing here is safe to call directly;
+//! `h3-core` wraps it.
+
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::path::{Path, PathBuf};
+
+/// Element types of floating-point tensors (`H3S_F32` ...).
+pub const F32: c_int = 0;
+pub const F16: c_int = 1;
+pub const BF16: c_int = 2;
+
+extern "C" {
+    fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
+}
+const RTLD_NOW: c_int = 2;
+const RTLD_GLOBAL: c_int = 0x100;
+
+/// The functions of `h3sycl.h`, resolved once.
+#[allow(non_snake_case)]
+pub struct Api {
+    pub last_error: unsafe extern "C" fn() -> *const c_char,
+    pub open: unsafe extern "C" fn() -> *mut c_void,
+    pub destroy: unsafe extern "C" fn(*mut c_void),
+    pub device_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
+    pub alloc: unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void,
+    pub free: unsafe extern "C" fn(*mut c_void, *mut c_void),
+    pub mem_used: unsafe extern "C" fn(*mut c_void) -> u64,
+    pub mem_cap: unsafe extern "C" fn(*mut c_void) -> u64,
+    pub write: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
+    pub read: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
+    pub wait: unsafe extern "C" fn(*mut c_void) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub int8_linear: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *const c_void,  // x
+        c_int,          // x_dt
+        i64,            // M
+        i64,            // K
+        *const i8,      // w
+        i64,            // N
+        *const f32,     // wscale
+        i64,            // n_wscale
+        *const f32,     // bias
+        *mut c_void,    // out
+        c_int,          // out_dt
+        c_int,          // group
+    ) -> c_int,
+}
+
+fn dl_error() -> String {
+    // SAFETY: dlerror returns NULL or a NUL-terminated string owned by libc.
+    unsafe {
+        let e = dlerror();
+        if e.is_null() {
+            "unknown dlopen error".into()
+        } else {
+            CStr::from_ptr(e).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// Where the library is looked for: `$H3SYCL_LIB`, then beside the executable, then the loader's search path.
+pub fn candidates() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(p) = std::env::var("H3SYCL_LIB") {
+        v.push(PathBuf::from(p));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("libh3sycl.so"));
+        }
+    }
+    v.push(PathBuf::from("libh3sycl.so"));
+    v
+}
+
+impl Api {
+    /// Opens the library and resolves every function. The handle is never closed: the kernels live as long as the
+    /// process.
+    pub fn load() -> Result<Api, String> {
+        let mut tried = Vec::new();
+        for path in candidates() {
+            if path.components().count() > 1 && !path.exists() {
+                tried.push(format!("{} (no such file)", path.display()));
+                continue;
+            }
+            match Self::load_from(&path) {
+                Ok(api) => return Ok(api),
+                Err(e) => tried.push(format!("{}: {e}", path.display())),
+            }
+        }
+        Err(format!("libh3sycl.so could not be loaded:\n  {}", tried.join("\n  ")))
+    }
+
+    // each field's declared type is the annotation: the transmute target is inferred from it
+    #[allow(clippy::missing_transmute_annotations)]
+    pub fn load_from(path: &Path) -> Result<Api, String> {
+        let c = CString::new(path.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
+        // SAFETY: dlopen with a valid C string; the handle is checked.
+        let h = unsafe { dlopen(c.as_ptr(), RTLD_NOW | RTLD_GLOBAL) };
+        if h.is_null() {
+            return Err(dl_error());
+        }
+        macro_rules! sym {
+            ($name:literal) => {{
+                let n = CString::new($name).unwrap();
+                // SAFETY: `h` is a live handle; the symbol's type is the one declared in h3sycl.h.
+                let p = unsafe { dlsym(h, n.as_ptr()) };
+                if p.is_null() {
+                    return Err(format!("{} is missing from the library ({})", $name, dl_error()));
+                }
+                unsafe { std::mem::transmute::<*mut c_void, _>(p) }
+            }};
+        }
+        Ok(Api {
+            last_error: sym!("h3s_last_error"),
+            open: sym!("h3s_open"),
+            destroy: sym!("h3s_destroy"),
+            device_name: sym!("h3s_device_name"),
+            alloc: sym!("h3s_alloc"),
+            free: sym!("h3s_free"),
+            mem_used: sym!("h3s_mem_used"),
+            mem_cap: sym!("h3s_mem_cap"),
+            write: sym!("h3s_write"),
+            read: sym!("h3s_read"),
+            wait: sym!("h3s_wait"),
+            int8_linear: sym!("h3s_int8_linear"),
+        })
+    }
+
+    /// The library's last error on this thread.
+    pub fn error(&self) -> String {
+        // SAFETY: h3s_last_error returns a NUL-terminated string that lives until the thread's next failing call.
+        unsafe { CStr::from_ptr((self.last_error)()).to_string_lossy().into_owned() }
+    }
+}

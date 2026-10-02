@@ -1,0 +1,22 @@
+# The build-and-run image of the H3 engine: Intel's SYCL compiler and oneDNN (the kernels), Rust (the engine),
+# node (the front end's TypeScript compiler runs on it). Everything is built inside it, so the host needs podman only.
+#
+# The base is a public image with the oneAPI 2026 compiler and the Level Zero driver stack for Xe2 (Arc B-series)
+# already set up, including Intel's apt repository.
+ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
+FROM ${BASE}
+
+RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      intel-oneapi-dnnl-devel-2026.0 build-essential ca-certificates curl nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust, for every user id the container may run as; crates are fetched into the mounted source tree's .cache/
+ARG RUST=1.97.1
+ENV RUSTUP_HOME=/opt/rust/rustup PATH=/opt/rust/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy \
+    && chmod -R a+rX /opt/rust
+
+ENV ONEAPI_DEVICE_SELECTOR=level_zero:0 ZES_ENABLE_SYSMAN=1
+WORKDIR /src
+ENTRYPOINT []
+CMD ["/bin/bash"]

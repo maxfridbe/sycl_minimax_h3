@@ -1,0 +1,173 @@
+//! The GPU and its memory: a context of `libh3sycl`, buffers that free themselves, tensors with a type and a shape.
+
+use std::ffi::{c_void, CStr};
+use std::sync::Arc;
+
+use h3_sys::Api;
+
+use crate::dtype::DType;
+use crate::{Error, Result};
+
+/// One GPU: the kernel library and its context (an in-order SYCL queue). Shared by reference count; the context is
+/// destroyed, with everything still allocated on it, when the last holder goes.
+pub struct Device {
+    pub(crate) api: Api,
+    pub(crate) ctx: *mut c_void,
+}
+
+// SAFETY: the context is a SYCL queue plus state guarded inside the library (h3sycl.h: the copy and allocation
+// functions are thread-safe, errors are per thread). Kernels are queued from one thread at a time by the engine.
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
+
+impl Device {
+    /// Opens the first GPU.
+    pub fn open() -> Result<Arc<Device>> {
+        let api = Api::load()?;
+        // SAFETY: h3s_open takes nothing and returns NULL on failure.
+        let ctx = unsafe { (api.open)() };
+        if ctx.is_null() {
+            return Err(Error(format!("no usable GPU: {}", api.error())));
+        }
+        Ok(Arc::new(Device { api, ctx }))
+    }
+
+    pub fn name(&self) -> String {
+        // SAFETY: the name lives as long as the context.
+        unsafe { CStr::from_ptr((self.api.device_name)(self.ctx)).to_string_lossy().into_owned() }
+    }
+
+    /// Bytes allocated through this device, and the most it will allocate.
+    pub fn mem_used(&self) -> u64 {
+        unsafe { (self.api.mem_used)(self.ctx) }
+    }
+    pub fn mem_cap(&self) -> u64 {
+        unsafe { (self.api.mem_cap)(self.ctx) }
+    }
+
+    /// Device memory. Refused (an error, not a stall) when it would pass the cap.
+    pub fn alloc(self: &Arc<Self>, bytes: usize) -> Result<Buf> {
+        // SAFETY: plain call; NULL is the failure.
+        let ptr = unsafe { (self.api.alloc)(self.ctx, bytes as u64) };
+        if ptr.is_null() {
+            return Err(Error(self.api.error()));
+        }
+        Ok(Buf { dev: self.clone(), ptr, bytes })
+    }
+
+    /// Waits until everything queued has run.
+    pub fn wait(&self) -> Result<()> {
+        self.check(unsafe { (self.api.wait)(self.ctx) })
+    }
+
+    pub(crate) fn check(&self, rc: i32) -> Result<()> {
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error(self.api.error()))
+        }
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        // SAFETY: last holder; every Buf holds an Arc, so none is alive.
+        unsafe { (self.api.destroy)(self.ctx) }
+    }
+}
+
+/// A block of device memory. Freed on drop (the library waits for queued work first).
+pub struct Buf {
+    dev: Arc<Device>,
+    ptr: *mut c_void,
+    bytes: usize,
+}
+
+// SAFETY: a device pointer is only dereferenced by the library, on the queue.
+unsafe impl Send for Buf {}
+unsafe impl Sync for Buf {}
+
+impl Buf {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+    pub fn device(&self) -> &Arc<Device> {
+        &self.dev
+    }
+
+    /// Copies host bytes to `offset`. Returns when the copy is done.
+    pub fn write(&self, offset: usize, src: &[u8]) -> Result<()> {
+        if offset + src.len() > self.bytes {
+            return Err(Error(format!("write of {} bytes at {offset} passes a {}-byte buffer", src.len(), self.bytes)));
+        }
+        // SAFETY: bounds checked above; the library waits for the copy before returning.
+        let rc = unsafe {
+            (self.dev.api.write)(self.dev.ctx, self.ptr.cast::<u8>().add(offset).cast(), src.as_ptr().cast(), src.len() as u64)
+        };
+        self.dev.check(rc)
+    }
+
+    /// Copies device bytes from `offset` to the host, after everything queued before it.
+    pub fn read(&self, offset: usize, dst: &mut [u8]) -> Result<()> {
+        if offset + dst.len() > self.bytes {
+            return Err(Error(format!("read of {} bytes at {offset} passes a {}-byte buffer", dst.len(), self.bytes)));
+        }
+        // SAFETY: bounds checked above.
+        let rc = unsafe {
+            (self.dev.api.read)(self.dev.ctx, dst.as_mut_ptr().cast(), self.ptr.cast::<u8>().add(offset).cast_const().cast(), dst.len() as u64)
+        };
+        self.dev.check(rc)
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        // SAFETY: allocated by this device; freed once.
+        unsafe { (self.dev.api.free)(self.dev.ctx, self.ptr) }
+    }
+}
+
+/// Device memory with a type and a shape (row-major).
+pub struct Tensor {
+    pub buf: Buf,
+    pub dtype: DType,
+    pub shape: Vec<usize>,
+}
+
+impl Tensor {
+    pub fn new(dev: &Arc<Device>, dtype: DType, shape: &[usize]) -> Result<Tensor> {
+        let n: usize = shape.iter().product();
+        Ok(Tensor { buf: dev.alloc(n * dtype.size())?, dtype, shape: shape.to_vec() })
+    }
+
+    pub fn from_bytes(dev: &Arc<Device>, dtype: DType, shape: &[usize], bytes: &[u8]) -> Result<Tensor> {
+        let t = Tensor::new(dev, dtype, shape)?;
+        if bytes.len() != t.buf.len() {
+            return Err(Error(format!("{} bytes for a {:?} tensor of shape {:?}", bytes.len(), dtype, shape)));
+        }
+        t.buf.write(0, bytes)?;
+        Ok(t)
+    }
+
+    pub fn elements(&self) -> usize {
+        self.shape.iter().product()
+    }
+
+    /// The tensor's bytes, read back from the device.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut v = vec![0u8; self.buf.len()];
+        self.buf.read(0, &mut v)?;
+        Ok(v)
+    }
+
+    /// The tensor's values as float32, read back from the device.
+    pub fn to_f32(&self) -> Result<Vec<f32>> {
+        crate::dtype::bytes_to_f32(&self.to_bytes()?, self.dtype)
+    }
+}

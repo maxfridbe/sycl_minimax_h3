@@ -1,11 +1,10 @@
-// h3sycl.cpp - SYCL kernels for MiniMax H3 on Intel Arc (Xe2), loaded into the PyTorch-XPU process.
+// h3sycl.cpp - SYCL kernels for MiniMax H3 on Intel Arc (Xe2). The C ABI is h3sycl.h; two hosts use it:
 //
-// A plain C ABI (ctypes-friendly). Every pointer is a USM device pointer from the SAME SYCL context PyTorch uses,
-// and the queue is PyTorch's own in-order queue, so calls here are ordered with PyTorch's operations and nothing
-// is copied or synchronized by hand.
+//   the Rust engine (engine/)        h3s_open(): the library owns the queue and the device memory (h3s_alloc ...)
+//   the PyTorch reference pipeline   h3s_create(queue): PyTorch's own in-order queue and its tensors' device pointers,
+//                                    so calls are ordered with PyTorch's operations and nothing is copied
 //
-//   h3s_create(queue)                 a context around PyTorch's sycl::queue (scratch buffers, oneDNN engine)
-//   h3s_int8_linear(...)              comfy-kitchen's int8_linear: [rotate] -> quantize rows -> int8 GEMM -> rescale
+// Every data pointer is a USM device pointer of the context's queue.
 //
 // int8_linear, as comfy-kitchen's eager backend defines it:
 //   x_rot = x . H           per group of `group` features, H the normalized regular Hadamard matrix (ConvRot)
@@ -13,14 +12,18 @@
 //   q     = clamp(round(x_rot / s_r), -128, 127)                 int8
 //   acc   = q . W^T                                              int32, W int8 [N, K]   <- the matrix engine, oneDNN
 //   y     = cast(acc * (s_r * w_scale)) + bias                   in the output type
+#include "h3sycl.h"
+
 #include <sycl/sycl.hpp>
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -54,32 +57,7 @@ inline void store(void* p, int dt, size_t i, float v) {
         default: ((float*) p)[i] = v;
     }
 }
-// a value rounded through the output type (what "cast, then add the bias in that type" does)
-inline float through(int dt, float v) {
-    switch (dt) {
-        case F16: return (float) (sycl::half) v;
-        case BF16: return bf16_to_f32(f32_to_bf16(v));
-        default: return v;
-    }
-}
-
 constexpr int kMaxGroup = 256;
-
-// v[0..g) *= regular Hadamard (h4 (x) h4 (x) ...), normalized by 1/sqrt(g). g a power of 4, <= 256.
-inline void hadamard(float* v, int g) {
-    for (int s = 1; s < g; s *= 4)
-        for (int b = 0; b < g; b += 4 * s)
-            for (int i = b; i < b + s; ++i) {
-                const float a = v[i], bb = v[i + s], c = v[i + 2 * s], d = v[i + 3 * s];
-                v[i] = a + bb + c - d;
-                v[i + s] = a + bb - c + d;
-                v[i + 2 * s] = a - bb + c + d;
-                v[i + 3 * s] = -a + bb + c + d;
-            }
-    float norm = 1.0f;
-    for (int s = 1; s < g; s *= 4) norm *= 0.5f;       // 1/sqrt(g) = 2^-(log4 g)
-    for (int i = 0; i < g; ++i) v[i] *= norm;
-}
 
 struct Ctx {
     sycl::queue q;
@@ -88,12 +66,19 @@ struct Ctx {
     int8_t* xq = nullptr; size_t xq_cap = 0;       // quantized activations [M, K]
     float* rs = nullptr; size_t rs_cap = 0;        // per-row scale times the scalar weight scale [M]
     float* gmax = nullptr; size_t gmax_cap = 0;    // per-(row, group) absmax
-    uint16_t* xr = nullptr; size_t xr_cap = 0;     // rotated activations [M, K], in x's 16-bit type (f32 x: f16)
+    float* xr = nullptr; size_t xr_cap = 0;        // rotated activations [M, K], float32 (see pass 1)
     int32_t* acc = nullptr; size_t acc_cap = 0;    // fallback path: one chunk of int32 products [C, N]
     void* had[3] = {nullptr, nullptr, nullptr};    // the normalized 256 x 256 Hadamard matrix per Dt
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int, int>, dnnl::matmul> gemm;   // (M, K, N, out, bias, per_n)
     std::map<std::tuple<int64_t, int, int>, dnnl::matmul> rot;                            // (rows, group, dt)
     bool fused_ok = true;                          // oneDNN took the post-op form (else: int32 + our rescale kernel)
+    bool rot_f32 = true;                           // oneDNN took a float32 result for the 16-bit rotation
+    // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
+    // library refuses an allocation that would pass the cap instead of asking the driver
+    std::mutex mem_mu;
+    std::unordered_map<void*, size_t> mem;
+    size_t mem_used = 0, mem_cap = 0;
+    std::string name;
 
     template <typename T> T* grow(T*& p, size_t& cap, size_t n) {
         if (n > cap) {
@@ -144,19 +129,84 @@ void* hadamard_matrix(Ctx& c, int g, int dt) {
     return c.had[dt];
 }
 
+// what both ways of making a context share: the oneDNN engine on the queue, the device's name, the memory cap
+void init(Ctx& c) {
+    c.eng = dnnl::sycl_interop::make_engine(c.q.get_device(), c.q.get_context());
+    c.strm = dnnl::sycl_interop::make_stream(c.eng, c.q);
+    c.name = c.q.get_device().get_info<sycl::info::device::name>();
+    const uint64_t total = c.q.get_device().get_info<sycl::info::device::global_mem_size>();
+    double frac = 0.92;                            // of the card; the kernels' scratch buffers come on top
+    if (const char* e = std::getenv("H3S_MEM_FRACTION")) frac = std::min(0.97, std::max(0.05, std::atof(e)));
+    c.mem_cap = (size_t) ((double) total * frac);
+}
+
 }  // namespace
 
 extern "C" {
 
-const char* h3s_last_error() { return g_err.c_str(); }
+const char* h3s_last_error(void) { return g_err.c_str(); }
 
-// `sycl_queue`: a `sycl::queue*` (PyTorch: torch.xpu.current_stream().sycl_queue). The queue is copied (a handle).
 void* h3s_create(void* sycl_queue) try {
-    auto* c = new Ctx{*static_cast<sycl::queue*>(sycl_queue), {}, {}};
-    c->eng = dnnl::sycl_interop::make_engine(c->q.get_device(), c->q.get_context());
-    c->strm = dnnl::sycl_interop::make_stream(c->eng, c->q);
+    auto* c = new Ctx{*static_cast<sycl::queue*>(sycl_queue)};
+    init(*c);
     return c;
 } catch (const std::exception& e) { g_err = e.what(); return nullptr; }
+
+void* h3s_open(void) try {
+    auto* c = new Ctx{sycl::queue(sycl::gpu_selector_v, sycl::property::queue::in_order())};
+    init(*c);
+    return c;
+} catch (const std::exception& e) { g_err = e.what(); return nullptr; }
+
+const char* h3s_device_name(void* ctx) { return static_cast<Ctx*>(ctx)->name.c_str(); }
+uint64_t h3s_mem_cap(void* ctx) { return static_cast<Ctx*>(ctx)->mem_cap; }
+uint64_t h3s_mem_used(void* ctx) {
+    auto& c = *static_cast<Ctx*>(ctx);
+    std::lock_guard<std::mutex> l(c.mem_mu);
+    return c.mem_used;
+}
+
+void* h3s_alloc(void* ctx, uint64_t bytes) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    std::lock_guard<std::mutex> l(c.mem_mu);
+    if (c.mem_used + bytes > c.mem_cap) {
+        g_err = "h3s_alloc: " + std::to_string(bytes >> 20) + " MiB would pass the device memory cap (" +
+                std::to_string(c.mem_used >> 20) + " of " + std::to_string(c.mem_cap >> 20) + " MiB in use)";
+        return nullptr;
+    }
+    void* p = sycl::malloc_device(bytes ? bytes : 1, c.q);
+    if (!p) { g_err = "h3s_alloc: the device refused " + std::to_string(bytes >> 20) + " MiB"; return nullptr; }
+    c.mem.emplace(p, bytes);
+    c.mem_used += bytes;
+    return p;
+} catch (const std::exception& e) { g_err = e.what(); return nullptr; }
+
+void h3s_free(void* ctx, void* p) {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (!p) return;
+    c.q.wait();                                    // nothing queued may still read or write it
+    std::lock_guard<std::mutex> l(c.mem_mu);
+    auto it = c.mem.find(p);
+    if (it == c.mem.end()) return;
+    c.mem_used -= it->second;
+    c.mem.erase(it);
+    sycl::free(p, c.q);
+}
+
+int h3s_write(void* ctx, void* dst, const void* src_host, uint64_t bytes) try {
+    static_cast<Ctx*>(ctx)->q.memcpy(dst, src_host, bytes).wait();
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_read(void* ctx, void* dst_host, const void* src, uint64_t bytes) try {
+    static_cast<Ctx*>(ctx)->q.memcpy(dst_host, src, bytes).wait();
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_wait(void* ctx) try {
+    static_cast<Ctx*>(ctx)->q.wait_and_throw();
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
 
 void h3s_destroy(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx);
@@ -164,14 +214,11 @@ void h3s_destroy(void* ctx) {
     c->q.wait();
     for (void* p : {(void*) c->xq, (void*) c->rs, (void*) c->gmax, (void*) c->xr, (void*) c->acc, c->had[0], c->had[1], c->had[2]})
         if (p) sycl::free(p, c->q);
+    for (auto& [p, n] : c->mem) sycl::free(p, c->q);
     delete c;
 }
 
-// x [M, K] (x_dt), w int8 [N, K], wscale float32 [1 or N], bias float32 [N] or null, out [M, N] (out_dt).
-// group = 0: no rotation; else the ConvRot group size (a power of 4, <= 256, dividing K).
-// Returns 0, or -1 with h3s_last_error(). Asynchronous: the result is complete when the queue reaches it.
-//
-// The passes:
+// The passes (the contract is in h3sycl.h):
 //   1. rotation     x_rot = x . H per group: ONE GEMM [M * K / g, g] x [g, g] on the matrix engine (it is ~0.3 ms;
 //                   a scalar butterfly kernel was 5 ms a pass)
 //   2. row scales   absmax per (row, group), then per row
@@ -199,16 +246,30 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
     const void* xs = x;          // what the quantizer reads
     int xs_dt = x_dt;
     if (rot) {
-        uint16_t* xr = c.grow(c.xr, c.xr_cap, (size_t) M * K);
+        float* xr = c.grow(c.xr, c.xr_cap, (size_t) M * K);
         if (!xr) { g_err = "h3s_int8_linear: device allocation failed"; return -1; }
-        const int r_dt = x_dt == F32 ? F16 : x_dt;                       // the rotated copy is 16-bit
+        // The rotated copy is float32. In bfloat16 (8 significant bits) its rounding moves ~5% of the values to the
+        // neighbouring int8 level in pass 3: 0.7% error on the layer's output, measured against exact arithmetic,
+        // next to the 0.9% the 8-bit quantization costs by itself.
+        int r_dt = c.rot_f32 ? F32 : x_dt;
         const int64_t rows = M * (K / g);
         memory::desc smd({rows, g}, ddt(x_dt), memory::format_tag::ab);
         memory::desc hmd({g, g}, ddt(x_dt), memory::format_tag::ab);
-        memory::desc dmd({rows, g}, ddt(r_dt), memory::format_tag::ab);
         auto key = std::make_tuple(rows, g, x_dt);
         auto it = c.rot.find(key);
-        if (it == c.rot.end()) it = c.rot.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, hmd, dmd))).first;
+        if (it == c.rot.end()) {
+            try {
+                memory::desc d32({rows, g}, ddt(r_dt), memory::format_tag::ab);
+                it = c.rot.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, hmd, d32))).first;
+            } catch (const dnnl::error& e) {
+                if (r_dt == x_dt) throw;
+                std::fprintf(stderr, "h3sycl: oneDNN refused a float32 rotation result (%s); keeping the input's type\n", e.what());
+                c.rot_f32 = false; r_dt = x_dt;
+                memory::desc d16({rows, g}, ddt(r_dt), memory::format_tag::ab);
+                it = c.rot.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, hmd, d16))).first;
+            }
+        }
+        memory::desc dmd({rows, g}, ddt(r_dt), memory::format_tag::ab);
         it->second.execute(c.strm, {{DNNL_ARG_SRC, usm(smd, c.eng, x)}, {DNNL_ARG_WEIGHTS, usm(hmd, c.eng, hadamard_matrix(c, g, x_dt))},
                                     {DNNL_ARG_DST, usm(dmd, c.eng, xr)}});
         xs = xr; xs_dt = r_dt;

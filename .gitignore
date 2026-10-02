@@ -1,9 +1,13 @@
-build*/
+dist/
+.cache/
+out/
+examples/
+engine/target/
+wfe/build/
 __pycache__/
+*.so
+*.so.*
 *.pt
 *.safetensors
 *.gguf
 *.mp4
-examples/
-*.so
-*.so.*
