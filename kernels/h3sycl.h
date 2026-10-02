@@ -95,7 +95,9 @@ int h3s_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void*
 
 /* Attention: out = softmax(q . k^T / sqrt(D)) . v, per head. q, k, v: S token rows of H heads x D features, row s at
  * element s * stride (as in h3s_rms_rope), in type dt; out [S, H * D] in out_dt. The S x S scores are never
- * held whole: they are made, used and overwritten a block of query rows at a time (at most ~1.5 GiB of them). */
+ * held whole: the work is done a block of query rows at a time, sized so that a block's score table is at most
+ * 1.5 GiB (H3S_ATTN_TABLE_MB in the environment overrides; with oneDNN's fused kernel no table is written at all, and
+ * the bound is what is at stake if oneDNN silently falls back - see h3sycl.cpp). */
 int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                   int64_t stride, void* out, int out_dt);
 

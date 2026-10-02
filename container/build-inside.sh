@@ -2,11 +2,14 @@
 # Runs inside the container (build.sh starts it), in /src.
 set -euo pipefail
 source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1 || true
-DNNL=/opt/intel/oneapi/dnnl/2026.0
+DNNL=${H3_DNNL:-/opt/onednn}      # oneDNN: headers in include/, the library in lib/ (the image builds 3.12 there)
+# a oneDNN with container/onednn-sdpa-no-fallback.patch says so with this file: only then may attention use large
+# chunks (kernels/h3sycl.cpp, attention_fused)
+SDPA_FLAG=; [ -f "$DNNL/H3_SDPA_NO_FALLBACK" ] && SDPA_FLAG=-DH3S_SDPA_NO_FALLBACK
 
 kernels() {
   echo "==> kernels: libh3sycl.so (icpx, SYCL + oneDNN)"
-  icpx -O3 -fsycl -fPIC -shared -std=c++20 -Wall -I"$DNNL/include" kernels/h3sycl.cpp \
+  icpx -O3 -fsycl -fPIC -shared -std=c++20 -Wall $SDPA_FLAG -I"$DNNL/include" kernels/h3sycl.cpp \
        -L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN' -o dist/libh3sycl.so
   cp -L "$DNNL/lib/libdnnl.so.3" dist/        # shipped beside the library: hosts without a shared oneDNN load it too
 }
@@ -22,6 +25,7 @@ wfe() {
 }
 tools() {
   echo "==> tools: oneDNN probes (gemm_bench, sdpa_probe)"
+  cp -L "$DNNL/lib/libdnnl.so.3" dist/
   for t in gemm_bench sdpa_probe; do
     icpx -O2 -fsycl -std=c++20 -I"$DNNL/include" kernels/$t.cpp -L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN' -o dist/$t
   done

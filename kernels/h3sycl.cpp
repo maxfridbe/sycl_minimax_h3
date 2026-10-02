@@ -16,6 +16,7 @@
 
 #include <sycl/sycl.hpp>
 #include <oneapi/dnnl/dnnl.hpp>
+#include <oneapi/dnnl/dnnl_graph.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include <chrono>
@@ -93,6 +94,17 @@ struct Ctx {
     float* rowv = nullptr; size_t rowv_cap = 0;    // per row: its max
     bool profile = false;                          // H3S_PROFILE: attention waits per phase and reports its timings
     struct Attn { dnnl::matmul qk; dnnl::matmul pv; };
+    // oneDNN's fused attention, compiled per (rows, S, H, D); see attention_fused
+    struct Sdpa {
+        dnnl::graph::compiled_partition cp;
+        std::vector<dnnl::graph::logical_tensor> in;    // in the partition's port order
+        std::vector<int> slot;                          // which of (q, k, scale, v) each port takes
+        dnnl::graph::logical_tensor out;
+    };
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Sdpa> sdpa;
+    float sdpa_scale = 0.0f;                       // 1 / sqrt(D): a host scalar oneDNN reads when the kernel runs
+    bool sdpa_ok = true;                           // false once oneDNN has refused the fused form
+    size_t attn_table_bytes = 1536ull << 20;       // the most score-table memory a chunk of attention may take
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Attn> attn;                   // (H, rows, S, D)
     void* had[3] = {nullptr, nullptr, nullptr};    // the normalized 256 x 256 Hadamard matrix per Dt
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int, int>, dnnl::matmul> gemm;   // (M, K, N, out, bias, per_n)
@@ -175,7 +187,12 @@ void init(Ctx& c) {
     double frac = 0.94;                            // of the card, for h3s_alloc and the kernels' scratch together
     if (const char* e = std::getenv("H3S_MEM_FRACTION")) frac = std::min(0.97, std::max(0.05, std::atof(e)));
     c.mem_cap = (size_t) ((double) total * frac);
+#ifdef H3S_SDPA_NO_FALLBACK
+    // built against a oneDNN with container/onednn-sdpa-no-fallback.patch: ask it to refuse, not to fall back
+    setenv("_ONEDNN_GRAPH_SDPA_NO_FALLBACK", "1", 1);
+#endif
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
+    if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
 }
 
 }  // namespace
@@ -491,36 +508,170 @@ int h3s_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void*
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
-// Attention with a bounded score table. A chunk of query rows at a time, so the scores held at once are
-// heads x rows x S <= ~1.5 GiB whatever S is:
+// Attention, a chunk of query rows at a time. Two forms; both keep what is in device memory bounded whatever S is.
 //
-//   scores   q . k^T               oneDNN, on the matrix engine          -> half [H, rows, S]
-//   weights  exp(score - row max)  ours, in place, one score per work-item (the row's max from a read-only pass)
-//   values   weights . [v | 1]     oneDNN, on the matrix engine          -> float32 [H, rows, D + 1]
-//   out      values / row sum      ours, folded into the copy back to token order
+// 1. attention_fused - oneDNN's fused kernel: scores, softmax and the weighted sum over tiles that stay in the GPU's
+//    registers, so no score table is written at all. About 5x the speed of form 2. oneDNN reaches it only through
+//    its graph interface, and only for one exact form of the pattern (found with kernels/sdpa_probe.cpp and oneDNN's
+//    sdp_primitive_config.cpp):
+//        MatMul(q, k, transpose_b) -> Multiply(scale) -> SoftMax(axis -1, mode inf_as_zero) -> MatMul(., v)
+//    with q, k, v, the weights and the result 16-bit, the two tensors in between declared FLOAT32, and the scale a
+//    float32 HOST scalar; and it needs oneDNN 3.12 (3.11 has no such kernel on this card).
+//    When oneDNN does not take that form as its fused kernel it runs the same graph as separate steps with the
+//    whole score table of the call in device memory, and nothing tells the caller which happened. Called with all
+//    S query rows at 16.5k tokens that table is 30 GiB; the xe driver has no out-of-memory error, the card spilled
+//    into host RAM and the machine went down (2026-10-02). Two defences:
+//      - built against the image's oneDNN (patched: container/onednn-sdpa-no-fallback.patch, -DH3S_SDPA_NO_FALLBACK),
+//        oneDNN is told to fail instead of falling back, and form 2 takes over;
+//      - built against any other oneDNN, the rows per call are chosen so that even the fallback's tables (10 bytes
+//        per score) stay under ~1.5 GiB - safe, but the small chunks cost about a third of the speed.
 //
-// The column of ones beside v makes the matrix engine deliver each row's sum of weights with the values, so no pass
-// of ours has to add them up. q, k, v are stored by token; the multiplies want them by head, so k and v are copied
-// once and q a chunk at a time, in IEEE half (11 significant bits where bfloat16 has 8); 1 / sqrt(D) rides on q.
+// 2. attention_split - ours, used when oneDNN refuses form 1 (an older oneDNN):
+//      scores   q . k^T               oneDNN, on the matrix engine          -> half [H, rows, S]
+//      weights  exp(score - row max)  ours, in place, one score per work-item (the row's max from a read-only pass)
+//      values   weights . [v | 1]     oneDNN, on the matrix engine          -> float32 [H, rows, D + 1]
+//      out      values / row sum      ours, folded into the copy back to token order
+//    (The column of ones beside v makes the matrix engine deliver each row's sum of weights with the values.
+//    oneDNN's stand-alone softmax is not used: it took 1.0 s of a 1.2 s call on rows 16.5k long.)
 //
-// Two things oneDNN offers for this and why they are not used:
-//  - its stand-alone softmax: 1.0 s of a 1.2 s call at 16.5k tokens (it is slow on rows that long);
-//  - its fused attention through the graph interface (MatMul -> Divide -> SoftMax -> MatMul): on this card oneDNN
-//    3.11 runs every form of that pattern as separate steps with the WHOLE S x S table in device memory
-//    (kernels/sdpa_probe.cpp), and nothing tells the caller. At 16.5k tokens that table is 30 GiB; the xe driver has
-//    no out-of-memory error, the card spilled into host RAM and the machine went down (2026-10-02).
+// q, k, v are stored by token; both forms want them by head, so k and v are copied once per call and q a chunk at a
+// time, in IEEE half (11 significant bits where bfloat16 has 8).
 //
 // H3S_PROFILE=1 in the environment: wait after every phase and report where a call's time went (slower).
+
+static Ctx::Sdpa& sdpa_for(Ctx& c, int64_t rows, int64_t S, int64_t H, int64_t D) {
+    auto key = std::make_tuple(rows, S, H, D);
+    auto it = c.sdpa.find(key);
+    if (it != c.sdpa.end()) return it->second;
+    using namespace dnnl::graph;
+    using lt = logical_tensor;
+    const auto f16 = lt::data_type::f16, f32 = lt::data_type::f32;
+    const auto strided = lt::layout_type::strided;
+    size_t id = 0;
+    lt q(id++, f16, lt::dims {1, H, rows, D}, strided), k(id++, f16, lt::dims {1, H, S, D}, strided);
+    lt scale(id++, f32, lt::dims {}, strided, lt::property_type::host_scalar);
+    lt v(id++, f16, lt::dims {1, H, S, D}, strided);
+    lt score(id++, f32, lt::dims {1, H, rows, S}, strided), scaled(id++, f32, lt::dims {1, H, rows, S}, strided);
+    lt probs(id++, f16, lt::dims {1, H, rows, S}, strided), out(id++, f16, lt::dims {1, H, rows, D}, strided);
+    op bmm1(id++, op::kind::MatMul, {q, k}, {score}, "scores");
+    bmm1.set_attr<bool>(op::attr::transpose_b, true);
+    op mul(id++, op::kind::Multiply, {score, scale}, {scaled}, "scale");
+    op sm(id++, op::kind::SoftMax, {scaled}, {probs}, "softmax");
+    sm.set_attr<int64_t>(op::attr::axis, -1);
+    sm.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+    op bmm2(id++, op::kind::MatMul, {probs, v}, {out}, "values");
+    graph g(dnnl::engine::kind::gpu);
+    g.add_op(bmm1); g.add_op(mul); g.add_op(sm); g.add_op(bmm2);
+    g.finalize();
+    auto parts = g.get_partitions();
+    if (parts.size() != 1 || !parts[0].is_supported())
+        throw std::runtime_error("oneDNN did not take attention as one partition");
+    const lt mine[4] = {q, k, scale, v};
+    Ctx::Sdpa sd;
+    for (const auto& port : parts[0].get_input_ports())
+        for (int i = 0; i < 4; ++i)
+            if (mine[i].get_id() == port.get_id()) { sd.in.push_back(mine[i]); sd.slot.push_back(i); }
+    if (sd.in.size() != 4) throw std::runtime_error("oneDNN's attention partition has unexpected inputs");
+    sd.cp = parts[0].compile(sd.in, {out}, c.eng);
+    sd.out = sd.cp.query_logical_tensor(out.get_id());
+    return c.sdpa.emplace(key, std::move(sd)).first->second;
+}
+
+// Form 1. Returns false (having queued nothing) when oneDNN refuses the pattern; throws on anything else.
+static bool attention_fused(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                            int64_t stride, void* out, int out_dt) {
+    sycl::queue& qu = c.q;
+#ifdef H3S_SDPA_NO_FALLBACK
+    // This oneDNN cannot fall back (see init): the fused kernel or an error. So the chunk is sized for speed alone -
+    // measured at 16.5k keys: 174 rows per call 156 ms, 464 rows 99 ms, 1859 rows 89 ms.
+    const int64_t rows_max = std::min<int64_t>(S, 2048);
+#else
+    // rows per chunk: if oneDNN falls back to separate steps it holds scores and scaled scores in float32 and the
+    // weights in half - 10 bytes per score. Keep that under the table budget (1.5 GiB unless H3S_ATTN_TABLE_MB says
+    // otherwise).
+    const int64_t rows_max = std::max<int64_t>(1, std::min<int64_t>(S, (int64_t) c.attn_table_bytes / (H * S * 10)));
+#endif
+    try {
+        sdpa_for(c, std::min(rows_max, S), S, H, D);
+        if (S % rows_max != 0 && S > rows_max) sdpa_for(c, S % rows_max, S, H, D);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "h3sycl: oneDNN's fused attention is not available (%s); using the split form\n", e.what());
+        return false;
+    }
+    const size_t n = (size_t) S * H * D;
+    uint16_t* hq = c.grow(c.hq, c.hq_cap, (size_t) H * rows_max * D);
+    uint16_t* hk = c.grow(c.hk, c.hk_cap, n);
+    uint16_t* hv = c.grow(c.hv, c.hv_cap, n);
+    float* aof = c.grow(c.ao, c.ao_cap, (size_t) H * rows_max * D);     // used as half [H, rows, D] here
+    if (!hq || !hk || !hv || !aof) throw std::runtime_error(g_err);
+    sycl::half* ao = (sycl::half*) aof;
+    c.sdpa_scale = 1.0f / std::sqrt((float) D);
+
+    const bool prof = c.profile;
+    double t_ph[3] = {0, 0, 0};
+    auto clock = std::chrono::steady_clock::now();
+    auto lap = [&](int i) {
+        if (!prof) return;
+        qu.wait();
+        const auto now = std::chrono::steady_clock::now();
+        t_ph[i] += std::chrono::duration<double, std::milli>(now - clock).count();
+        clock = now;
+    };
+    lap(0);
+    qu.parallel_for(sycl::range<3>((size_t) H, (size_t) S, (size_t) D), [=](sycl::id<3> id) {
+        const size_t src = id[1] * stride + id[0] * D + id[2], dst = (id[0] * S + id[1]) * D + id[2];
+        ((sycl::half*) hk)[dst] = (sycl::half) load(k, dt, src);
+        ((sycl::half*) hv)[dst] = (sycl::half) load(v, dt, src);
+    });
+    for (int64_t r0 = 0; r0 < S; r0 += rows_max) {
+        const int64_t rows = std::min(rows_max, S - r0);
+        qu.parallel_for(sycl::range<3>((size_t) H, (size_t) rows, (size_t) D), [=](sycl::id<3> id) {
+            ((sycl::half*) hq)[(id[0] * rows + id[1]) * D + id[2]] = (sycl::half) load(q, dt, (r0 + id[1]) * stride + id[0] * D + id[2]);
+        });
+        Ctx::Sdpa& sd = sdpa_for(c, rows, S, H, D);
+        void* const handles[4] = {hq, hk, nullptr, hv};
+        std::vector<dnnl::graph::tensor> in;
+        for (size_t i = 0; i < sd.in.size(); ++i) {
+            if (sd.slot[i] == 2) in.push_back(dnnl::graph::tensor::make_scalar_tensor(sd.in[i], &c.sdpa_scale));
+            else in.emplace_back(sd.in[i], c.eng, handles[sd.slot[i]]);
+        }
+        lap(0);
+        sd.cp.execute(c.strm, in, {dnnl::graph::tensor(sd.out, c.eng, ao)});
+        lap(1);
+        // back to token order: out [S, H * D]
+        qu.parallel_for(sycl::range<3>((size_t) rows, (size_t) H, (size_t) D), [=](sycl::id<3> id) {
+            store(out, out_dt, ((r0 + id[0]) * H + id[1]) * D + id[2], (float) ao[(id[1] * rows + id[0]) * D + id[2]]);
+        });
+        lap(2);
+    }
+    if (prof)
+        std::fprintf(stderr, "h3sycl: attention (fused) S=%lld, %lld rows per chunk: copies %.1f ms, attention %.1f, out %.1f\n",
+                     (long long) S, (long long) rows_max, t_ph[0], t_ph[1], t_ph[2]);
+    return true;
+}
+
+static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                           int64_t stride, void* out, int out_dt);
+
 int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                   int64_t stride, void* out, int out_dt) try {
     auto& c = *static_cast<Ctx*>(ctx);
     if (S <= 0 || H <= 0 || D <= 0) return 0;
     if (stride < H * D) { g_err = "h3s_attention: the row stride is shorter than a row"; return -1; }
+    if (c.sdpa_ok) {
+        if (attention_fused(c, q, k, v, dt, S, H, D, stride, out, out_dt)) return 0;
+        c.sdpa_ok = false;
+    }
+    return attention_split(c, q, k, v, dt, S, H, D, stride, out, out_dt);
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                           int64_t stride, void* out, int out_dt) {
     using dnnl::memory;
     sycl::queue& qu = c.q;
     const int64_t D1 = D + 1;                           // v with its column of ones
     // rows per chunk: the scores of a chunk take at most ~1.5 GiB
-    const int64_t rows_max = std::max<int64_t>(1, std::min<int64_t>(S, (int64_t) (1536ull << 20) / (H * S * 2)));
+    const int64_t rows_max = std::max<int64_t>(1, std::min<int64_t>(S, (int64_t) c.attn_table_bytes / (H * S * 2)));
     // the max pass: work-item j of a row takes scores j, j + kLanes, j + 2 kLanes ..., so neighbouring work-items
     // (which the GPU runs as the lanes of one vector) read neighbouring scores
     constexpr int64_t kLanes = 256;
@@ -610,9 +761,9 @@ int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt
         lap(5);
     }
     if (prof)
-        std::fprintf(stderr, "h3sycl: attention S=%lld: copies %.1f ms, scores %.1f, row max %.1f, exp %.1f, values %.1f, out %.1f\n",
+        std::fprintf(stderr, "h3sycl: attention (split) S=%lld: copies %.1f ms, scores %.1f, row max %.1f, exp %.1f, values %.1f, out %.1f\n",
                      (long long) S, t_ph[0], t_ph[1], t_ph[2], t_ph[3], t_ph[4], t_ph[5]);
     return 0;
-} catch (const std::exception& e) { g_err = e.what(); return -1; }
+}
 
 }  // extern "C"

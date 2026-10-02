@@ -13,5 +13,5 @@ source "$(dirname "$0")/container/common.sh"
 need_image
 
 mkdir -p "$ROOT/dist" "$ROOT/.cache/cargo"
-exec $CE run --rm "${AS_USER[@]}" -v "$ROOT:/src" -w /src -e CARGO_HOME=/src/.cache/cargo \
+exec $CE run --rm "${AS_USER[@]}" -v "$ROOT:/src" -w /src -e CARGO_HOME=/src/.cache/cargo ${H3_DNNL:+-e H3_DNNL=$H3_DNNL} \
   "$IMAGE" bash /src/container/build-inside.sh "$@"

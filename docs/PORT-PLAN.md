@@ -15,7 +15,7 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | weight load to the GPU, read ahead in parallel | ComfyUI lazy load | `h3-core::load` | done |
 | int8 linear (rotate, quantize, int8 multiply, rescale) | comfy-kitchen, PyTorch ops | `kernels/` `h3s_int8_linear` + `h3-core::ops` | done |
 | per-head RMS norm + position rotation (on q and k) | comfy-kitchen, 22.7 ms | `h3s_rms_rope`, 6.2 ms at 16.5k tokens | done |
-| attention (scores, softmax, weighted sum) | PyTorch -> oneDNN's fused kernel, 102 ms | `h3s_attention`: correct and memory-bounded, but 1.2 s at 16.5k tokens (below) | next |
+| attention (scores, softmax, weighted sum) | PyTorch -> oneDNN's fused kernel, 102 ms | `h3s_attention`: oneDNN 3.12's fused kernel made fail-safe, 96 ms; our own bounded form behind it (below) | done |
 | gated activation between the MLP's two linears | PyTorch | `h3s_swiglu` (its own pass; folding it into the quantizer is open) | done |
 | norm, scale+shift, gated residual add | PyTorch | `h3s_rms_norm_mod`, `h3s_gate_add` | done |
 | the 50 denoiser blocks, with their per-step tables and position rotations | ComfyUI `ldm/minimax/model.py` | `h3-core::dit` | done (the 2 text refiner blocks: open) |
@@ -50,25 +50,42 @@ of the denoiser at production size. So:
 ## Where the block stack stands (2026-10-02)
 
 `h3 check-block` runs all 50 blocks from Rust on a dump of the reference (2,159 tokens): every stage of block 0 agrees
-to cosine >= 0.99985, the stream after 25 blocks to 0.99997, after all 50 to 0.997. The reference itself computes in
+to cosine >= 0.99985, the stream after 25 blocks to 0.99998, after all 50 to 0.9975. The reference itself computes in
 bfloat16 throughout; this engine keeps intermediate arithmetic in float32 or IEEE half and rounds once.
 
-`h3 bench-blocks` at 16.5k tokens (a 5 s clip), per block:
+`h3 bench-blocks`, per block:
 
-| stage | reference (PyTorch) | this engine |
-|---|---:|---:|
-| the four int8 linears (+ gated activation) | 70 ms (with our kernel plugged in; 145 ms without) | 64 ms |
-| per-head norm + rotation | 22.7 ms | 6.2 ms |
-| norms, scale/shift, gated adds | ~6 ms | 8.1 ms |
-| everything except attention | ~99 ms | 78 ms |
-| attention | 102 ms | **1208 ms** |
+| stage | reference (PyTorch), 16.5k tokens | this engine, 16.5k | this engine, 47k (a 15 s clip) |
+|---|---:|---:|---:|
+| the four int8 linears (+ gated activation) | 70 ms (with our kernel plugged in; 145 ms without) | 67 ms | 192 ms |
+| per-head norm + rotation | 22.7 ms | 6.2 ms | 20.9 ms |
+| norms, scale/shift, gated adds | ~6 ms | 10.5 ms | 28.1 ms |
+| attention | 102 ms | 96 ms | 756 ms |
+| **the block** | 222 ms as it runs in production (186 ms with our linear kernel plugged in) | **177 ms** | **997 ms** |
+| **50 blocks = one denoiser step** | 11.1 s as it runs in production (9.3 s with our linear kernel plugged in) | **8.95 s** | **~50 s** (10 blocks measured; reference 58-63 s) |
 
-Attention is the open problem, and the whole clip's biggest cost. Built from oneDNN's separate primitives it is
-correct and its memory is bounded, but oneDNN's stand-alone softmax takes 1.0 s of the 1.2 s on rows 16.5k long.
-oneDNN's *fused* attention (what PyTorch reaches) cannot be used blind: when it does not recognize the pattern it
-silently builds the whole S x S score table in device memory - 30 GiB at 16.5k tokens - and on this driver that takes
-the machine down (it did, once). So the next step is our own kernel: scores, softmax and the weighted sum over tiles
-that never leave the GPU's registers, with memory bounded by construction.
+At 47k tokens all 50 blocks do not fit yet: 18 GiB of weights plus ~13 GiB of work buffers pass the engine's own
+memory cap by about 1 GiB (it refuses; it does not spill). The MLP's inner buffer (2.7 GiB) and the linear's rotation
+scratch (2.7 GiB) are the two to shrink - both by working in row chunks.
+
+### Attention: how it got there
+
+1. oneDNN's separate primitives (multiply, softmax, multiply) in row chunks: correct, memory bounded, **1208 ms** at
+   16.5k tokens - oneDNN's stand-alone softmax took 1.0 s of it on rows that long.
+2. Our own softmax passes between oneDNN's two multiplies (a polynomial exponential, the row sums delivered by the
+   matrix engine through a column of ones beside the values): **559 ms**. What remained was memory traffic over the
+   score table - written once, read twice, rewritten once.
+3. oneDNN's *fused* attention kernel, which never writes the score table: **96 ms**. It is reachable only through
+   oneDNN's graph interface, only from oneDNN 3.12 on, and only for one exact form of the pattern (16-bit q, k, v;
+   the two tensors in between declared float32; the scale a float32 host scalar; softmax mode `inf_as_zero`) - found
+   with `kernels/sdpa_probe.cpp` and by reading oneDNN's source. Any other form silently runs as separate steps with
+   the **whole** score table in device memory: 30 GiB at 16.5k tokens, which on this driver (no out-of-memory error)
+   took the machine down once during this work. So the image builds oneDNN 3.12 from source with one small patch
+   (`container/onednn-sdpa-no-fallback.patch`): on request, a pattern the fused kernel does not take is an error,
+   not a fallback. Then form 2 above, whose memory is bounded by construction, takes over.
+
+Next on attention: it is still ~75% of a production step. The fused kernel runs at ~165 G scores/s; beyond that it
+takes computing fewer scores (the block-sparse form the model family was trained to tolerate), with clips to judge.
 
 ## Checks that every piece must pass
 

@@ -49,15 +49,25 @@ dispatch); only the denoiser's linear layers are ours so far. A 15-second produc
 | 19.5 GiB of weights, disk to GPU | 15-44 s | 10.7-12.8 s (Rust, 8 readers) | 1.2-3.5x |
 | start-up before the first step | load + ~36 s compile, every job | load only | |
 
-The denoiser's 50 blocks now also run from the Rust engine alone (no PyTorch): at 16.5k tokens everything except
-attention takes 78 ms per block (reference: ~99 ms), and the result tracks the reference block by block
-(docs/PORT-PLAN.md). Attention in the Rust engine is correct but still slow (1.2 s per block, against the reference's
-0.1 s) - it is the next piece, and until it is replaced the clip timings above come from the PyTorch process with
-our linear kernel plugged in.
+### The denoiser in the Rust engine (no PyTorch)
+
+The denoiser's 50 blocks run from the Rust engine alone and track the reference block by block
+(docs/PORT-PLAN.md). One step = 50 blocks:
+
+| | reference | Rust + SYCL engine | |
+|---|---:|---:|---:|
+| 16.5k tokens (a 5 s clip) | 11.1 s | 8.95 s | 1.24x |
+| 47k tokens (a 15 s clip) | 58-63 s | ~50 s (10 of 50 blocks measured) | ~1.2x |
+| of which attention, per block, 16.5k tokens | 102 ms | 96 ms | |
+| of which everything else, per block, 16.5k tokens | ~99 ms | 81 ms | |
+
+Not a whole clip yet: the embeddings around the blocks, the sampler, the decoders and the text encoder are still to
+port, so the clip timings above come from the PyTorch process with our linear kernel plugged in.
 
 What the card can do, measured with bare oneDNN (docs/PHASE0-RESULTS.md): int8 matrix multiply 317-357 T-ops/s
-against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention is bound by writing its score
-table, where int8 gives nothing and a fused kernel about 1.2x - beyond that it takes computing fewer scores.
+against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention built from separate steps is bound by
+writing its score table; oneDNN's fused kernel avoids the table (165 G scores/s at production size), and beyond that
+it takes computing fewer scores.
 
 ## Layout
 
@@ -77,7 +87,7 @@ table, where int8 gives nothing and a fused kernel about 1.2x - beyond that it t
 Everything builds inside one podman container; the host needs podman (with `crun`, so a rootless container can
 reach the GPU) and nothing else.
 
-    ./setup.sh                      # build the container image (SYCL compiler, oneDNN, Rust, node)
+    ./setup.sh                      # build the container image (SYCL compiler, oneDNN 3.12 from source, Rust, node)
     ./build.sh                      # kernels + engine + front end -> dist/
     ./build.sh test                 # the Rust tests and lints
 

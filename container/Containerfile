@@ -1,5 +1,6 @@
-# The build-and-run image of the H3 engine: Intel's SYCL compiler and oneDNN (the kernels), Rust (the engine),
-# node (the front end's TypeScript compiler runs on it). Everything is built inside it, so the host needs podman only.
+# The build-and-run image of the H3 engine: Intel's SYCL compiler (the kernels), oneDNN 3.12 built from source,
+# Rust (the engine), node (the front end's TypeScript compiler runs on it). Everything is built inside it, so the host
+# needs podman only.
 #
 # The base is a public image with the oneAPI 2026 compiler and the Level Zero driver stack for Xe2 (Arc B-series)
 # already set up, including Intel's apt repository.
@@ -7,8 +8,28 @@ ARG BASE=ghcr.io/snailium/llama.cpp-sycl-intel-b70/llama-sycl-b70:stable
 FROM ${BASE}
 
 RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-      intel-oneapi-dnnl-devel-2026.0 build-essential ca-certificates curl nodejs \
+      build-essential ca-certificates cmake curl git nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# oneDNN from source, GPU only, into /opt/onednn. Two reasons it is not the oneAPI package (3.11):
+#  - the fused attention kernel for this card exists from 3.12 on (kernels/h3sycl.cpp, attention_fused);
+#  - one small patch (onednn-sdpa-no-fallback.patch): on request, a pattern that kernel does not take is an error
+#    instead of a silent fallback that puts the whole score table in device memory.
+# The compiler needs 2-3 GB per job on some of these files; ONEDNN_JOBS=4 fits a 16 GB machine.
+ARG ONEDNN=v3.12
+ARG ONEDNN_JOBS=4
+COPY onednn-sdpa-no-fallback.patch /tmp/
+RUN git clone -q --depth 1 -b ${ONEDNN} https://github.com/uxlfoundation/oneDNN.git /tmp/onednn \
+    && git -C /tmp/onednn apply /tmp/onednn-sdpa-no-fallback.patch \
+    && bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; \
+         cmake -S /tmp/onednn -B /tmp/onednn/build -DCMAKE_BUILD_TYPE=Release \
+               -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+               -DDNNL_CPU_RUNTIME=NONE -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL -DONEDNN_BUILD_GRAPH=ON \
+               -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=/opt/onednn >/dev/null \
+         && make -C /tmp/onednn/build -j ${ONEDNN_JOBS} install >/tmp/onednn-build.log 2>&1 \
+         || { tail -40 /tmp/onednn-build.log; exit 1; }' \
+    && touch /opt/onednn/H3_SDPA_NO_FALLBACK \
+    && rm -rf /tmp/onednn /tmp/onednn-build.log /tmp/onednn-sdpa-no-fallback.patch
 
 # Rust, for every user id the container may run as; crates are fetched into the mounted source tree's .cache/
 ARG RUST=1.97.1

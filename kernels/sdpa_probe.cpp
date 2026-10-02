@@ -7,7 +7,7 @@
 // times each, and prints the rate in scores per second: the fused kernel is several times faster than the fallback.
 // Run it with ONEDNN_VERBOSE=1 to also see the implementation names.
 //
-//   sdpa_probe [rows=1024] [keys=2048] [reps=3]      the fallback's score table is 56 * rows * keys * 2 bytes
+//   sdpa_probe [rows=1024] [keys=2048] [reps=3] [nofallback]     the fallback's score table: 56 * rows * keys * 2 bytes
 //
 // Keep rows * keys small (the default is 0.23 GiB). Never run this at a real sequence length: see h3s_attention.
 #include <oneapi/dnnl/dnnl.hpp>
@@ -31,6 +31,7 @@ struct Variant {
     bool mode;            // SoftMax mode = "inf_as_zero"
     bool mask;            // an additive mask [1, 1, 1, keys] of zeros before the softmax
     bool host_scalar;     // the scale as a float32 scalar held on the host (how PyTorch passes it)
+    bool f32_inter;       // the tensors between the two multiplies declared float32 (q, k, v stay 16-bit)
 };
 
 static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H, long R, long S, long D, int reps) {
@@ -42,8 +43,9 @@ static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H
                 ? lt(id++, lt::data_type::f32, lt::dims {}, strided, lt::property_type::host_scalar)
                 : lt(id++, va.dt, lt::dims {1}, strided, va.const_scale ? lt::property_type::constant : lt::property_type::undef);
         lt v(id++, va.dt, lt::dims {1, H, S, D}, strided), mask(id++, va.dt, lt::dims {1, 1, 1, S}, strided);
-        lt score(id++, va.dt, lt::dims {1, H, R, S}, strided), scaled(id++, va.dt, lt::dims {1, H, R, S}, strided);
-        lt masked(id++, va.dt, lt::dims {1, H, R, S}, strided), probs(id++, va.dt, lt::dims {1, H, R, S}, strided);
+        const auto it = va.f32_inter ? lt::data_type::f32 : va.dt;
+        lt score(id++, it, lt::dims {1, H, R, S}, strided), scaled(id++, it, lt::dims {1, H, R, S}, strided);
+        lt masked(id++, it, lt::dims {1, H, R, S}, strided), probs(id++, va.dt, lt::dims {1, H, R, S}, strided);   // the weights are 16-bit again
         lt out(id++, va.dt, lt::dims {1, H, R, D}, strided);
         op bmm1(id++, op::kind::MatMul, {q, k}, {score}, "scores");
         bmm1.set_attr<bool>(op::attr::transpose_b, true);
@@ -93,6 +95,8 @@ static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H
 int main(int argc, char** argv) {
     const long R = argc > 1 ? std::atol(argv[1]) : 1024, S = argc > 2 ? std::atol(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 3;
+    // a 4th argument: ask a patched oneDNN (container/onednn-sdpa-no-fallback.patch) to refuse instead of falling back
+    if (argc > 4) setenv("_ONEDNN_GRAPH_SDPA_NO_FALLBACK", "1", 1);
     const long H = 56, D = 128;
     if ((double) H * R * S * 2 > 1.6e9) {
         std::printf("refusing: a score table of %.1f GiB (keep 56 * rows * keys * 2 bytes under 1.5 GiB)\n", (double) H * R * S * 2 / (1 << 30));
@@ -104,21 +108,26 @@ int main(int argc, char** argv) {
                 (double) H * R * S * 2 / (1 << 30));
     const auto f16 = lt::data_type::f16, bf16 = lt::data_type::bf16;
     const Variant vs[] = {
-        {"f16  divide", f16, false, false, false, false, false},
-        {"f16  divide, softmax mode", f16, false, false, true, false, false},
-        {"f16  divide, constant scale", f16, false, true, false, false, false},
-        {"f16  divide, constant scale, mode", f16, false, true, true, false, false},
-        {"f16  multiply", f16, true, false, false, false, false},
-        {"f16  multiply, softmax mode", f16, true, false, true, false, false},
-        {"f16  divide, mask", f16, false, false, false, true, false},
-        {"f16  divide, mask, softmax mode", f16, false, false, true, true, false},
-        {"bf16 divide", bf16, false, false, false, false, false},
-        {"bf16 divide, softmax mode", bf16, false, false, true, false, false},
-        {"bf16 divide, mask, softmax mode", bf16, false, false, true, true, false},
-        {"f16  multiply, host scalar", f16, true, false, false, false, true},
-        {"f16  multiply, host scalar, softmax mode", f16, true, false, true, false, true},
-        {"f16  divide, host scalar, softmax mode", f16, false, false, true, false, true},
-        {"bf16 multiply, host scalar, softmax mode", bf16, true, false, true, false, true},
+        {"f16  divide", f16, false, false, false, false, false, false},
+        {"f16  divide, softmax mode", f16, false, false, true, false, false, false},
+        {"f16  divide, constant scale", f16, false, true, false, false, false, false},
+        {"f16  divide, constant scale, mode", f16, false, true, true, false, false, false},
+        {"f16  multiply", f16, true, false, false, false, false, false},
+        {"f16  multiply, softmax mode", f16, true, false, true, false, false, false},
+        {"f16  divide, mask", f16, false, false, false, true, false, false},
+        {"f16  divide, mask, softmax mode", f16, false, false, true, true, false, false},
+        {"bf16 divide", bf16, false, false, false, false, false, false},
+        {"bf16 divide, softmax mode", bf16, false, false, true, false, false, false},
+        {"bf16 divide, mask, softmax mode", bf16, false, false, true, true, false, false},
+        {"f16  multiply, host scalar", f16, true, false, false, false, true, false},
+        {"f16  multiply, host scalar, softmax mode", f16, true, false, true, false, true, false},
+        {"f16  divide, host scalar, softmax mode", f16, false, false, true, false, true, false},
+        {"bf16 multiply, host scalar, softmax mode", bf16, true, false, true, false, true, false},
+        {"f16  multiply, host scalar, mode, f32 between", f16, true, false, true, false, true, true},
+        {"bf16 multiply, host scalar, mode, f32 between", bf16, true, false, true, false, true, true},
+        {"f16  divide, mode, f32 between", f16, false, false, true, false, false, true},
+        {"f16  multiply, mode, f32 between", f16, true, false, true, false, false, true},
+        {"f16  multiply, f32 between (no mode)", f16, true, false, false, false, true, true},
     };
     for (const auto& va : vs) run(va, eng, strm, H, R, S, D, reps);
     return 0;
