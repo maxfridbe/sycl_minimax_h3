@@ -394,6 +394,36 @@ def _dit_state_dict(path):
     return _load_gguf_native(path), {}
 
 
+def _prefetch(path, threads=8, block=32 << 20):
+    """h3x: read `path` ahead into the page cache on several threads, in the background.
+    One stream of this SSD is ~0.4 GB/s and that is what a lazy or mmap load gets; eight streams are ~1.5 GB/s and
+    the copy onto the card is 5-6 GB/s, so the loader (which walks the file in order) finds its pages already there.
+    Returns the thread list; nothing waits for it."""
+    import threading
+    size = os.path.getsize(path)
+    nblk = (size + block - 1) // block
+    nxt = [0]; lock = threading.Lock(); t0 = time.time()
+    def work():
+        fd = os.open(path, os.O_RDONLY)
+        buf = bytearray(block)
+        try:
+            while True:
+                with lock:
+                    i = nxt[0]; nxt[0] += 1
+                if i >= nblk: break
+                os.preadv(fd, [buf], i * block)
+        finally:
+            os.close(fd)
+    ts = [threading.Thread(target=work, daemon=True) for _ in range(threads)]
+    for t in ts: t.start()
+    def report():
+        for t in ts: t.join()
+        dt = time.time() - t0
+        print(f"  prefetch: {size/2**30:.1f} GiB of {os.path.basename(path)} read ahead in {dt:.1f}s ({size/2**30/dt:.2f} GiB/s, {threads} threads)", flush=True)
+    threading.Thread(target=report, daemon=True).start()
+    return ts
+
+
 def _align(n):
     while n % 17 != 5:
         n += 1
@@ -696,6 +726,8 @@ def cmd_gen(args):
     ops = GGMLOps(); ops.Linear.dequant_dtype = None; ops.Linear.patch_dtype = None
     dit_path = getattr(args, "dit", None) or P["dit"]
     print(f"  engine : {os.path.basename(dit_path)} ({os.path.getsize(dit_path)/2**30:.2f} GiB)", flush=True)
+    if os.environ.get("H3X_PREFETCH"):
+        _prefetch(dit_path, threads=int(os.environ["H3X_PREFETCH"]))
     if dit_path.endswith(".safetensors"):
         # h3x: a comfy-native checkpoint (bf16 / fp8 / int8_convrot / w6a8): comfy's own loader and quantized ops,
         # which call comfy-kitchen (int8_linear etc.) - no GGUF ops, no GGUF patcher
