@@ -14,6 +14,7 @@
 #include <oneapi/dnnl/dnnl_graph.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -29,6 +30,7 @@ struct Variant {
     bool const_scale;     // the scale marked as a constant
     bool mode;            // SoftMax mode = "inf_as_zero"
     bool mask;            // an additive mask [1, 1, 1, keys] of zeros before the softmax
+    bool host_scalar;     // the scale as a float32 scalar held on the host (how PyTorch passes it)
 };
 
 static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H, long R, long S, long D, int reps) {
@@ -36,7 +38,9 @@ static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H
         const auto strided = lt::layout_type::strided;
         size_t id = 0;
         lt q(id++, va.dt, lt::dims {1, H, R, D}, strided), k(id++, va.dt, lt::dims {1, H, S, D}, strided);
-        lt scale(id++, va.dt, lt::dims {1}, strided, va.const_scale ? lt::property_type::constant : lt::property_type::undef);
+        lt scale = va.host_scalar
+                ? lt(id++, lt::data_type::f32, lt::dims {}, strided, lt::property_type::host_scalar)
+                : lt(id++, va.dt, lt::dims {1}, strided, va.const_scale ? lt::property_type::constant : lt::property_type::undef);
         lt v(id++, va.dt, lt::dims {1, H, S, D}, strided), mask(id++, va.dt, lt::dims {1, 1, 1, S}, strided);
         lt score(id++, va.dt, lt::dims {1, H, R, S}, strided), scaled(id++, va.dt, lt::dims {1, H, R, S}, strided);
         lt masked(id++, va.dt, lt::dims {1, H, R, S}, strided), probs(id++, va.dt, lt::dims {1, H, R, S}, strided);
@@ -67,7 +71,11 @@ static void run(const Variant& va, dnnl::engine& eng, dnnl::stream& strm, long H
                 if (m.get_id() == port.get_id()) in.push_back(m);
         auto cp = parts[0].compile(in, {out}, eng);
         std::vector<tensor> tin;
-        for (const auto& l : in) tin.emplace_back(l, eng);          // device memory, contents irrelevant (zeros or junk)
+        float scale_value = va.multiply ? 1.0f / std::sqrt((float) D) : std::sqrt((float) D);
+        for (const auto& l : in) {                                  // device memory, contents irrelevant (zeros or junk)
+            if (va.host_scalar && l.get_id() == scale.get_id()) tin.push_back(tensor::make_scalar_tensor(l, &scale_value));
+            else tin.emplace_back(l, eng);
+        }
         tensor tout(cp.query_logical_tensor(out.get_id()), eng);
         cp.execute(strm, tin, {tout});
         strm.wait();
@@ -96,17 +104,21 @@ int main(int argc, char** argv) {
                 (double) H * R * S * 2 / (1 << 30));
     const auto f16 = lt::data_type::f16, bf16 = lt::data_type::bf16;
     const Variant vs[] = {
-        {"f16  divide", f16, false, false, false, false},
-        {"f16  divide, softmax mode", f16, false, false, true, false},
-        {"f16  divide, constant scale", f16, false, true, false, false},
-        {"f16  divide, constant scale, mode", f16, false, true, true, false},
-        {"f16  multiply", f16, true, false, false, false},
-        {"f16  multiply, softmax mode", f16, true, false, true, false},
-        {"f16  divide, mask", f16, false, false, false, true},
-        {"f16  divide, mask, softmax mode", f16, false, false, true, true},
-        {"bf16 divide", bf16, false, false, false, false},
-        {"bf16 divide, softmax mode", bf16, false, false, true, false},
-        {"bf16 divide, mask, softmax mode", bf16, false, false, true, true},
+        {"f16  divide", f16, false, false, false, false, false},
+        {"f16  divide, softmax mode", f16, false, false, true, false, false},
+        {"f16  divide, constant scale", f16, false, true, false, false, false},
+        {"f16  divide, constant scale, mode", f16, false, true, true, false, false},
+        {"f16  multiply", f16, true, false, false, false, false},
+        {"f16  multiply, softmax mode", f16, true, false, true, false, false},
+        {"f16  divide, mask", f16, false, false, false, true, false},
+        {"f16  divide, mask, softmax mode", f16, false, false, true, true, false},
+        {"bf16 divide", bf16, false, false, false, false, false},
+        {"bf16 divide, softmax mode", bf16, false, false, true, false, false},
+        {"bf16 divide, mask, softmax mode", bf16, false, false, true, true, false},
+        {"f16  multiply, host scalar", f16, true, false, false, false, true},
+        {"f16  multiply, host scalar, softmax mode", f16, true, false, true, false, true},
+        {"f16  divide, host scalar, softmax mode", f16, false, false, true, false, true},
+        {"bf16 multiply, host scalar, softmax mode", bf16, true, false, true, false, true},
     };
     for (const auto& va : vs) run(va, eng, strm, H, R, S, D, reps);
     return 0;

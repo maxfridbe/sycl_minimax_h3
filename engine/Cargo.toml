@@ -2,8 +2,11 @@
 resolver = "2"
 members = ["h3-sys", "h3-core", "h3"]
 
+# The repository's version is yy.mmdd.### (the VERSION file): year, month and day, then the day's sequence number.
+# Cargo wants it without leading zeros, so 26.1002.001 is written 26.1002.1 here; `h3 version` prints the full form,
+# and a test keeps this line and VERSION in step.
 [workspace.package]
-version = "0.1.0"
+version = "26.1002.1"
 edition = "2021"
 
 [profile.release]

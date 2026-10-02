@@ -92,6 +92,15 @@ reach the GPU) and nothing else.
     ./teardown.sh                   # stop a running engine, gracefully
     ./teardown.sh --all             # ... and remove the build output and the image
 
+### Versions and releases
+
+The version is `yy.mmdd.###` - year, month and day, then that day's sequence number - and lives in the `VERSION`
+file (`h3 version` prints it; a test keeps Cargo's copy in step). `.github/workflows/build.yml` builds the image,
+runs `./build.sh` and `./build.sh test` on every push and pull request and keeps the result as a workflow artifact;
+on `main` it also publishes the build image to the GitHub container registry, and on a tag `v<VERSION>` it publishes
+a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (the engine, the kernel library with its oneDNN, the built
+front end).
+
 One model per GPU: Intel's `xe` driver has no out-of-memory error, an over-committed card stalls the whole machine.
 The engine counts its own allocations and refuses to pass 94% of the card; do not start it beside another program
 that holds the card, and stop it with `./teardown.sh`, never with a kill.

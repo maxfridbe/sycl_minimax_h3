@@ -1,5 +1,6 @@
 //! `h3` - MiniMax H3 on an Intel Arc GPU.
 //!
+//!     h3 version                              yy.mmdd.###
 //!     h3 device                               the GPU the kernels found, and its memory cap
 //!     h3 info <checkpoint.safetensors>        what is in a checkpoint
 //!     h3 load <checkpoint> [--threads 8]      load it onto the GPU, timed
@@ -22,7 +23,14 @@ use h3_core::rng::Rng;
 use h3_core::safetensors::Checkpoint;
 use h3_core::{dit, load, reference, Error, Result};
 
+/// The repository's version, yy.mmdd.### (Cargo carries it without the leading zeros).
+fn version() -> String {
+    let p: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|x| x.parse().unwrap_or(0)).collect();
+    format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
+}
+
 const USAGE: &str = "usage:
+  h3 version
   h3 device
   h3 info <checkpoint.safetensors>
   h3 load <checkpoint.safetensors> [--threads 8]
@@ -396,6 +404,10 @@ fn run() -> Result<()> {
     };
     let args = Args::parse(&raw[1..])?;
     match cmd.as_str() {
+        "version" | "--version" | "-V" => {
+            println!("h3 {}", version());
+            Ok(())
+        }
         "device" => cmd_device(),
         "info" => cmd_info(&args),
         "load" => cmd_load(&args),
@@ -403,6 +415,14 @@ fn run() -> Result<()> {
         "check-block" => cmd_check_block(&args),
         "bench-blocks" => cmd_bench_blocks(&args),
         _ => Err(Error(USAGE.into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_matches_the_version_file() {
+        assert_eq!(super::version(), include_str!("../../../VERSION").trim());
     }
 }
 

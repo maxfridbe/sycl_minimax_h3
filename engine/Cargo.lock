@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "h3"
-version = "0.1.0"
+version = "26.1002.1"
 dependencies = [
  "h3-core",
 ]
 
 [[package]]
 name = "h3-core"
-version = "0.1.0"
+version = "26.1002.1"
 dependencies = [
  "h3-sys",
  "serde_json",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "h3-sys"
-version = "0.1.0"
+version = "26.1002.1"
 
 [[package]]
 name = "itoa"
