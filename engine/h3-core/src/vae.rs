@@ -253,6 +253,11 @@ impl VideoDecoder {
         let proj = Tensor::new(dev, self.act, &[rows_all, DIM])?;
         let f1 = Tensor::new(dev, self.act, &[rows_all, 2 * 4 * DIM])?;
         let act = Tensor::new(dev, self.act, &[rows_all, 4 * DIM])?;
+        let prof = std::env::var_os("H3S_PROFILE").is_some();
+        let tb = std::time::Instant::now();
+        if prof {
+            dev.wait()?;
+        }
         for b in &self.blocks {
             ops::rms_norm_mod(&x, &b.norm1, EPS, None, &hbuf)?;
             b.qkv.forward(&hbuf, &qkv)?;
@@ -275,6 +280,10 @@ impl VideoDecoder {
             ops::swiglu(&f1, &act)?;
             b.w2.forward(&act, &proj)?;
             ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
+        }
+        if prof {
+            dev.wait()?;
+            eprintln!("vae: {nb} tiles of {s} tokens: blocks {:.3} s", tb.elapsed().as_secs_f64());
         }
         let normed = Tensor::new(dev, DType::F32, &[nb * n, DIM])?;
         {
@@ -342,10 +351,13 @@ impl VideoDecoder {
             }
         }
         let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(zs.len());
+        let t0 = std::time::Instant::now();
         for batch in zs.chunks(TILE_BATCH) {
             tick()?;
             decoded.extend(self.tiles(batch, t, lh, lw)?);
         }
+        let t_tiles = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
         let mut decoded = decoded.into_iter();
         let mut canvas = vec![0f32; OUT_C * ft * fh * fw];
         // per row of tiles: the bottom overlap strips of the previous row, per tile column
@@ -386,6 +398,9 @@ impl VideoDecoder {
             }
             row_tails = new_tails;
             out_y += tile_h;
+        }
+        if std::env::var_os("H3S_PROFILE").is_some() {
+            eprintln!("vae: {} tiles of {t}x{lh}x{lw}: {t_tiles:.2} s in the tiles, {:.2} s cross-fading", zs.len(), t0.elapsed().as_secs_f64());
         }
         Ok(canvas)
     }

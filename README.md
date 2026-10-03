@@ -23,59 +23,44 @@ those comparisons and is deleted when the port has parity. The plan and its stat
 
 ## Timings on a B70
 
-Measured on one Arc Pro B70 (Ryzen 7 1700X, 23 GiB RAM), 2026-10-02. "Reference" is the PyTorch pipeline as it runs
-in production: Q8 GGUF weights, `torch.compile`, 768x576, 8 steps, realism LoRA, 1.5x latent upscale.
+Measured on one Arc Pro B70 (Ryzen 7 1700X, 23 GiB RAM), 2026-10-02. "Reference" is the PyTorch pipeline
+(ComfyUI's MiniMax H3 code) with the same int8 weights and our linear kernel plugged in - already faster than the
+production path it replaced (Q8 GGUF, `torch.compile`: 286 s for the clip below).
 
-### A whole clip ("Goodnight Borg", 5 s, production recipe, text encoding cached)
+### A whole clip, prompt to .mp4, in the engine
 
-| | reference | int8 weights + SYCL linears | |
-|---|---:|---:|---:|
-| weights to the GPU + first-step warm-up | 119.6 s | 44.0 s | 2.7x |
-| one denoiser step (16.5k tokens) | 11.1 s | 9.3 s | 1.19x |
-| 8 steps, with the above | 217.2 s | 127.3 s | 1.71x |
-| everything after (upscale, decode, mux) and process start-up | 69 s | 75 s | not ported yet |
-| **the clip** | **286.2 s** | **202.1 s** | **1.42x** |
-
-The SYCL column still runs inside the PyTorch process (the kernel library is plugged into the model's own kernel
-dispatch); only the denoiser's linear layers are ours so far. A 15-second production clip (47k tokens) is about
-845 s on the reference, 58-63 s per step, 70% of it attention - which is the next piece.
-
-### The pieces that are ported
+"Goodnight Borg" (`reference/prompts/borg_goodnight_5s.txt`, 356 tokens), the production recipe: 768x576 sampled,
+5 s (124 frames), 8 steps, the realism LoRA at 0.5, a 1.5x latent upscale to 1152x864, sound. `h3d generate`:
 
 | | reference | this engine | |
 |---|---:|---:|---:|
-| a denoiser block's four linear layers, 16k tokens | 84 ms (bf16) / 145 ms (int8, PyTorch ops) | 61 ms | 1.4x / 2.4x |
-| the same, error against exact arithmetic | 0.69% with the rotation kept in 16 bits, as comfy-kitchen does it | 0.17% | |
-| 19.5 GiB of weights, disk to GPU | 15-44 s | 10.7-12.8 s (Rust, 8 readers) | 1.2-3.5x |
-| start-up before the first step | load + ~36 s compile, every job | load only | |
+| text encoder (Qwen3-VL 32B, 50 layers) | ~54 s (cached for this run) | 16.0 s, streamed from disk | 3.4x |
+| denoiser weights to the GPU | 20.1 s | 12.0 s | 1.7x |
+| 8 denoiser steps (16.8k tokens) | 83.3 s | 70.6 s | 1.18x |
+| latent upscaler | 7.5 s | 4.6 s | 1.6x |
+| video decoder (124 frames, 1152x864) | 37.1 s | 47.0 s | 0.8x |
+| audio decoder | 7.4 s | 2.7 s | 2.7x |
+| **the clip** | **202 s** with the text encoding cached, ~256 s without | **163 s** wall, text encoder included | **1.24x / ~1.6x** |
 
-### The denoiser in the Rust engine (no PyTorch)
+The video decoder is the one piece still slower: it runs at about 54 TFLOPS of half-precision work per tile batch,
+roughly a third of what the card does on a bare matrix product - the next thing to tune.
 
-The denoiser's 50 blocks run from the Rust engine alone and track the reference block by block
-(docs/PORT-PLAN.md). One step = 50 blocks:
+### Each piece against the reference
 
-| | reference | Rust + SYCL engine | |
-|---|---:|---:|---:|
-| 16.5k tokens (a 5 s clip) | 11.1 s | 8.95 s | 1.24x |
-| 47k tokens (a 15 s clip) | 58-63 s | 49.9 s | 1.16-1.27x |
-| of which attention, per block, 16.5k tokens | 102 ms | 96 ms | |
-| of which everything else, per block, 16.5k tokens | ~99 ms | 81 ms | |
+Every piece was checked against the reference on the same inputs (`reference/` dumps them):
 
-### A whole denoise in the Rust engine
-
-Text conditioning and starting noise in, finished latents out, with no PyTorch: the text refiner, the patch
-embeddings, the 50 blocks, the final layer and the Euler sampler (`h3d denoise`, checked against a reference run dump).
-The bakery prompt at 384x288, 2 s, 8 steps (2,159 tokens), with the same int8 weights:
-
-| | reference | Rust + SYCL engine | |
-|---|---:|---:|---:|
-| 8 sampler steps | 15.7 s | 6.8 s (0.78 s a step after the first) | 2.3x |
-| text refiner (once per clip) | included above | 3.9 s, loaded and freed | |
-| finished latents against the reference's | | cosine 0.985 video, 0.997 audio | |
-
-Decoded by the reference's decoders, it is the same scene with small differences in detail.
-The decoders, the upscaler and the text encoder are still to port, so the whole-clip timings above come from the
-PyTorch process with our linear kernel plugged in.
+| piece | agreement | reference | this engine |
+|---|---|---:|---:|
+| tokenizer | identical ids (2 prompts, 19 awkward strings) | | |
+| text encoder, 137 tokens | worst token cosine 0.999998 | ~54 s | 16.2 s |
+| starting noise (PyTorch's generator) | 83% bit-exact, the rest within 1 ulp | | |
+| one denoiser step, 2,159 tokens | first step cosine 0.9989 | 2.0 s | 0.69 s |
+| one denoiser step, 16.5k tokens (5 s) | 50 blocks cosine 0.9975 | 11.1 s (production) / 9.3 s | 8.0 s |
+| one denoiser step, 47k tokens (15 s) | | 58-63 s | 46.6 s |
+| 8 steps, 2 s at 384x288 | latents cosine 0.95-0.985 (8 steps amplify rounding) | 15.7 s | 6.7 s |
+| latent upscaler (2x) | cosine 0.99993 | 5.2 s | 2.4 s |
+| video decoder, 56 frames 384x288 | PSNR 72.6 dB | 12.0 s | 3.6-5.0 s |
+| audio decoder | rel err 3e-5 | 8.3 s | 2.0 s |
 
 What the card can do, measured with bare oneDNN (docs/PHASE0-RESULTS.md): int8 matrix multiply 317-357 T-ops/s
 against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention built from separate steps is bound by
@@ -87,11 +72,12 @@ it takes computing fewer scores.
     kernels/      SYCL C++: libh3sycl (h3sycl.h is the whole interface), and a oneDNN benchmark
     engine/       Rust workspace
       h3-sys/       bindings to libh3sycl, loaded at run time
-      h3-core/      device memory, checkpoints, loading, kernels with checked shapes, the denoiser's blocks,
-                    CPU reference arithmetic
+      h3-core/      device memory, checkpoints (safetensors, GGUF), kernels with checked shapes, and the model:
+                    tokenizer, text encoder, denoiser, sampler, LoRA, upscaler, video and audio decoders
       h3-http/      the small HTTP/JSON layer both programs below share (TCP or Unix socket)
       h3d/          the engine side, in the container: the daemon, the per-GPU engine process, the jobs, checks
       sycl-h3/      the command line, on the host (a static binary): starts the services, talks over the socket
+    tokenizer/    the Qwen2 tokenizer's vocabulary and merges (Apache-2.0)
     wfe/          the web front end (TSX + snabbdom, vendored compiler, no node_modules)
     container/    the build-and-run image (podman)
     reference/    the PyTorch pipeline's harness, for comparisons only
@@ -119,6 +105,8 @@ without the other - and talks to the engine over a Unix socket, like `docker` an
     ./sycl-h3 serve                 # the web front end, http://127.0.0.1:8095/ (--bind 0.0.0.0 --port 9000 ...)
     ./sycl-h3 status                # live, one row per GPU, like docker stats (--no-stream: once)
     ./sycl-h3 jobs add bench-blocks --tokens 47173 -f     # queue a job and follow its log (--gpu N to pin it)
+    ./sycl-h3 jobs add generate --prompt "a cat on a piano" --width 768 --height 576 --seconds 5 \
+        --upscale 1.5 --lora /models/loras/<lora>.safetensors:0.5 --out /out/cat.mp4 -f    # a whole clip
     ./sycl-h3 jobs add check-block --dump /out/blockdump.safetensors
     ./sycl-h3 jobs ps [-a] | stop <id>... | rem <id>... | details <id>
     ./sycl-h3 unload [--gpu N]      # give a GPU back now; the next job loads again
@@ -155,6 +143,8 @@ For measuring and debugging the engine itself, `./run.sh` runs one-shot checks i
     ./run.sh check-linear /models/<ckpt>.safetensors    # GPU against the CPU reference, and timed
     ./run.sh check-block /models/<ckpt>.safetensors /out/blockdump.safetensors   # 50 blocks against a reference dump
     ./run.sh bench-blocks /models/<ckpt>.safetensors --tokens 16500              # a denoiser step, stage by stage
+    ./run.sh generate /models/<ckpt>.safetensors --prompt-file /out/p.txt --out /out/clip.mp4  # a clip, one-shot
+    ./run.sh encode | denoise | decode ...       # the pieces alone, each with --check against a reference dump
 
 ### Versions and releases
 

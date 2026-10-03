@@ -22,16 +22,16 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | text projection + the 2 text refiner blocks | ComfyUI | `h3-core::denoiser::TextRefiner` (loaded per clip, freed) | done |
 | time embedding, patch embedding, final layer, token layout | ComfyUI | `h3-core::layout`, `h3-core::denoiser` | done (keyframes, reference media and masks: open) |
 | sampler (Euler, simple schedule, the carried audio stream) | ComfyUI | `h3-core::denoiser::sample` | done: 8 steps 6.8 s vs 15.7 s, latents cosine 0.985 / 0.997 |
-| PyTorch-compatible starting noise | ComfyUI | `h3-core::rng` | open (read from the run dump for now) |
-| LoRA applied to int8 weights | ComfyUI | `h3-core::lora` | open |
-| latent upscaler (3-D convolutions) | ComfyUI | SYCL conv kernels + Rust graph | open |
-| video decoder (3-D convolutions, group norm) | ComfyUI | SYCL conv kernels + Rust graph | open |
-| audio decoder | ComfyUI | SYCL kernels + Rust graph | open |
+| PyTorch-compatible starting noise | ComfyUI | `h3-core::noise` (mt19937 + PyTorch's 16-wide Box-Muller) | done: 83% bit-exact, the rest within 1 ulp |
+| LoRA on the int8 weights | ComfyUI (merged) | `h3-core::lora`: a side path `B (A x)` per touched linear (`h3s_linear_acc`) | done: +1.4 s over 8 steps at 16.8k tokens |
+| latent upscaler (3-D convolutions) | h3_upscaler.py | `h3-core::upscale`: oneDNN 3-D convolutions, `h3s_group_norm_silu`, `h3s_temporal_dwconv`, `h3s_trilinear` | done: cosine 0.99993, 2.4 s vs 5.2 s |
+| video decoder (a 36-block transformer over 16x16x4 patches, tiled) | ComfyUI `ldm/minimax/vae.py` | `h3-core::vae`, the denoiser's kernels + `h3s_layer_norm` | done: PSNR 72.6 dB; faster at small canvases, 0.8x at 1152x864 (tuning open) |
+| audio decoder (BigVGAN) | ComfyUI `ldm/minimax/audio_vae.py` | `h3-core::audio`: `h3s_conv1d`, `h3s_conv_transpose1d`, `h3s_aa_snake` | done: rel err 3e-5, 2.0 s vs 8.3 s |
 | keyframe / reference image encoders | ComfyUI | SYCL kernels + Rust graph | open |
-| text encoder (Qwen3-VL 32B, hidden states) | ComfyUI-GGUF | reuse the int8 linear + attention kernels | open |
-| tokenizer, prompt template | Python | Rust | open |
-| mp4 writing | ffmpeg subprocess | ffmpeg subprocess from Rust | open |
-| job queue, HTTP API, LLM mode switching | `server.py` | `engine/h3-wfe` (Rust) | open |
+| text encoder (Qwen3-VL 32B, 50 layers, Q4_K/Q6_K GGUF) | ComfyUI-GGUF | `h3-core::gguf` + `te`: streamed layer by layer, `h3s_dequant`, `h3s_attention_causal` | done: worst token cosine 0.999998, 16 s vs ~54 s |
+| tokenizer (text-to-video presentation: the raw prompt) | transformers `Qwen2Tokenizer` | `h3-core::tokenizer` | done: identical ids (picture/video prompts with vision blocks: open) |
+| mp4 writing | PyAV | ffmpeg subprocess from Rust (`h3d/media.rs`) | done |
+| job queue, HTTP API, LLM mode switching | `server.py` | `h3d daemon` + `sycl-h3` (Rust); `generate` jobs | engine side done; the front end's clip/project endpoints: open |
 | web front end | TSX + snabbdom | `wfe/` unchanged | done (needs the Rust server) |
 
 ## Order
