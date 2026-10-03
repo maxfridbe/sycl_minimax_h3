@@ -41,6 +41,8 @@ const FRAME_OVERLAP: usize = TOKEN_OVERLAP * PATCH_T - FRAME_PRE_PAD; // 5
 // spatial tiling, in pixels
 const TILE: usize = 256;
 const TILE_OVERLAP_MIN: usize = 64;
+/// tiles decoded together (they share the linears' matrix products)
+const TILE_BATCH: usize = 4;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
@@ -200,27 +202,35 @@ impl VideoDecoder {
         })
     }
 
-    /// One tile: latents [24, t, h, w] (denormalized, after the 1x1x1 convolution) -> raw pixels [3, 4t, 16h, 16w].
-    fn tile(&self, z: &[f32], t: usize, h: usize, w: usize) -> Result<Vec<f32>> {
+    /// Tiles of the same size, decoded together: latents [24, t, h, w] each (denormalized, after the 1x1x1
+    /// convolution) -> raw pixels [3, 4t, 16h, 16w] each. The tiles share the linears (one matrix product over all
+    /// their tokens: a tile alone, ~1,800 tokens, is a thin product for this card) and keep their own attention.
+    fn tiles(&self, zs: &[Vec<f32>], t: usize, h: usize, w: usize) -> Result<Vec<Vec<f32>>> {
         let dev = &self.dev;
+        let nb = zs.len();
         let n = t * h * w;
         let s = n + REGISTERS + 1;
-        // tokens: (t, h, w) order, 24 features
-        let mut rows = vec![0f32; n * LATENT_C];
-        for c in 0..LATENT_C {
-            for i in 0..n {
-                rows[i * LATENT_C + c] = z[c * n + i];
+        let rows_all = nb * s;
+        // tokens: (t, h, w) order, 24 features, tile after tile
+        let mut rows = vec![0f32; nb * n * LATENT_C];
+        for (k, z) in zs.iter().enumerate() {
+            for c in 0..LATENT_C {
+                for i in 0..n {
+                    rows[(k * n + i) * LATENT_C + c] = z[c * n + i];
+                }
             }
         }
-        let input = f32_tensor(dev, &[n, LATENT_C], &rows)?;
-        let x = Tensor::new(dev, self.act, &[s, DIM])?;
+        let input = f32_tensor(dev, &[nb * n, LATENT_C], &rows)?;
+        let x = Tensor::new(dev, self.act, &[rows_all, DIM])?;
         {
-            let e = Tensor::new(dev, self.act, &[n, DIM])?;
+            let e = Tensor::new(dev, self.act, &[nb * n, DIM])?;
             self.x_embed.forward(&input, &e)?;
-            x.copy_rows(0, &e, 0, n)?;
-            x.copy_rows(n, &self.suffix, 0, REGISTERS + 1)?;
+            for k in 0..nb {
+                x.copy_rows(k * s, &e, k * n, n)?;
+                x.copy_rows(k * s + n, &self.suffix, 0, REGISTERS + 1)?;
+            }
         }
-        // positions: cell centres in [-1, 1] per axis, the suffix at 0; angles carry the 2 pi
+        // positions: cell centres in [-1, 1] per axis, the suffix at 0; angles carry the 2 pi; the same per tile
         let mut pos = Vec::with_capacity(s * 3);
         let c = |i: usize, d: usize| (2.0 * ((i as f64 + 0.5) / d as f64) - 1.0) * std::f64::consts::TAU;
         for ti in 0..t {
@@ -231,22 +241,33 @@ impl VideoDecoder {
             }
         }
         pos.extend(std::iter::repeat_n(0.0, (REGISTERS + 1) * 3));
-        let cs = f32_tensor(dev, &[s, ROT_DIM / 2, 2], &rotations(&pos, &self.inv_freq))?;
-        let zero_rows = Tensor::from_bytes(dev, DType::I32, &[s], &vec![0u8; s * 4])?;
+        let one = rotations(&pos, &self.inv_freq);
+        let all: Vec<f32> = (0..nb).flat_map(|_| one.iter().copied()).collect();
+        let cs = f32_tensor(dev, &[rows_all, ROT_DIM / 2, 2], &all)?;
+        let zero_rows = Tensor::from_bytes(dev, DType::I32, &[rows_all], &vec![0u8; rows_all * 4])?;
 
-        let hbuf = Tensor::new(dev, self.act, &[s, DIM])?;
-        let qkv = Tensor::new(dev, self.act, &[s, 3 * DIM])?;
-        let att = Tensor::new(dev, self.act, &[s, DIM])?;
-        let proj = Tensor::new(dev, self.act, &[s, DIM])?;
-        let f1 = Tensor::new(dev, self.act, &[s, 2 * 4 * DIM])?;
-        let act = Tensor::new(dev, self.act, &[s, 4 * DIM])?;
+        let hbuf = Tensor::new(dev, self.act, &[rows_all, DIM])?;
+        let qkv = Tensor::new(dev, self.act, &[rows_all, 3 * DIM])?;
+        let att = Tensor::new(dev, self.act, &[rows_all, DIM])?;
+        let att1 = Tensor::new(dev, self.act, &[s, DIM])?;
+        let proj = Tensor::new(dev, self.act, &[rows_all, DIM])?;
+        let f1 = Tensor::new(dev, self.act, &[rows_all, 2 * 4 * DIM])?;
+        let act = Tensor::new(dev, self.act, &[rows_all, 4 * DIM])?;
         for b in &self.blocks {
             ops::rms_norm_mod(&x, &b.norm1, EPS, None, &hbuf)?;
             b.qkv.forward(&hbuf, &qkv)?;
-            let part = |i: usize| Rows { t: &qkv, offset: i * DIM, stride: 3 * DIM, tokens: s, heads: HEADS, dim: HEAD_DIM };
-            ops::rms_rope(part(0), &self.ones, EPS, &cs, ROT_DIM)?;
-            ops::rms_rope(part(1), &self.ones, EPS, &cs, ROT_DIM)?;
-            ops::attention(part(0), part(1), part(2), &att)?;
+            let all_rows = |i: usize| Rows { t: &qkv, offset: i * DIM, stride: 3 * DIM, tokens: rows_all, heads: HEADS, dim: HEAD_DIM };
+            ops::rms_rope(all_rows(0), &self.ones, EPS, &cs, ROT_DIM)?;
+            ops::rms_rope(all_rows(1), &self.ones, EPS, &cs, ROT_DIM)?;
+            for k in 0..nb {
+                let part = |i: usize| Rows { t: &qkv, offset: k * s * 3 * DIM + i * DIM, stride: 3 * DIM, tokens: s, heads: HEADS, dim: HEAD_DIM };
+                if nb == 1 {
+                    ops::attention(part(0), part(1), part(2), &att)?;
+                } else {
+                    ops::attention(part(0), part(1), part(2), &att1)?;
+                    att.copy_rows(k * s, &att1, 0, s)?;
+                }
+            }
             b.out.forward(&att, &proj)?;
             ops::gate_add(&x, &proj, &zero_rows, &b.scale1)?;
             ops::rms_norm_mod(&x, &b.norm2, EPS, None, &hbuf)?;
@@ -255,36 +276,43 @@ impl VideoDecoder {
             b.w2.forward(&act, &proj)?;
             ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
         }
-        let normed = Tensor::new(dev, DType::F32, &[n, DIM])?;
+        let normed = Tensor::new(dev, DType::F32, &[nb * n, DIM])?;
         {
-            let img = Tensor::new(dev, self.act, &[n, DIM])?;
-            img.copy_rows(0, &x, 0, n)?;
+            let img = Tensor::new(dev, self.act, &[nb * n, DIM])?;
+            for k in 0..nb {
+                img.copy_rows(k * n, &x, k * s, n)?;
+            }
             ops::layer_norm(&img, DIM, Some(&self.norm_out_w), Some(&self.norm_out_b), EPS, &normed)?;
         }
         let per = OUT_C * PATCH_T * PATCH * PATCH;
-        let out = Tensor::new(dev, DType::F32, &[n, per])?;
+        let out = Tensor::new(dev, DType::F32, &[nb * n, per])?;
         self.proj_out.forward(&normed, &out)?;
         let o = out.to_f32()?;
         // token (t, h, w) -> pixels (c, t*4 + a, h*16 + y, w*16 + x)
         let (ft, fh, fw) = (t * PATCH_T, h * PATCH, w * PATCH);
-        let mut px = vec![0f32; OUT_C * ft * fh * fw];
-        for ti in 0..t {
-            for yi in 0..h {
-                for xi in 0..w {
-                    let tok = &o[((ti * h + yi) * w + xi) * per..][..per];
-                    for ch in 0..OUT_C {
-                        for a in 0..PATCH_T {
-                            for y in 0..PATCH {
-                                let dst = ((ch * ft + ti * PATCH_T + a) * fh + yi * PATCH + y) * fw + xi * PATCH;
-                                let src = ((ch * PATCH_T + a) * PATCH + y) * PATCH;
-                                px[dst..dst + PATCH].copy_from_slice(&tok[src..src + PATCH]);
+        let mut res = Vec::with_capacity(nb);
+        for k in 0..nb {
+            let o = &o[k * n * per..(k + 1) * n * per];
+            let mut px = vec![0f32; OUT_C * ft * fh * fw];
+            for ti in 0..t {
+                for yi in 0..h {
+                    for xi in 0..w {
+                        let tok = &o[((ti * h + yi) * w + xi) * per..][..per];
+                        for ch in 0..OUT_C {
+                            for a in 0..PATCH_T {
+                                for y in 0..PATCH {
+                                    let dst = ((ch * ft + ti * PATCH_T + a) * fh + yi * PATCH + y) * fw + xi * PATCH;
+                                    let src = ((ch * PATCH_T + a) * PATCH + y) * PATCH;
+                                    px[dst..dst + PATCH].copy_from_slice(&tok[src..src + PATCH]);
+                                }
                             }
                         }
                     }
                 }
             }
+            res.push(px);
         }
-        Ok(px)
+        Ok(res)
     }
 
     /// Latents [24, t, h, w] (raw, denormalized) through tiling: pixels [3, 4t, 16h, 16w], raw.
@@ -293,19 +321,13 @@ impl VideoDecoder {
         let (ys, yo) = split_tiles(fh);
         let (xs, xo) = split_tiles(fw);
         let tile_px = |len: usize| len.min(TILE);
-        let mut canvas = vec![0f32; OUT_C * ft * fh * fw];
-        // per row of tiles: the bottom overlap strips of the previous row, per tile column
-        let mut row_tails: Vec<Img> = Vec::new();
-        let mut out_y = 0;
-        for (i, &y0) in ys.iter().enumerate() {
-            let th = tile_px(fh);
-            let mut new_tails = Vec::new();
-            let mut left_tail: Option<Img> = None;
-            let mut out_x = 0;
-            let mut tile_h = 0;
-            for (j, &x0) in xs.iter().enumerate() {
-                let tw = tile_px(fw);
-                let (lh, lw, ly, lx) = (th / PATCH, tw / PATCH, y0 / PATCH, x0 / PATCH);
+        let (th, tw) = (tile_px(fh), tile_px(fw));
+        let (lh, lw) = (th / PATCH, tw / PATCH);
+        // every tile's latents, then the tiles decoded a few at a time
+        let mut zs = Vec::with_capacity(ys.len() * xs.len());
+        for &y0 in &ys {
+            for &x0 in &xs {
+                let (ly, lx) = (y0 / PATCH, x0 / PATCH);
                 let mut zt = vec![0f32; LATENT_C * t * lh * lw];
                 for c in 0..LATENT_C {
                     for ti in 0..t {
@@ -316,8 +338,26 @@ impl VideoDecoder {
                         }
                     }
                 }
-                tick()?;
-                let mut tile = Img { c: OUT_C * ft, h: th, w: tw, v: self.tile(&zt, t, lh, lw)? };
+                zs.push(zt);
+            }
+        }
+        let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(zs.len());
+        for batch in zs.chunks(TILE_BATCH) {
+            tick()?;
+            decoded.extend(self.tiles(batch, t, lh, lw)?);
+        }
+        let mut decoded = decoded.into_iter();
+        let mut canvas = vec![0f32; OUT_C * ft * fh * fw];
+        // per row of tiles: the bottom overlap strips of the previous row, per tile column
+        let mut row_tails: Vec<Img> = Vec::new();
+        let mut out_y = 0;
+        for i in 0..ys.len() {
+            let mut new_tails = Vec::new();
+            let mut left_tail: Option<Img> = None;
+            let mut out_x = 0;
+            let mut tile_h = 0;
+            for j in 0..xs.len() {
+                let mut tile = Img { c: OUT_C * ft, h: th, w: tw, v: decoded.next().ok_or("a tile went missing")? };
                 if i + 1 < ys.len() {
                     new_tails.push(tile.rows(th - yo[i], th));
                 }
@@ -351,7 +391,7 @@ impl VideoDecoder {
     }
 
     /// Normalized latents [24, T, H, W] (what the sampler produces) -> pixels [3, frames, 16 H, 16 W] in [0, 1].
-    /// `tick` is called before every tile (cancel checks, progress).
+    /// `tick` is called before every batch of tiles (cancel checks, progress).
     pub fn decode(&self, z: &[f32], t: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
         let n = h * w;
         // denormalize, then the 1x1x1 convolution

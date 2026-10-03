@@ -492,7 +492,7 @@ pub fn decode_latents(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Va
     })?;
     let secs = t0.elapsed().as_secs_f64();
     let (fh, fw) = (h * 16, w * 16);
-    ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} tiles)"));
+    ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} batches of tiles)"));
     for (k, v) in [("frames", json!(frames)), ("width", json!(fw)), ("height", json!(fh)), ("seconds", json!(secs)), ("tiles", json!(tiles))] {
         report[k] = v;
     }
