@@ -46,6 +46,9 @@ the engine (over its socket):
                                 queue a job (-f: follow its log); --gpu N pins it to one GPU
                                 kinds: bench-blocks (--tokens N --blocks N), check-block (--dump /out/<file>),
                                 denoise (--dump /out/<run dump> --out /out/<latents>),
+                                generate (--prompt <text> --width 384 --height 288 --seconds 2 --steps 8 --seed 0
+                                          --upscale 2 --out /out/<clip>.mp4): a whole clip
+                                encode (--prompt <text> | --prompt_file f --te /models/<te>.gguf --out /out/<cond>),
                                 decode (--latents /out/<latents> --vae /models/<vae> --audio_vae /models/<vae> --out /out/<clip>.mp4)
   sycl-h3 jobs stop <id>... | rem <id>... | details <id>
   sycl-h3 unload [--gpu N]      give a GPU back now; the next job loads again

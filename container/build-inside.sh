@@ -20,6 +20,7 @@ engine() {
   cp engine/target/release/h3d dist/
   cp engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/
   rm -f dist/h3                                  # the name before the split
+  rm -rf dist/tokenizer && cp -r tokenizer dist/tokenizer   # the text encoder's tokenizer files (/app/tokenizer)
 }
 wfe() {
   echo "==> wfe: TypeScript -> dist/wfe"

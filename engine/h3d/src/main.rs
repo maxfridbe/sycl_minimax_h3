@@ -14,6 +14,7 @@
 //!     h3d check-block <checkpoint> <dump> [--blocks N]
 //!     h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
 //!     h3d denoise <checkpoint> <run dump> [--out latents.safetensors]
+//!     h3d encode <te.gguf> --prompt-file <file> [--tokenizer dir] [--out cond.safetensors] [--check run dump]
 //!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
 //!                [--out clip.mp4] [--check decode dump]
 
@@ -52,6 +53,7 @@ const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
   h3d check-block <checkpoint> <dump.safetensors> [--blocks N] [--threads 8]
   h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
   h3d denoise <checkpoint> <rundump.safetensors> [--out latents.safetensors] [--threads 8]
+  h3d encode <te.gguf> --prompt-file <file> [--tokenizer /app/tokenizer] [--out cond.safetensors] [--check rundump.safetensors]
   h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
              [--out clip.mp4] [--check decodedump.safetensors]";
 
@@ -251,6 +253,19 @@ fn cmd_denoise(args: &Args) -> Result<()> {
     jobs::denoise(&e, args.path(1)?, out, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
+fn cmd_encode(args: &Args) -> Result<()> {
+    let mut log = println_log();
+    let dev = Device::open()?;
+    log(format!("device : {}", dev.name()));
+    let pf = args.options.get("prompt-file").ok_or("encode needs --prompt-file")?;
+    let prompt = std::fs::read_to_string(pf).map_err(|e| Error(format!("{pf}: {e}")))?.trim().to_string();
+    let cancel = AtomicBool::new(false);
+    let opt = |k: &str| args.options.get(k).map(Path::new);
+    let tokenizer = opt("tokenizer").unwrap_or(Path::new("/app/tokenizer"));
+    jobs::encode(&dev, args.number("threads", 8)?, &prompt, &jobs::TeFiles { te: args.path(0)?, tokenizer }, opt("out"), opt("check"), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None })
+        .map(|_| ())
+}
+
 fn cmd_decode(args: &Args) -> Result<()> {
     let mut log = println_log();
     let dev = Device::open()?;
@@ -339,6 +354,7 @@ fn run() -> Result<()> {
         "bench-blocks" => cmd_bench_blocks(&args),
         "denoise" => cmd_denoise(&args),
         "decode" => cmd_decode(&args),
+        "encode" => cmd_encode(&args),
         "daemon" => cmd_daemon(&raw[1..]),
         "gpus" => cmd_gpus(&Args { positional: raw[1..].to_vec(), options: BTreeMap::new() }),
         "worker" => worker::run(args.number("gpu", 0)?, args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),

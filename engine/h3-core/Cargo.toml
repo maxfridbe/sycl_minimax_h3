@@ -7,3 +7,5 @@ edition.workspace = true
 [dependencies]
 h3-sys = { path = "../h3-sys" }
 serde_json = "1"
+fancy-regex = "0.14"
+unicode-normalization = "0.1"
