@@ -258,12 +258,30 @@ impl VideoDecoder {
         if prof {
             dev.wait()?;
         }
+        // H3S_PROFILE: a wait after every stage, the time summed per stage (slower; for finding where it goes)
+        let mut stages: Vec<(&str, f64)> = Vec::new();
+        let mut mark = std::time::Instant::now();
+        let mut lap = |name: &'static str| -> Result<()> {
+            if prof {
+                dev.wait()?;
+                let dt = mark.elapsed().as_secs_f64();
+                match stages.iter_mut().find(|(n, _)| *n == name) {
+                    Some(st) => st.1 += dt,
+                    None => stages.push((name, dt)),
+                }
+                mark = std::time::Instant::now();
+            }
+            Ok(())
+        };
         for b in &self.blocks {
             ops::rms_norm_mod(&x, &b.norm1, EPS, None, &hbuf)?;
+            lap("norm")?;
             b.qkv.forward(&hbuf, &qkv)?;
+            lap("linear qkv")?;
             let all_rows = |i: usize| Rows { t: &qkv, offset: i * DIM, stride: 3 * DIM, tokens: rows_all, heads: HEADS, dim: HEAD_DIM };
             ops::rms_rope(all_rows(0), &self.ones, EPS, &cs, ROT_DIM)?;
             ops::rms_rope(all_rows(1), &self.ones, EPS, &cs, ROT_DIM)?;
+            lap("norm + rotation q k")?;
             for k in 0..nb {
                 let part = |i: usize| Rows { t: &qkv, offset: k * s * 3 * DIM + i * DIM, stride: 3 * DIM, tokens: s, heads: HEADS, dim: HEAD_DIM };
                 if nb == 1 {
@@ -273,13 +291,27 @@ impl VideoDecoder {
                     att.copy_rows(k * s, &att1, 0, s)?;
                 }
             }
+            lap("attention")?;
             b.out.forward(&att, &proj)?;
+            lap("linear out")?;
             ops::gate_add(&x, &proj, &zero_rows, &b.scale1)?;
+            lap("scaled add")?;
             ops::rms_norm_mod(&x, &b.norm2, EPS, None, &hbuf)?;
+            lap("norm")?;
             b.w1.forward(&hbuf, &f1)?;
+            lap("linear w1")?;
             ops::swiglu(&f1, &act)?;
+            lap("gated activation")?;
             b.w2.forward(&act, &proj)?;
+            lap("linear w2")?;
             ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
+            lap("scaled add")?;
+        }
+        if prof {
+            let sum: f64 = stages.iter().map(|s| s.1).sum();
+            for (n, t) in &stages {
+                eprintln!("vae stage: {n:22} {:7.1} ms  {:4.1}%", t * 1e3, t / sum * 100.0);
+            }
         }
         if prof {
             dev.wait()?;
