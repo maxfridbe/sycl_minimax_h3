@@ -76,10 +76,12 @@ it takes computing fewer scores.
                     tokenizer, text encoder, denoiser, sampler, LoRA, upscaler, video and audio decoders
       h3-http/      the small HTTP/JSON layer both programs below share (TCP or Unix socket)
       h3d/          the engine side, in the container: the daemon, the per-GPU engine process, the jobs, checks
-      sycl-h3/      the command line, on the host (a static binary): starts the services, talks over the socket
+      sycl-h3/      the command line, on the host (a static binary): starts the services, talks over the socket;
+                    the studio (the front end's API and clip queue) and the film tools
     tokenizer/    the Qwen2 tokenizer's vocabulary and merges (Apache-2.0)
     wfe/          the web front end (TSX + snabbdom, vendored compiler, no node_modules)
     container/    the build-and-run image (podman)
+    tools/        examples for the studio's configuration (characters for sycl-h3 speech, language-model modes)
     reference/    the PyTorch pipeline's harness, for comparisons only
     docs/
 
@@ -96,29 +98,33 @@ reach the GPU) and nothing else.
 ### Using it: `sycl-h3`
 
 `sycl-h3` is the command line, on the host: a static binary in `dist/` (copy it onto your PATH if you like; it finds
-`dist/` beside itself, or through `H3_DIST`). It starts two services, each in its own container - either can run
-without the other - and talks to the engine over a Unix socket, like `docker` and `dockerd`.
+`dist/` beside itself, or through `H3_DIST`). It starts two services - either runs without the other - and talks to
+the engine over a Unix socket, like `docker` and `dockerd`.
 
     ./sycl-h3 gpus                  # the GPUs, numbered as --gpu takes them
     ./sycl-h3 start                 # the engine daemon: every GPU (or --gpu 0 --gpu 1 ...); --shared-gpu N for the
                                     # GPU(s) another program normally holds (see below)
-    ./sycl-h3 serve                 # the web front end, http://127.0.0.1:8095/ (--bind 0.0.0.0 --port 9000 ...)
+    ./sycl-h3 serve                 # the studio: the web front end and its clip queue, http://127.0.0.1:8095/
+                                    # (--bind 0.0.0.0 --port 9000 ...)
     ./sycl-h3 status                # live, one row per GPU, like docker stats (--no-stream: once)
-    ./sycl-h3 jobs add bench-blocks --tokens 47173 -f     # queue a job and follow its log (--gpu N to pin it)
     ./sycl-h3 jobs add generate --prompt "a cat on a piano" --width 768 --height 576 --seconds 5 \
-        --upscale 1.5 --lora /models/loras/<lora>.safetensors:0.5 --out /out/cat.mp4 -f    # a whole clip
-    ./sycl-h3 jobs add check-block --dump /out/blockdump.safetensors
+        --upscale 1.5 --lora /models/loras/<lora>.safetensors:0.5 --out /out/cat.mp4 -f    # a whole clip, directly
     ./sycl-h3 jobs ps [-a] | stop <id>... | rem <id>... | details <id>
     ./sycl-h3 unload [--gpu N]      # give a GPU back now; the next job loads again
-    ./sycl-h3 stop [--web | --all]  # the engine (default), the web front end, or both - gracefully
+    ./sycl-h3 stop [--web | --all]  # the engine (default), the studio, or both - gracefully
     ./sycl-h3 logs [--web]
+
+    ./sycl-h3 speech speech.txt --character data --audio-anchor prev --guide-frames 22   # a speech as chained clips
+    ./sycl-h3 scene film.scene.json # queue a scene file (the front end's export)
+    ./sycl-h3 join "Speech"         # the series' finished clips as one film, frame-exact
+    ./sycl-h3 speechpct out/h3_*.mp4
 
 How it fits together:
 
     sycl-h3 (host) --start/stop (podman)--> [sycl-h3]      h3d daemon --pipes--> h3d worker --gpu 0, --gpu 1 ...
          |                                     ^ Unix socket, JSON over HTTP
          +--status / jobs / unload ------------+
-         +--serve (podman)------------------> [sycl-h3-web]  web front end, TCP -> the same socket
+         +--serve (a host process)----------> studio        web front end + clip queue, TCP -> the same socket
 
 - `h3d daemon` keeps the job queue and never opens a GPU. Each GPU it serves gets its own engine process,
   `h3d worker --gpu N`, started when a job needs that GPU; the model stays loaded on it between jobs. The worker
@@ -127,13 +133,23 @@ How it fits together:
   stdin/stdout, one JSON object per line (job, cancel, exit; log lines, progress, memory, results); tensors and video
   never cross the pipe. Jobs run on any free GPU, or on the one they name. A cancel lands at the next block
   boundary, never inside a kernel (1.1 s at production size).
-- The web service serves the same TSX/snabbdom front end as before and passes the engine's API through to the
-  daemon's socket. The front end's calls for the clip queue, projects, scenes and films are not ported to Rust yet:
-  it passes them on to the server they were written for (`H3_LEGACY_API`), so it works whole while those move over.
+- The studio serves the same TSX/snabbdom front end as before and answers its API the way the old Python server
+  did (docs/LEGACY-API.md): the clip queue with holds per project and batch, anchors (`prev`, `first`, per camera)
+  resolved against the series, retries, per-clip records with the speech fraction, thumbnails, the timeline, scene
+  files, films. Each clip becomes the engine's `generate` job. It runs on the host because it also switches the
+  box's language models (`H3_LLM_MODES`), which are the host's own programs.
+- What a clip can be anchored to (the request fields, and `sycl-h3 jobs add generate` options): a picture or the
+  previous clip's last frame at the start and/or the end (exposure-matched), the previous clip's last latent, a
+  **motion guide** (the previous clip's last 22 frames as one moving keyframe - position and velocity), an **audio
+  keyframe** (the previous clip's last second of sound, so the room tone and the voice carry across the cut), a
+  **voice reference** (`<Audio 1>` in the prompt), and a **masked run** (regenerate seconds a-b of a clip, or extend
+  it, keeping the rest exactly). Every clip leaves the next one's anchors beside it (`.last.png`,
+  `.lastaud.safetensors`, `.lastlat.safetensors`, `.latents.safetensors`).
 - Sharing a GPU with another program: `H3_GPU_LOCK` names a lock file the daemon waits on and holds while an engine
-  on a shared GPU is loaded; `H3_LLM_SWITCHER` names a front end's model switcher whose model is stopped before
-  loading and restored after the last such engine has ended (`--shared-gpu` / `H3_SHARED_GPUS` say which GPUs these
-  are about; all served ones by default). Either way an engine waits until its card really has the memory free.
+  on a shared GPU is loaded; `H3_LLM_SWITCHER` names a model switcher (the studio's `/rpc/llm.mode`) whose model is
+  stopped before loading and restored after the last such engine has ended (`--shared-gpu` / `H3_SHARED_GPUS` say
+  which GPUs these are about; all served ones by default). Either way an engine waits until its card really has the
+  memory free.
 
 Settings go in `sycl-h3.conf` beside the repository or `~/.config/sycl-h3.conf` (`sycl-h3 help` lists them).
 
