@@ -23,5 +23,5 @@ OUT=${H3_OUT:-$ROOT/out}; mkdir -p "$OUT"; mounts+=(-v "$OUT:/out")
 
 exec $CE run --rm --name h3-engine --stop-timeout 120 "${AS_USER[@]}" "${GPU[@]}" "${mounts[@]}" \
   -e H3SYCL_LIB=/app/libh3sycl.so ${H3S_MEM_FRACTION:+-e H3S_MEM_FRACTION=$H3S_MEM_FRACTION} \
-  ${ONEDNN_VERBOSE:+-e ONEDNN_VERBOSE=$ONEDNN_VERBOSE} ${H3S_PROFILE:+-e H3S_PROFILE=1} ${H3S_ROTQ_SPLIT:+-e H3S_ROTQ_SPLIT=1} ${H3S_ATTN_TABLE_MB:+-e H3S_ATTN_TABLE_MB=$H3S_ATTN_TABLE_MB} ${H3S_ATTN_ROWS:+-e H3S_ATTN_ROWS=$H3S_ATTN_ROWS} -e H3_BIN="${H3_BIN:-h3d}" \
+  ${ONEDNN_VERBOSE:+-e ONEDNN_VERBOSE=$ONEDNN_VERBOSE} ${H3S_PROFILE:+-e H3S_PROFILE=1} ${H3S_ROTQ_SPLIT:+-e H3S_ROTQ_SPLIT=1} ${H3S_POISON:+-e H3S_POISON=1} ${H3S_ATTN_TABLE_MB:+-e H3S_ATTN_TABLE_MB=$H3S_ATTN_TABLE_MB} ${H3S_ATTN_ROWS:+-e H3S_ATTN_ROWS=$H3S_ATTN_ROWS} -e H3_BIN="${H3_BIN:-h3d}" \
   "$IMAGE" bash -c 'source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec "/app/$H3_BIN" "$@"' h3d "$@"

@@ -123,7 +123,8 @@ struct Ctx {
     std::map<const void*, dnnl::memory> conv3_w;
     std::map<std::tuple<std::vector<int64_t>>, Conv3> conv3x;   // strided, unpadded (h3s_conv3d_ex)
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
-    bool rotq_fused = true;                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
+    bool rotq_fused = true;
+    bool poison = false;                           // H3S_POISON=1: new buffers filled with NaN bytes (finds reads of unwritten memory)                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
     // library refuses an allocation that would pass the cap instead of asking the driver
     std::mutex mem_mu;
@@ -147,6 +148,7 @@ struct Ctx {
         p = sycl::malloc_device<T>(want, q);
         cap = p ? want : 0;
         mem_used += cap * sizeof(T);
+        if (p && poison) q.memset(p, 0xff, want * sizeof(T)).wait();
         if (!p) g_err = "the device refused a scratch buffer of " + std::to_string((want * sizeof(T)) >> 20) + " MiB";
         return p;
     }
@@ -206,6 +208,7 @@ void init(Ctx& c) {
 #endif
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
     c.rotq_fused = std::getenv("H3S_ROTQ_SPLIT") == nullptr;
+    c.poison = std::getenv("H3S_POISON") != nullptr;
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
     if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
@@ -277,6 +280,7 @@ void* h3s_alloc(void* ctx, uint64_t bytes) try {
     }
     void* p = sycl::malloc_device(bytes ? bytes : 1, c.q);
     if (!p) { g_err = "h3s_alloc: the device refused " + std::to_string(bytes >> 20) + " MiB"; return nullptr; }
+    if (c.poison) c.q.memset(p, 0xff, bytes ? bytes : 1).wait();
     c.mem.emplace(p, bytes);
     c.mem_used += bytes;
     return p;
@@ -289,6 +293,12 @@ void h3s_free(void* ctx, void* p) {
     std::lock_guard<std::mutex> l(c.mem_mu);
     auto it = c.mem.find(p);
     if (it == c.mem.end()) return;
+    // weights reordered for oneDNN are cached by their buffer's address, and the allocator hands a freed address
+    // out again: a later load (the next clip's video encoder after this one's upscaler) would find this buffer's
+    // reorder and convolve with another network's weights
+    const char* lo = static_cast<const char*>(p);
+    for (auto w = c.conv3_w.lower_bound(lo); w != c.conv3_w.end() && static_cast<const char*>(w->first) < lo + it->second;)
+        w = c.conv3_w.erase(w);
     c.mem_used -= it->second;
     c.mem.erase(it);
     sycl::free(p, c.q);
