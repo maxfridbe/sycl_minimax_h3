@@ -10,7 +10,6 @@ use h3_http::{Error, Result};
 use crate::config::Config;
 
 pub const ENGINE: &str = "sycl-h3";
-pub const WEB: &str = "sycl-h3-web";
 /// Where the socket directory appears inside both containers.
 pub const SOCKET_DIR_IN: &str = "/run/sycl-h3";
 

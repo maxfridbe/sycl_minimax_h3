@@ -1,19 +1,24 @@
-//! `sycl-h3` - MiniMax H3 on Intel Arc GPUs: the command line, on the host. It starts two services in containers and
-//! talks to the engine over a Unix socket; nothing of the engine runs in this process.
+//! `sycl-h3` - MiniMax H3 on Intel Arc GPUs: the command line, on the host. It starts two services - the engine
+//! daemon in a container, the studio (the web front end and its clip queue) as a host process - and talks to the
+//! engine over a Unix socket; nothing of the engine runs in this process.
 //!
 //! ```text
 //!   sycl-h3 (you) ---- start/stop (podman) ----> [sycl-h3]      h3d daemon -- pipes --> h3d worker per GPU
 //!        |                                            ^ Unix socket (JSON over HTTP)
 //!        +---------- status/jobs/unload -------------+
-//!        +---- serve/stop --web (podman) ----> [sycl-h3-web]   web front end, :8095 -> the same socket
+//!        +---- serve/stop --web (process) ---> studio            web front end + clip queue, :8095 -> the same socket
 //! ```
+//!
+//! The studio runs on the host, not in a container, because the box's language models it switches are the host's
+//! own programs (H3_LLM_MODES).
 //!
 //! A static binary: it runs on the host whatever the host's C library is.
 
 mod client;
 mod config;
 mod container;
-mod web;
+mod studio;
+mod tools;
 
 use std::path::PathBuf;
 use std::process::{ExitCode, Stdio};
@@ -22,7 +27,7 @@ use std::time::{Duration, Instant};
 use h3_http::{Error, Result, Target};
 
 use config::Config;
-use container::{mount, Ce, ENGINE, SOCKET_DIR_IN, WEB};
+use container::{mount, Ce, ENGINE, SOCKET_DIR_IN};
 
 pub(crate) fn version() -> String {
     let p: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|x| x.parse().unwrap_or(0)).collect();
@@ -31,12 +36,13 @@ pub(crate) fn version() -> String {
 
 const USAGE: &str = "sycl-h3 - MiniMax H3 on Intel Arc GPUs
 
-services (each in its own container; either runs without the other):
+services (either runs without the other):
   sycl-h3 start [--all | --gpu N ...] [--shared-gpu N ...]
                                 the engine daemon; each GPU (all by default) gets its own engine process when a job
                                 needs it, and the model stays loaded on it between jobs
   sycl-h3 serve [--bind ADDR] [--port N]
-                                the web front end (default 127.0.0.1:8095); it reaches the engine over the same socket
+                                the studio: the web front end and its clip queue (default 127.0.0.1:8095), a host
+                                process; it hands the clips to the engine over the same socket
   sycl-h3 stop [--web | --all]  stop the engine (the default), the web front end, or both - gracefully
 
 the engine (over its socket):
@@ -54,6 +60,12 @@ the engine (over its socket):
   sycl-h3 unload [--gpu N]      give a GPU back now; the next job loads again
 
   sycl-h3 gpus                  the GPUs, numbered as --gpu takes them
+
+tools (talk to the studio, like the front end):
+  sycl-h3 speech <text file> [options]   a speech as sized, chained character clips (sycl-h3 speech --help)
+  sycl-h3 scene <scene.json> [options]   queue a scene file (from the front end's export)
+  sycl-h3 join <prefix> [options]        join a series of finished clips into one film, frame-exact
+  sycl-h3 speechpct <clip.mp4>...        how much of each clip is speech
   sycl-h3 logs [--web]          a service's log, followed
   sycl-h3 version
 
@@ -67,7 +79,12 @@ settings (environment, or NAME=value lines in sycl-h3.conf beside the repository
   H3_GPU_LOCK      a lock file shared with the GPU's other users
   H3_LLM_SWITCHER  a front end's model switcher URL: its model stops before loading, comes back after
   H3_LISTEN, H3_PORT   where serve listens (default 127.0.0.1, 8095; 0.0.0.0 = the network, no password)
-  H3_LEGACY_API    the server the front end's not yet ported calls go to (e.g. http://127.0.0.1:8090)
+  H3_STUDIO_DIR    the studio's queue and state files (default ~/.local/share/sycl-h3)
+  H3_LLM_MODES     a JSON file of the language models the studio switches (docs/LEGACY-API.md); point the
+                   engine's H3_LLM_SWITCHER at the studio (http://127.0.0.1:8095/rpc/llm.mode) to use them
+  H3_GPUSTAT       GPU telemetry JSON for the front end (default /run/gpustat.json)
+  H3_TEMPLATES     a directory of prompt templates (*.txt)
+  H3_STUDIO        the studio's URL for the tools (default http://127.0.0.1:8095)
   H3_SOCKET_DIR    where the engine's socket lives (default $XDG_RUNTIME_DIR/sycl-h3)
   H3_IMAGE, H3_CONTAINER_ENGINE   the image (h3-build) and podman / docker";
 
@@ -203,66 +220,79 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
     client::status(&["--no-stream".into()], &|| String::new())
 }
 
-/// `sycl-h3 serve`: the web service's container.
+/// The studio's process files: its pid and where it listens, beside the engine's socket.
+fn studio_files(cfg: &Config) -> (PathBuf, PathBuf, PathBuf) {
+    let d = cfg.socket_dir();
+    (d.join("studio.pid"), d.join("studio.listen"), d.join("studio.log"))
+}
+
+fn studio_pid(cfg: &Config) -> Option<u32> {
+    let (pidf, _, _) = studio_files(cfg);
+    let pid: u32 = std::fs::read_to_string(pidf).ok()?.trim().parse().ok()?;
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    String::from_utf8_lossy(&cmd).contains("studio").then_some(pid)
+}
+
+/// `sycl-h3 serve`: the studio, as a host process of its own (setsid; it outlives this command).
 fn serve(cfg: &Config, raw: &[String]) -> Result<()> {
     let (bind, rest) = take_value(raw, "--bind")?;
     let (port, rest) = take_value(&rest, "--port")?;
     no_more(&rest, "serve")?;
     let bind = bind.unwrap_or_else(|| cfg.or("H3_LISTEN", "127.0.0.1"));
     let port: u16 = port.unwrap_or_else(|| cfg.or("H3_PORT", "8095")).parse().map_err(|_| Error("--port: not a port".into()))?;
-    let ce = Ce::new(cfg)?;
-    if ce.running(WEB) {
-        println!("the web front end is already running ({})", web_line(cfg, &ce));
+    if studio_pid(cfg).is_some() {
+        println!("the studio is already running ({})", web_line(cfg));
         return Ok(());
     }
-    ce.need_image()?;
-    need_dist(cfg, "sycl-h3")?;
     need_dist(cfg, "wfe/index.html")?;
-    ce.remove(WEB);
     let sock_dir = cfg.socket_dir();
     std::fs::create_dir_all(&sock_dir)?;
     let listen = if bind.contains(':') && !bind.starts_with('[') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") };
-    let mut args: Vec<String> = vec!["run".into(), "-d".into(), "--name".into(), WEB.into(), "--network".into(), "host".into()];
-    args.extend(["--stop-timeout".into(), "10".into()]);
-    args.extend(ce.user_args());
-    args.extend(mount(&cfg.dist, "/app", true));
-    args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
-    args.extend(["--label".into(), format!("sycl-h3.listen={listen}")]);
-    args.extend([ce.image.clone(), "/app/sycl-h3".into(), "web-service".into(), "--listen".into(), listen.clone(),
-                 "--socket".into(), format!("{SOCKET_DIR_IN}/h3d.sock"), "--ui".into(), "/app/wfe".into()]);
-    if let Some(l) = cfg.get("H3_LEGACY_API") {
-        args.extend(["--legacy-api".into(), l]);
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = cfg.get("H3_STUDIO_DIR").unwrap_or_else(|| format!("{home}/.local/share/sycl-h3"));
+    let out = cfg.or("H3_OUT", "./out");
+    let (pidf, listenf, logf) = studio_files(cfg);
+    let exe = std::env::current_exe()?;
+    let mut c = std::process::Command::new("setsid");
+    c.arg(exe).args(["studio", "--listen", &listen, "--socket"]).arg(cfg.socket()).arg("--ui").arg(cfg.dist.join("wfe"))
+        .args(["--out", &out, "--dir", &dir, "--gpustat", &cfg.or("H3_GPUSTAT", "/run/gpustat.json"), "--logs", &format!("{dir}/logs")]);
+    if let Some(t) = cfg.get("H3_TEMPLATES") {
+        c.args(["--templates", &t]);
     }
-    let st = ce.cmd().args(&args).stdout(Stdio::null()).status()?;
-    if !st.success() {
-        return Err(Error(format!("{} run failed", ce.bin)));
+    if let Some(m) = cfg.get("H3_LLM_MODES") {
+        c.args(["--llm-modes", &m]);
     }
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&logf)?;
+    let child = c.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).spawn()?;
+    std::fs::write(&pidf, format!("{}\n", child.id()))?;
+    std::fs::write(&listenf, &listen)?;
     let reach = match bind.as_str() {
         "0.0.0.0" => format!("127.0.0.1:{port}"),
         "::" | "[::]" => format!("[::1]:{port}"),
         _ => listen.clone(),
     };
-    wait_until("the web front end", 20, || std::net::TcpStream::connect(&reach).is_ok())?;
-    println!("{}", web_line(cfg, &ce));
+    wait_until("the studio", 20, || std::net::TcpStream::connect(&reach).is_ok())?;
+    // setsid forks: the studio's own pid is the listener's
+    if let Ok(o) = std::process::Command::new("pgrep").args(["-f", &format!("studio --listen {listen}")]).output() {
+        if let Some(p) = String::from_utf8_lossy(&o.stdout).lines().last() {
+            std::fs::write(&pidf, format!("{p}\n"))?;
+        }
+    }
+    println!("{}", web_line(cfg));
     Ok(())
 }
 
-/// "web front end: http://... " or "not running", for status and serve.
-fn web_line(_cfg: &Config, ce: &Ce) -> String {
-    if !ce.running(WEB) {
-        return "web front end: not running (sycl-h3 serve)".into();
+/// "studio: http://... " or "not running", for status and serve.
+fn web_line(cfg: &Config) -> String {
+    if studio_pid(cfg).is_none() {
+        return "studio: not running (sycl-h3 serve)".into();
     }
-    let listen = ce
-        .cmd()
-        .args(["container", "inspect", "-f", "{{index .Config.Labels \"sycl-h3.listen\"}}", WEB])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let listen = std::fs::read_to_string(studio_files(cfg).1).unwrap_or_default();
     let shown = match listen.split_once(':') {
         Some(("0.0.0.0", port)) => format!("{}:{port}", std::fs::read_to_string("/etc/hostname").unwrap_or_default().trim()),
         _ => listen,
     };
-    format!("web front end: http://{shown}/")
+    format!("studio: http://{shown}/")
 }
 
 /// `sycl-h3 stop [--web | --all]`
@@ -271,16 +301,21 @@ fn stop(cfg: &Config, raw: &[String]) -> Result<()> {
     let all = raw.iter().any(|a| a == "--all");
     let rest: Vec<String> = raw.iter().filter(|a| *a != "--web" && *a != "--all").cloned().collect();
     no_more(&rest, "stop")?;
-    let ce = Ce::new(cfg)?;
     if web || all {
-        if ce.running(WEB) {
-            ce.stop(WEB, 10);
-            ce.remove(WEB);
-            println!("web front end: stopped");
-        } else {
-            println!("web front end: not running");
+        match studio_pid(cfg) {
+            Some(pid) => {
+                let _ = std::process::Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+                let t0 = Instant::now();
+                while studio_pid(cfg).is_some() && t0.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let _ = std::fs::remove_file(studio_files(cfg).0);
+                println!("studio: stopped");
+            }
+            None => println!("studio: not running"),
         }
     }
+    let ce = Ce::new(cfg)?;
     if !web || all {
         if ce.running(ENGINE) {
             // ask the daemon: the running jobs stop at their next block boundary, the engines unload, it ends
@@ -332,13 +367,17 @@ fn gpus(cfg: &Config) -> Result<()> {
 }
 
 fn logs(cfg: &Config, raw: &[String]) -> Result<()> {
-    let name = if raw.iter().any(|a| a == "--web") { WEB } else { ENGINE };
+    if raw.iter().any(|a| a == "--web") {
+        let f = studio_files(cfg).2;
+        let st = std::process::Command::new("tail").args(["-n", "60", "-f"]).arg(&f).status()?;
+        return if st.success() { Ok(()) } else { Err(Error(format!("no log at {}", f.display()))) };
+    }
     let ce = Ce::new(cfg)?;
-    let st = ce.cmd().args(["logs", "-f", name]).status()?;
+    let st = ce.cmd().args(["logs", "-f", ENGINE]).status()?;
     if st.success() {
         Ok(())
     } else {
-        Err(Error(format!("no log for {name} (is it running?)")))
+        Err(Error(format!("no log for {ENGINE} (is it running?)")))
     }
 }
 
@@ -354,10 +393,7 @@ fn run() -> Result<()> {
         "start" => start(&cfg, rest),
         "serve" => serve(&cfg, rest),
         "stop" => stop(&cfg, rest),
-        "status" => {
-            let ce = Ce::new(&cfg).ok();
-            client::status(rest, &|| ce.as_ref().map_or(String::new(), |ce| web_line(&cfg, ce) + "\n"))
-        }
+        "status" => client::status(rest, &|| web_line(&cfg) + "\n"),
         "jobs" => client::jobs(rest),
         "unload" => client::unload(rest),
         "gpus" => gpus(&cfg),
@@ -366,18 +402,34 @@ fn run() -> Result<()> {
             println!("sycl-h3 {}", version());
             Ok(())
         }
-        // inside the web service's container (sycl-h3 serve starts it)
-        "web-service" => {
+        "speech" => tools::speech(&cfg, rest),
+        "scene" => tools::scene(&cfg, rest),
+        "join" => tools::join(&cfg, rest),
+        "speechpct" => tools::speechpct(rest),
+        // the studio's process (sycl-h3 serve starts it)
+        "studio" => {
             let (listen, r) = take_value(rest, "--listen")?;
             let (socket, r) = take_value(&r, "--socket")?;
             let (ui, r) = take_value(&r, "--ui")?;
-            let (legacy, r) = take_value(&r, "--legacy-api")?;
-            no_more(&r, "web-service")?;
-            web::run(web::Options {
+            let (out, r) = take_value(&r, "--out")?;
+            let (dir, r) = take_value(&r, "--dir")?;
+            let (gpustat, r) = take_value(&r, "--gpustat")?;
+            let (logs, r) = take_value(&r, "--logs")?;
+            let (templates, r) = take_value(&r, "--templates")?;
+            let (llm, r) = take_value(&r, "--llm-modes")?;
+            no_more(&r, "studio")?;
+            let dir: PathBuf = dir.ok_or("--dir")?.into();
+            studio::run(studio::Options {
                 listen: listen.ok_or("--listen")?,
                 socket: socket.ok_or("--socket")?.into(),
                 ui: ui.ok_or("--ui")?.into(),
-                legacy_api: legacy,
+                out: out.ok_or("--out")?.into(),
+                out_in: "/out".into(),
+                logs: logs.map(PathBuf::from).unwrap_or_else(|| dir.join("logs")),
+                dir,
+                templates: templates.map(PathBuf::from),
+                gpustat: gpustat.unwrap_or_else(|| "/run/gpustat.json".into()).into(),
+                llm_modes: llm.map(PathBuf::from),
             })
         }
         "help" | "--help" | "-h" => {
