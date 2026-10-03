@@ -12,9 +12,10 @@
 //!                                             what a denoiser step costs at a sequence length, stage by stage
 //!
 //!     h3 serve --model <checkpoint> ...       the engine as a resident daemon (daemon.rs)
-//!     h3 runjob <kind> ... | status | jobs | job <id> | killjob <id> | unload | shutdown
-//!                                             its client
+//!     h3 status | jobs ps|add|stop|rem|details | unload | shutdown
+//!                                             its client (client.rs)
 
+mod client;
 mod daemon;
 mod http;
 mod jobs;
@@ -54,9 +55,12 @@ the engine as a resident daemon (the model stays loaded between jobs):
            (or --listen ADDR:PORT in place of --bind/--port)
            [--gpu-lock <file>] [--llm-switcher <url>] [--threads 8]
            [--ui <dist/wfe>] [--legacy-api <url>]      the web front end on the same port
-  h3 runjob <kind> [--name value ...] [--no-wait]     kinds: bench-blocks (--tokens N --blocks N),
-                                                      check-block (--dump <file>)
-  h3 status | jobs | job <id> | killjob <id> | unload | shutdown
+  h3 status [--no-stream]                             the engine, live (like docker stats)
+  h3 jobs ps [-a]                                     queued and running jobs (-a: all)
+  h3 jobs add <kind> [--name value ...] [-f]          queue a job (-f: follow its log); kinds:
+                                                      bench-blocks (--tokens N --blocks N), check-block (--dump <file>)
+  h3 jobs stop <id>... | rem <id>... | details <id>
+  h3 unload | shutdown
   (the client finds the daemon at $H3_DAEMON, default 127.0.0.1:8095)";
 
 /// `--name value` options after the positional arguments.
@@ -236,7 +240,7 @@ fn cmd_check_block(args: &Args) -> Result<()> {
     let mut log = println_log();
     let e = jobs::Engine::load(args.path(0)?, count, args.number("threads", 8)?, &mut log)?;
     let cancel = AtomicBool::new(false);
-    jobs::check_block(&e, args.path(1)?, &mut jobs::Ctl { log: &mut log, cancel: &cancel }).map(|_| ())
+    jobs::check_block(&e, args.path(1)?, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
 fn cmd_bench_blocks(args: &Args) -> Result<()> {
@@ -244,7 +248,7 @@ fn cmd_bench_blocks(args: &Args) -> Result<()> {
     let mut log = println_log();
     let e = jobs::Engine::load(args.path(0)?, count, args.number("threads", 8)?, &mut log)?;
     let cancel = AtomicBool::new(false);
-    jobs::bench_blocks(&e, args.number("tokens", 16500)?, None, &mut jobs::Ctl { log: &mut log, cancel: &cancel }).map(|_| ())
+    jobs::bench_blocks(&e, args.number("tokens", 16500)?, None, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
 fn cmd_serve(args: &Args) -> Result<()> {
@@ -279,82 +283,13 @@ fn listen_addr(args: &Args) -> Result<String> {
     Ok(if bind.contains(':') && !bind.starts_with('[') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") })
 }
 
-/// Where the client finds the daemon: `$H3_DAEMON`, or the default port on the loopback interface.
-fn daemon_addr() -> String {
-    std::env::var("H3_DAEMON").unwrap_or_else(|_| "127.0.0.1:8095".into())
-}
-
-fn show(v: &serde_json::Value) {
-    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
-}
-
-/// `h3 runjob <kind> [--name value ...] [--no-wait]`: numbers become numbers, everything else strings.
-fn cmd_runjob(raw: &[String]) -> Result<()> {
-    let no_wait = raw.iter().any(|a| a == "--no-wait");
-    let rest: Vec<String> = raw.iter().filter(|a| *a != "--no-wait").cloned().collect();
-    let args = Args::parse(&rest)?;
-    let kind = args.positional.first().ok_or("runjob needs a kind: bench-blocks, check-block")?;
-    let mut spec = serde_json::Map::new();
-    spec.insert("kind".into(), serde_json::json!(kind));
-    for (k, v) in &args.options {
-        let val = v.parse::<u64>().map(serde_json::Value::from).unwrap_or_else(|_| serde_json::json!(v));
-        spec.insert(k.clone(), val);
-    }
-    let addr = daemon_addr();
-    let id = http::call(&addr, "POST", "/engine/jobs", Some(&serde_json::Value::Object(spec)))?["id"].as_u64().ok_or("no job id in the answer")?;
-    println!("job {id}");
-    if no_wait {
-        return Ok(());
-    }
-    // follow the log until the job ends
-    let mut shown = 0;
-    let mut engine_shown = String::new();
-    loop {
-        let j = http::call(&addr, "GET", &format!("/engine/jobs/{id}"), None)?;
-        let log = j["log"].as_array().cloned().unwrap_or_default();
-        for l in &log[shown.min(log.len())..] {
-            println!("{}", l.as_str().unwrap_or(""));
-        }
-        shown = log.len();
-        let state = j["state"].as_str().unwrap_or("");
-        if state == "queued" || (state == "running" && shown == 0) {
-            let st = http::call(&addr, "GET", "/engine/status", None)?;
-            let e = st["engine"].as_str().unwrap_or("").to_string();
-            if e != engine_shown && e != "loaded" {
-                println!("({state}; engine: {e})");
-                engine_shown = e;
-            }
-        }
-        match state {
-            "done" => return Ok(()),
-            "failed" | "cancelled" => return Err(Error(format!("job {id} {state}: {}", j["error"].as_str().unwrap_or("")))),
-            _ => std::thread::sleep(std::time::Duration::from_millis(700)),
-        }
-    }
-}
-
-fn cmd_client(cmd: &str, args: &Args) -> Result<()> {
-    let addr = daemon_addr();
-    let id = || args.positional.first().ok_or_else(|| Error(format!("{cmd} needs a job id")));
-    let v = match cmd {
-        "status" => http::call(&addr, "GET", "/engine/status", None)?,
-        "jobs" => http::call(&addr, "GET", "/engine/jobs", None)?,
-        "job" => http::call(&addr, "GET", &format!("/engine/jobs/{}", id()?), None)?,
-        "killjob" => http::call(&addr, "POST", &format!("/engine/jobs/{}/cancel", id()?), None)?,
-        "unload" => http::call(&addr, "POST", "/engine/unload", None)?,
-        "shutdown" => http::call(&addr, "POST", "/engine/shutdown", None)?,
-        _ => unreachable!(),
-    };
-    show(&v);
-    Ok(())
-}
-
 fn run() -> Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = raw.first() else {
         return Err(Error(USAGE.into()));
     };
-    let args = if cmd == "runjob" { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
+    // the client commands parse their own arguments (flags like -a, -f, --no-stream)
+    let args = if matches!(cmd.as_str(), "status" | "jobs") { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
     match cmd.as_str() {
         "version" | "--version" | "-V" => {
             println!("h3 {}", version());
@@ -368,8 +303,9 @@ fn run() -> Result<()> {
         "bench-blocks" => cmd_bench_blocks(&args),
         "serve" => cmd_serve(&args),
         "worker" => worker::run(args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),
-        "runjob" => cmd_runjob(&raw[1..]),
-        "status" | "jobs" | "job" | "killjob" | "unload" | "shutdown" => cmd_client(cmd, &args),
+        "status" => client::status(&raw[1..]),
+        "jobs" => client::jobs(&raw[1..]),
+        "unload" | "shutdown" => client::simple(cmd),
         _ => Err(Error(USAGE.into())),
     }
 }

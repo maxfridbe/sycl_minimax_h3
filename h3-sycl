@@ -6,10 +6,12 @@
 #                                 loaded) and the web front end on the same port
 #   h3-sycl serve [--bind ADDR] [--port N]
 #                                 the same in the foreground, its log on the terminal; Ctrl-C stops it gracefully
-#   h3-sycl runjob <kind> [--name value ...] [--no-wait]
-#                                 queue a job and follow its log; kinds: bench-blocks (--tokens N --blocks N),
+#   h3-sycl status [--no-stream]  the engine, live (like docker stats)
+#   h3-sycl jobs ps [-a]          queued and running jobs (-a: all)
+#   h3-sycl jobs add <kind> [--name value ...] [-f]
+#                                 queue a job (-f: follow its log); kinds: bench-blocks (--tokens N --blocks N),
 #                                 check-block (--dump /out/<file>)
-#   h3-sycl status | jobs | job <id> | killjob <id>
+#   h3-sycl jobs stop <id>... | rem <id>... | details <id>
 #   h3-sycl unload                give the GPU back now (the daemon keeps running; the next job loads again)
 #   h3-sycl stop                  stop: the running job stops at its next block boundary, the engine unloads
 #   h3-sycl logs                  the daemon's log, followed
@@ -40,7 +42,10 @@ MODEL=${H3_MODEL:-/models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetenso
 
 running() { [ "$($CE container inspect -f '{{.State.Running}}' $NAME 2>/dev/null)" = true ]; }
 # the container carries H3_DAEMON (set at start), so the client finds the daemon on whatever address it was given
-client() { $CE exec $NAME /app/h3 "$@"; }
+client() {
+  local t=(); [ -t 0 ] && [ -t 1 ] && t=(-it)        # a terminal for the live status
+  $CE exec "${t[@]}" $NAME /app/h3 "$@"
+}
 
 # start / serve: the container that runs `h3 serve`; $1 = -d for the background, -i for the foreground
 launch() {
@@ -102,7 +107,7 @@ case $cmd in
     $CE rm $NAME >/dev/null 2>&1 || true
     echo "stopped"
     ;;
-  status|jobs|job|killjob|unload|runjob)
+  status|jobs|unload)
     running || { echo "not running: h3-sycl start" >&2; exit 1; }
     client "$cmd" "$@"
     ;;
@@ -110,7 +115,7 @@ case $cmd in
     exec $CE logs -f $NAME
     ;;
   *)
-    sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

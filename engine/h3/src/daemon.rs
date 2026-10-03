@@ -82,12 +82,15 @@ struct JobRec {
     created: f64,
     started: Option<f64>,
     finished: Option<f64>,
+    /// (done, total) as the job last reported it
+    progress: Option<(u64, u64)>,
 }
 
 impl JobRec {
     fn summary(&self) -> Value {
         json!({"id": self.id, "kind": self.spec.get("kind"), "state": self.state, "created": self.created,
                "started": self.started, "finished": self.finished, "error": self.error,
+               "progress": self.progress.map(|(d, t)| json!({"done": d, "total": t})),
                "last": self.log.last()})
     }
     fn full(&self) -> Value {
@@ -109,6 +112,12 @@ struct Shared {
     unload_requested: bool,
     shutdown: bool,
     info: Value,
+    /// the engine process, when there is one
+    worker_pid: Option<u32>,
+    /// the engine's last report: its GPU memory, the card's free memory
+    stats: Value,
+    /// the card's idle counter at the last status request: (when, idle ms)
+    busy_sample: Option<(Instant, u64)>,
 }
 
 struct Daemon {
@@ -231,6 +240,7 @@ impl Daemon {
         });
         let stdin = child.stdin.take().unwrap();
         self.set_engine("starting the engine process");
+        self.s.lock().unwrap().worker_pid = Some(child.id());
         Ok(Proc { child, stdin, events, saved_mode })
     }
 
@@ -246,8 +256,23 @@ impl Daemon {
                 self.s.lock().unwrap().info = ev["info"].clone();
                 self.set_engine("loaded");
             }
+            Some("stats") => self.s.lock().unwrap().stats = ev.clone(),
+            Some("progress") => {
+                if let (Some(id), Some(d), Some(t)) = (ev["job"].as_u64(), ev["done"].as_u64(), ev["total"].as_u64()) {
+                    if let Some(j) = self.s.lock().unwrap().jobs.get_mut(&id) {
+                        j.progress = Some((d, t));
+                    }
+                }
+            }
             _ => {}
         }
+    }
+
+    fn forget_worker(&self) {
+        let mut s = self.s.lock().unwrap();
+        s.info = Value::Null;
+        s.stats = Value::Null;
+        s.worker_pid = None;
     }
 
     /// Ends the worker: asks it to exit (it finishes the kernel it is in, unloads, ends), waits for it, and gives back
@@ -265,7 +290,7 @@ impl Daemon {
         eprintln!("[engine] the engine process ended ({})", status.map_or("unknown".into(), |s| s.to_string()));
         self.restore_llm(&p.saved_mode);
         self.release_lock();
-        self.s.lock().unwrap().info = Value::Null;
+        self.forget_worker();
         self.set_engine("unloaded");
     }
 
@@ -277,7 +302,7 @@ impl Daemon {
                 let p = proc.take().unwrap();
                 self.restore_llm(&p.saved_mode);
                 self.release_lock();
-                self.s.lock().unwrap().info = Value::Null;
+                self.forget_worker();
                 self.set_engine("unloaded");
                 Some(format!("the engine process ended unexpectedly ({status})"))
             }
@@ -460,9 +485,24 @@ impl Daemon {
         match (method, parts.as_slice()) {
             ("GET", ["status"]) => {
                 let idle = s.last_active.elapsed().as_secs();
-                (200, json!({"version": crate::version(), "engine": s.engine, "info": s.info, "running": s.running,
-                             "queued": s.queue.iter().collect::<Vec<_>>(), "idle_seconds": idle,
-                             "unload_after_idle_seconds": self.opts.idle.map(|d| d.as_secs()), "model": self.opts.model}))
+                let busy = gpu_busy(&mut s.busy_sample);
+                let worker = s.worker_pid.map(|pid| json!({"pid": pid, "rss_gib": rss_gib(pid)}));
+                let running = s.running.and_then(|r| s.jobs.get(&r)).map(|j| {
+                    let mut v = j.summary();
+                    v["elapsed_seconds"] = json!(j.started.map(|t| now() - t));
+                    v
+                });
+                let unload_in = match (self.opts.idle, s.worker_pid, s.running) {
+                    (Some(limit), Some(_), None) => Some(limit.as_secs().saturating_sub(idle)),
+                    _ => None,
+                };
+                (200, json!({"version": crate::version(), "engine": s.engine, "info": s.info, "model": self.opts.model,
+                             "worker": worker, "gpu": {"busy_pct": busy, "engine_gib": s.stats["gib_in_use"],
+                                                       "cap_gib": s.stats["gib_cap"], "card_free_gib": s.stats["gib_free_card"]},
+                             "running": running, "queued": s.queue.iter().collect::<Vec<_>>(),
+                             "idle_seconds": if s.running.is_some() { 0 } else { idle },
+                             "unload_in_seconds": unload_in,
+                             "unload_after_idle_seconds": self.opts.idle.map(|d| d.as_secs())}))
             }
             ("GET", ["jobs"]) => (200, json!(s.jobs.values().rev().map(JobRec::summary).collect::<Vec<_>>())),
             ("GET", ["jobs", id]) => match id.parse::<u64>().ok().and_then(|i| s.jobs.get(&i)) {
@@ -479,7 +519,8 @@ impl Daemon {
                 let id = s.next;
                 s.next += 1;
                 s.jobs.insert(id, JobRec { id, spec: body, state: "queued", log: Vec::new(), result: None, error: None,
-                                           cancel: Arc::new(AtomicBool::new(false)), created: now(), started: None, finished: None });
+                                           cancel: Arc::new(AtomicBool::new(false)), created: now(), started: None, finished: None,
+                                           progress: None });
                 s.queue.push_back(id);
                 self.cv.notify_all();
                 (200, json!({"id": id}))
@@ -499,6 +540,18 @@ impl Daemon {
                     }
                     Some(j) => (200, json!({"id": i, "state": j.state})),
                     None => (404, json!({"error": format!("no job {i}")})),
+                }
+            }
+            ("POST", ["jobs", id, "remove"]) => {
+                let Some(i) = id.parse::<u64>().ok() else { return (404, json!({"error": format!("no job {id}")})) };
+                match s.jobs.get(&i).map(|j| j.state) {
+                    None => (404, json!({"error": format!("no job {i}")})),
+                    Some("running") => (409, json!({"error": format!("job {i} is running: stop it first")})),
+                    Some(_) => {
+                        s.queue.retain(|q| *q != i);
+                        s.jobs.remove(&i);
+                        (200, json!({"id": i, "removed": true}))
+                    }
                 }
             }
             ("POST", ["unload"]) => {
@@ -540,6 +593,7 @@ pub fn serve(opts: Options) -> Result<()> {
     let d = Arc::new(Daemon {
         opts,
         s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, engine: "unloaded".into(), running: None,
+                               worker_pid: None, stats: Value::Null, busy_sample: None,
                                last_active: Instant::now(), unload_requested: false, shutdown: false, info: Value::Null }),
         cv: Condvar::new(),
     });
@@ -589,4 +643,37 @@ pub fn serve(opts: Options) -> Result<()> {
     let _ = worker.join();
     eprintln!("[daemon] stopped");
     Ok(())
+}
+
+/// The card's compute-engine busy share since the last call, from the xe driver's idle counter (the whole card, every
+/// process): 100 - (idle ms gained) / (wall ms passed). The driver names that counter "gt<N>-rc" (render/compute; the
+/// media engine's "-mc" is left out). None when the counter is not there, and on the first call.
+fn gpu_busy(last: &mut Option<(Instant, u64)>) -> Option<f64> {
+    let idle: u64 = std::fs::read_dir("/sys/class/drm")
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("card") && !n.contains('-')
+        })
+        .flat_map(|card| std::fs::read_dir(card.path().join("device/tile0")).into_iter().flatten().flatten())
+        .map(|gt| gt.path().join("gtidle"))
+        .filter(|g| std::fs::read_to_string(g.join("name")).is_ok_and(|n| n.trim().ends_with("-rc")))
+        .filter_map(|g| std::fs::read_to_string(g.join("idle_residency_ms")).ok())
+        .filter_map(|v| v.trim().parse::<u64>().ok())
+        .next()?;
+    let now = Instant::now();
+    let out = last.map(|(t, i)| {
+        let wall = now.duration_since(t).as_secs_f64() * 1e3;
+        (100.0 - idle.saturating_sub(i) as f64 / wall.max(1.0) * 100.0).clamp(0.0, 100.0)
+    });
+    *last = Some((now, idle));
+    out
+}
+
+/// A process's resident memory, from /proc.
+fn rss_gib(pid: u32) -> Option<f64> {
+    let st = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let kb: f64 = st.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / (1024.0 * 1024.0))
 }

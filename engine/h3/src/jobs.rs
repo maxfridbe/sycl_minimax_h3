@@ -51,9 +51,17 @@ impl Engine {
 pub struct Ctl<'a> {
     pub log: &'a mut dyn FnMut(String),
     pub cancel: &'a AtomicBool,
+    /// how far it is: (done, total), e.g. blocks
+    pub progress: Option<&'a mut dyn FnMut(usize, usize)>,
 }
 
 impl Ctl<'_> {
+    fn step(&mut self, done: usize, total: usize) {
+        if let Some(p) = self.progress.as_mut() {
+            p(done, total)
+        }
+    }
+
     fn say(&mut self, s: String) {
         (self.log)(s)
     }
@@ -161,6 +169,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     let mut after = Vec::new();
     for i in 1..=last {
         ctl.check_at(dev)?;
+        ctl.step(i, 2 * (last + 1));
         e.model.block(i, &x, &step, &scratch, None)?;
         let key = if dump.metadata.get("last_block").is_some_and(|l| *l == i.to_string()) { "out.last".to_string() } else { format!("out.{i}") };
         if dump.entries.contains_key(&key) {
@@ -176,6 +185,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     let t0 = Instant::now();
     for i in 0..=last {
         ctl.check_at(dev)?;
+        ctl.step(last + 1 + i, 2 * (last + 1));
         e.model.block(i, &x, &step, &scratch, None)?;
     }
     dev.wait()?;
@@ -214,6 +224,7 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
     let t0 = Instant::now();
     for i in 0..n {
         ctl.check_at(dev)?;
+        ctl.step(i, 2 * n);
         e.model.block(i, &x, &step, &scratch, None)?;
     }
     dev.wait()?;
@@ -242,6 +253,9 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
         };
         for i in 0..n {
             ctl.check_at(dev)?;
+            if let Some(p) = ctl.progress.as_mut() {
+                p(n + i, 2 * n);
+            }
             e.model.block(i, &x, &step, &scratch, Some(&mut tap))?;
         }
     }

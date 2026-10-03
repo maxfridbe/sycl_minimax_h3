@@ -13,6 +13,8 @@
 //!         {"event": "log", "job": 3, "line": "..."}
 //!         {"event": "result", "job": 3, "ok": true, "value": {...}}
 //!         {"event": "result", "job": 3, "ok": false, "error": "...", "cancelled": false}
+//!         {"event": "progress", "job": 3, "done": 12, "total": 100}
+//!         {"event": "stats", "gib_in_use": 21.3, "gib_cap": 30.0, "gib_free_card": 8.1}   once a second
 //! ```
 
 use std::io::{BufRead, Write};
@@ -85,6 +87,18 @@ pub fn run(model: PathBuf, threads: usize) -> Result<()> {
     let e = Engine::load_on(dev, &model, None, threads, &mut log)?;
     emit(json!({"event": "ready", "info": {"device": e.dev.name(), "model": model, "blocks": e.model.blocks.len(),
                                            "gib_in_use": gib(e.dev.mem_used()), "gib_cap": gib(e.dev.mem_cap())}}));
+    // once a second: what the engine holds on the card and what the card has free (for `h3 status`)
+    let stats_stop = Arc::new(AtomicBool::new(false));
+    let stats = {
+        let (dev, stop) = (e.dev.clone(), stats_stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                emit(json!({"event": "stats", "gib_in_use": gib(dev.mem_used()), "gib_cap": gib(dev.mem_cap()),
+                            "gib_free_card": dev.mem_free().map(gib)}));
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        })
+    };
 
     loop {
         let (id, spec) = match rx.recv_timeout(Duration::from_millis(200)) {
@@ -98,7 +112,8 @@ pub fn run(model: PathBuf, threads: usize) -> Result<()> {
             eprintln!("[job {id}] {l}");
             emit(json!({"event": "log", "job": id, "line": l}));
         };
-        let out = jobs::run(&e, &spec, &mut Ctl { log: &mut log, cancel: &cancel });
+        let mut progress = |done: usize, total: usize| emit(json!({"event": "progress", "job": id, "done": done, "total": total}));
+        let out = jobs::run(&e, &spec, &mut Ctl { log: &mut log, cancel: &cancel, progress: Some(&mut progress) });
         current.store(0, Ordering::SeqCst);
         match out {
             Ok(v) => emit(json!({"event": "result", "job": id, "ok": true, "value": v})),
@@ -109,6 +124,8 @@ pub fn run(model: PathBuf, threads: usize) -> Result<()> {
             break;
         }
     }
+    stats_stop.store(true, Ordering::SeqCst);
+    let _ = stats.join(); // it holds the device: it must be gone before the context can go
     drop(e); // every GPU buffer, then the context; the process ends right after
     emit(json!({"event": "engine", "state": "unloaded"}));
     Ok(())
