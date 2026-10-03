@@ -82,6 +82,35 @@ impl Int8Linear {
     }
 }
 
+/// A low-rank addition to a layer (a LoRA): `out += B (A x)`, A [r, K], B [N, r] in the activations' type, the
+/// strength folded into B.
+pub struct Lora {
+    pub a: Tensor,
+    pub b: Tensor,
+}
+
+impl Lora {
+    pub fn rank(&self) -> usize {
+        self.a.shape[0]
+    }
+
+    /// `out += B (A x)`; `tmp` holds at least [M, rank] values of x's type.
+    pub fn apply(&self, x: &Tensor, tmp: &Tensor, out: &Tensor) -> Result<()> {
+        let (r, k, n) = (self.rank(), self.a.shape[1], self.b.shape[0]);
+        let m = x.elements() / k;
+        if x.dtype != self.a.dtype || out.dtype != x.dtype || tmp.dtype != x.dtype || tmp.elements() < m * r || out.elements() != m * n {
+            return Err(Error(format!("lora: x {:?} {:?}, out {:?} {:?}, A {:?}, B {:?}", x.dtype, x.shape, out.dtype, out.shape, self.a.shape, self.b.shape)));
+        }
+        let dev = x.buf.device();
+        let code = x.dtype.kernel_code()?;
+        // SAFETY: device buffers of this device, sizes checked above.
+        let rc = unsafe { (dev.api.linear)(dev.ctx, x.buf.ptr(), code, m as i64, k as i64, self.a.buf.ptr(), r as i64, std::ptr::null(), tmp.buf.ptr(), code) };
+        dev.check(rc)?;
+        let rc = unsafe { (dev.api.linear_acc)(dev.ctx, tmp.buf.ptr(), code, m as i64, r as i64, self.b.buf.ptr(), n as i64, out.buf.ptr()) };
+        dev.check(rc)
+    }
+}
+
 /// A plain linear layer with float weights, on the device.
 pub struct Linear {
     /// [N, K], float32, half or bfloat16

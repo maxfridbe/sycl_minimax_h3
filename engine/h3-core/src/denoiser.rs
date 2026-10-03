@@ -164,8 +164,9 @@ impl TextRefiner {
         Ok(TextRefiner { proj, blocks, final_norm: small(dev, ck, "token_refiner.final_norm.weight")? })
     }
 
-    /// The text encoder's states [L, text_dim] (in the weights' type) -> the text tokens [L, hidden].
-    pub fn run(&self, cfg: &Config, context: &Tensor) -> Result<Tensor> {
+    /// The text encoder's states [L, text_dim] (in the weights' type) -> the text tokens [L, hidden]. `lora`: LoRAs on
+    /// the refiner's blocks, if any.
+    pub fn run(&self, cfg: &Config, context: &Tensor, lora: Option<&[crate::lora::BlockLora]>) -> Result<Tensor> {
         let dev = context.buf.device();
         let l = context.shape[0];
         let dt = self.proj.weight.dtype;
@@ -174,19 +175,24 @@ impl TextRefiner {
         let w = cfg.heads * cfg.head_dim;
         let s = Scratch::new(dev, cfg, l, dt)?;
         let no_rotation = Tensor::new(dev, DType::F32, &[1])?;
-        for b in &self.blocks {
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let lo = lora.and_then(|l| l.get(bi));
             ops::rms_norm_mod(&x, &b.norm1, cfg.norm_eps, None, &s.h)?;
             b.qkv.forward(&s.h, &s.qkv)?;
+            crate::dit::side(lo, 0, &s.h, &s.qkv, &s.lora)?;
             let part = |i: usize| Rows { t: &s.qkv, offset: i * w, stride: 3 * w, tokens: l, heads: cfg.heads, dim: cfg.head_dim };
             ops::rms_rope(part(0), &b.q_norm, cfg.qk_eps, &no_rotation, 0)?;
             ops::rms_rope(part(1), &b.k_norm, cfg.qk_eps, &no_rotation, 0)?;
             ops::attention(part(0), part(1), part(2), &s.att)?;
             b.out_proj.forward(&s.att, &s.proj)?;
+            crate::dit::side(lo, 1, &s.att, &s.proj, &s.lora)?;
             ops::add(&x, &s.proj)?;
             ops::rms_norm_mod(&x, &b.norm2, cfg.norm_eps, None, &s.h)?;
             b.fc1.forward(&s.h, &s.fc1)?;
+            crate::dit::side(lo, 2, &s.h, &s.fc1, &s.lora)?;
             ops::swiglu(&s.fc1, &s.act)?;
             b.fc2.forward(&s.act, &s.proj)?;
+            crate::dit::side(lo, 3, &s.act, &s.proj, &s.lora)?;
             ops::add(&x, &s.proj)?;
         }
         ops::rms_norm_mod(&x, &self.final_norm, cfg.norm_eps, None, &x)?;
@@ -313,6 +319,8 @@ pub struct Denoiser<'a> {
     text_tags: Option<Vec<i32>>,
     x: Tensor,
     scratch: Scratch,
+    /// LoRAs on the blocks, if any
+    pub lora: Option<&'a crate::lora::LoraSet>,
 }
 
 impl<'a> Denoiser<'a> {
@@ -339,6 +347,7 @@ impl<'a> Denoiser<'a> {
             schedule,
             text,
             text_tags,
+            lora: None,
         })
     }
 
@@ -387,7 +396,8 @@ impl<'a> Denoiser<'a> {
 
         for i in 0..self.blocks.blocks.len() {
             between(i)?;
-            self.blocks.block(i, &self.x, &step, &self.scratch, None)?;
+            let lora = self.lora.and_then(|l| l.blocks.get(i));
+            self.blocks.block(i, &self.x, &step, &self.scratch, lora, None)?;
         }
 
         // final layer, per stream, in chunks of rows

@@ -219,7 +219,12 @@ pub struct Scratch {
     pub(crate) proj: Tensor,
     pub(crate) fc1: Tensor,
     pub(crate) act: Tensor,
+    /// a LoRA's middle product [tokens, rank]
+    pub(crate) lora: Tensor,
 }
+
+/// The widest LoRA the scratch has room for.
+pub const MAX_LORA_RANK: usize = 128;
 
 impl Scratch {
     pub fn new(dev: &Arc<Device>, cfg: &Config, tokens: usize, dtype: DType) -> Result<Scratch> {
@@ -231,7 +236,16 @@ impl Scratch {
             proj: Tensor::new(dev, dtype, &[tokens, cfg.hidden])?,
             fc1: Tensor::new(dev, dtype, &[tokens, 2 * cfg.ffn])?,
             act: Tensor::new(dev, dtype, &[tokens, cfg.ffn])?,
+            lora: Tensor::new(dev, dtype, &[tokens, MAX_LORA_RANK])?,
         })
+    }
+}
+
+/// A LoRA's addition to linear `j`'s output, when the block has one there.
+pub(crate) fn side(lora: Option<&crate::lora::BlockLora>, j: usize, x: &Tensor, out: &Tensor, tmp: &Tensor) -> Result<()> {
+    match lora.and_then(|l| l[j].as_ref()) {
+        Some(l) => l.apply(x, tmp, out),
+        None => Ok(()),
     }
 }
 
@@ -266,7 +280,8 @@ impl Blocks {
     }
 
     /// Runs block `index` on the stream `x` [S, hidden], in place.
-    pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, mut tap: Option<Tap>) -> Result<()> {
+    /// `lora`: this block's LoRAs, if any.
+    pub fn block(&self, index: usize, x: &Tensor, step: &Step, s: &Scratch, lora: Option<&crate::lora::BlockLora>, mut tap: Option<Tap>) -> Result<()> {
         let cfg = &self.cfg;
         let b = &self.blocks[index];
         let [shift_a, scale_a, gate_a, shift_m, scale_m, gate_m] = &step.tables[index];
@@ -280,6 +295,7 @@ impl Blocks {
         ops::rms_norm_mod(x, &b.norm1, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_a, shift: shift_a }), &s.h)?;
         tap("h1", &s.h)?;
         b.qkv.forward(&s.h, &s.qkv)?;
+        side(lora, 0, &s.h, &s.qkv, &s.lora)?;
         tap("qkv", &s.qkv)?;
         let w = cfg.heads * cfg.head_dim;
         let part = |i: usize| Rows { t: &s.qkv, offset: i * w, stride: 3 * w, tokens: step.tokens, heads: cfg.heads, dim: cfg.head_dim };
@@ -289,6 +305,7 @@ impl Blocks {
         ops::attention(part(0), part(1), part(2), &s.att)?;
         tap("att", &s.att)?;
         b.out_proj.forward(&s.att, &s.proj)?;
+        side(lora, 1, &s.att, &s.proj, &s.lora)?;
         tap("attn_out", &s.proj)?;
         ops::gate_add(x, &s.proj, &step.rows, gate_a)?;
         tap("x1", x)?;
@@ -296,9 +313,11 @@ impl Blocks {
         ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_m, shift: shift_m }), &s.h)?;
         tap("h2", &s.h)?;
         b.fc1.forward(&s.h, &s.fc1)?;
+        side(lora, 2, &s.h, &s.fc1, &s.lora)?;
         tap("fc1", &s.fc1)?;
         ops::swiglu(&s.fc1, &s.act)?;
         b.fc2.forward(&s.act, &s.proj)?;
+        side(lora, 3, &s.act, &s.proj, &s.lora)?;
         tap("mlp", &s.proj)?;
         ops::gate_add(x, &s.proj, &step.rows, gate_m)?;
         tap("x2", x)

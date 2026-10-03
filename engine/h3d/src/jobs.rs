@@ -167,7 +167,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
             worst_cos = worst_cos.min(c);
             Ok(())
         };
-        e.model.block(0, &x, &step, &scratch, Some(&mut tap))?;
+        e.model.block(0, &x, &step, &scratch, None, Some(&mut tap))?;
     }
 
     ctl.say("the stream after later blocks:".into());
@@ -176,7 +176,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     for i in 1..=last {
         ctl.check_at(dev)?;
         ctl.step(i, 2 * (last + 1));
-        e.model.block(i, &x, &step, &scratch, None)?;
+        e.model.block(i, &x, &step, &scratch, None, None)?;
         let key = if dump.metadata.get("last_block").is_some_and(|l| *l == i.to_string()) { "out.last".to_string() } else { format!("out.{i}") };
         if dump.entries.contains_key(&key) {
             let c = report(ctl, &format!("after block {i}"), &x.to_f32()?, &f32s(&key)?).1;
@@ -192,7 +192,7 @@ pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value>
     for i in 0..=last {
         ctl.check_at(dev)?;
         ctl.step(last + 1 + i, 2 * (last + 1));
-        e.model.block(i, &x, &step, &scratch, None)?;
+        e.model.block(i, &x, &step, &scratch, None, None)?;
     }
     dev.wait()?;
     let s = t0.elapsed().as_secs_f64();
@@ -224,14 +224,14 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
     let n = blocks.unwrap_or(e.model.blocks.len()).min(e.model.blocks.len());
 
     // warm-up: the first call of each kernel shape compiles it
-    e.model.block(0, &x, &step, &scratch, None)?;
+    e.model.block(0, &x, &step, &scratch, None, None)?;
     dev.wait()?;
     x.buf.write(0, &xb)?;
     let t0 = Instant::now();
     for i in 0..n {
         ctl.check_at(dev)?;
         ctl.step(i, 2 * n);
-        e.model.block(i, &x, &step, &scratch, None)?;
+        e.model.block(i, &x, &step, &scratch, None, None)?;
     }
     dev.wait()?;
     let total = t0.elapsed().as_secs_f64();
@@ -262,7 +262,7 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
             if let Some(p) = ctl.progress.as_mut() {
                 p(n + i, 2 * n);
             }
-            e.model.block(i, &x, &step, &scratch, Some(&mut tap))?;
+            e.model.block(i, &x, &step, &scratch, None, Some(&mut tap))?;
         }
     }
     let sum: f64 = stages.iter().map(|s| s.1).sum();
@@ -327,7 +327,7 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     let text = {
         let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
         let ctx = Tensor::from_bytes(&e.dev, DType::BF16, &[l, text_dim], &denoiser::bf16_bytes(&f32s("context")?))?;
-        let t = refiner.run(&e.model.cfg, &ctx)?;
+        let t = refiner.run(&e.model.cfg, &ctx, None)?;
         e.dev.wait()?;
         t
     };
@@ -634,6 +634,8 @@ pub struct ClipSpec<'a> {
     pub steps: usize,
     pub te: TeFiles<'a>,
     pub vaes: Vaes<'a>,
+    /// a LoRA and its strength
+    pub lora: Option<(&'a Path, f32)>,
 }
 
 /// The model's frame grid: frames at 24 fps snapped up to 17k + 5; (frames, video latent frames, audio latent frames).
@@ -658,17 +660,29 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
     let (ctx, ids, hidden, te_secs) = encode_prompt(&e.dev, e.threads, &c.prompt, &c.te, ctl)?;
     ctl.check()?;
+    let lora = match c.lora {
+        Some((p, strength)) => {
+            let l = h3_core::lora::LoraSet::load(&e.dev, &Checkpoint::open(p)?, strength, e.model.blocks.len(), 2)?;
+            if l.max_rank > h3_core::dit::MAX_LORA_RANK {
+                return Err(Error(format!("LoRA rank {} is over {}", l.max_rank, h3_core::dit::MAX_LORA_RANK)));
+            }
+            ctl.say(format!("lora   : {} @ {strength} ({} layers, rank {})", p.display(), l.layers, l.max_rank));
+            Some(l)
+        }
+        None => None,
+    };
     let t0 = Instant::now();
     let text = {
         let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
         let t = Tensor::from_bytes(&e.dev, DType::BF16, &[ids.len(), hidden], &denoiser::bf16_bytes(&ctx))?;
-        let r = refiner.run(&e.model.cfg, &t)?;
+        let r = refiner.run(&e.model.cfg, &t, lora.as_ref().map(|l| l.refiner.as_slice()))?;
         e.dev.wait()?;
         r
     };
     ctl.say(format!("text   : refined in {:.1} s", t0.elapsed().as_secs_f64()));
     let schedule = Schedule::default();
     let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule)?;
+    d.lora = lora.as_ref();
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = h3_core::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
     let sigmas = denoiser::sigmas(c.steps, schedule.shift_video);
@@ -762,7 +776,16 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     audio: Some(Path::new(s("audio_vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors"))),
                     upscale: upscale.map(|u| (Path::new(s("upscaler").unwrap_or("/models/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")), u as f32)),
                 },
+                lora: None,
             };
+            let lora = match s("lora") {
+                Some(l) => {
+                    let (p, st) = l.rsplit_once(':').filter(|(_, st)| st.parse::<f32>().is_ok()).unwrap_or((l, "1"));
+                    Some((Path::new(p), st.parse::<f32>().unwrap_or(1.0)))
+                }
+                None => None,
+            };
+            let c = ClipSpec { lora, ..c };
             generate(e, &c, Path::new(out), ctl)
         }
         "encode" => {

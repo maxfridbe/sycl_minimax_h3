@@ -14,6 +14,8 @@
 //!     h3d check-block <checkpoint> <dump> [--blocks N]
 //!     h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
 //!     h3d denoise <checkpoint> <run dump> [--out latents.safetensors]
+//!     h3d generate <checkpoint> --prompt-file <file> --out clip.mp4 [--width 384 --height 288 --seconds 2 --steps 8
+//!                  --seed 0 --upscale 1] [--te .. --vae .. --audio-vae .. --upscaler .. --tokenizer ..]
 //!     h3d encode <te.gguf> --prompt-file <file> [--tokenizer dir] [--out cond.safetensors] [--check run dump]
 //!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
 //!                [--out clip.mp4] [--check decode dump]
@@ -53,6 +55,8 @@ const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
   h3d check-block <checkpoint> <dump.safetensors> [--blocks N] [--threads 8]
   h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
   h3d denoise <checkpoint> <rundump.safetensors> [--out latents.safetensors] [--threads 8]
+  h3d generate <checkpoint> --prompt-file <file> --out clip.mp4 [--width 384] [--height 288] [--seconds 2] [--steps 8]
+               [--seed 0] [--upscale 1] [--te <gguf>] [--vae <ckpt>] [--audio-vae <ckpt>] [--upscaler <ckpt>] [--tokenizer <dir>]
   h3d encode <te.gguf> --prompt-file <file> [--tokenizer /app/tokenizer] [--out cond.safetensors] [--check rundump.safetensors]
   h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
              [--out clip.mp4] [--check decodedump.safetensors]";
@@ -253,6 +257,20 @@ fn cmd_denoise(args: &Args) -> Result<()> {
     jobs::denoise(&e, args.path(1)?, out, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
+fn cmd_generate(args: &Args) -> Result<()> {
+    let mut log = println_log();
+    let e = jobs::Engine::load(args.path(0)?, None, args.number("threads", 8)?, &mut log)?;
+    // the same spec the daemon takes: options become fields (numbers as numbers), the prompt file read by the job
+    let mut spec = serde_json::Map::new();
+    spec.insert("kind".into(), serde_json::json!("generate"));
+    for (k, v) in &args.options {
+        let key = k.replace('-', "_");
+        spec.insert(key, v.parse::<f64>().map(serde_json::Value::from).unwrap_or_else(|_| serde_json::json!(v)));
+    }
+    let cancel = AtomicBool::new(false);
+    jobs::run(&e, &serde_json::Value::Object(spec), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
+}
+
 fn cmd_encode(args: &Args) -> Result<()> {
     let mut log = println_log();
     let dev = Device::open()?;
@@ -355,6 +373,7 @@ fn run() -> Result<()> {
         "denoise" => cmd_denoise(&args),
         "decode" => cmd_decode(&args),
         "encode" => cmd_encode(&args),
+        "generate" => cmd_generate(&args),
         "daemon" => cmd_daemon(&raw[1..]),
         "gpus" => cmd_gpus(&Args { positional: raw[1..].to_vec(), options: BTreeMap::new() }),
         "worker" => worker::run(args.number("gpu", 0)?, args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),

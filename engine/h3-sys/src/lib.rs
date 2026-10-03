@@ -56,6 +56,7 @@ pub struct Api {
         c_int,          // group
     ) -> c_int,
     #[allow(clippy::type_complexity)]
+    pub linear_acc: unsafe extern "C" fn(*mut c_void, *const c_void, c_int, i64, i64, *const c_void, i64, *mut c_void) -> c_int,
     pub linear: unsafe extern "C" fn(
         *mut c_void,    // ctx
         *const c_void,  // x
@@ -221,6 +222,7 @@ impl Api {
             copy: sym!("h3s_copy"),
             int8_linear: sym!("h3s_int8_linear"),
             linear: sym!("h3s_linear"),
+            linear_acc: sym!("h3s_linear_acc"),
             dequant: sym!("h3s_dequant"),
             attention_causal: sym!("h3s_attention_causal"),
             conv3d: sym!("h3s_conv3d"),

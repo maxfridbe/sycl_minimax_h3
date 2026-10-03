@@ -11,6 +11,7 @@ pub mod gguf;
 pub mod layout;
 pub mod noise;
 pub mod load;
+pub mod lora;
 pub mod ops;
 pub mod reference;
 pub mod rng;

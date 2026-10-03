@@ -622,6 +622,34 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+// out += x . W^T, in the inputs' type (a LoRA's second factor, its strength folded into W): oneDNN's sum post-op,
+// in row chunks like h3s_linear.
+int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || K <= 0 || N <= 0) return 0;
+    using dnnl::memory;
+    constexpr int64_t kRows = 8192;
+    const size_t xe = dt == F32 ? 4 : 2;
+    memory::desc wmd({K, N}, ddt(dt), memory::format_tag::ba);
+    for (int64_t r0 = 0; r0 < M; r0 += kRows) {
+        const int64_t rows = std::min(kRows, M - r0);
+        memory::desc smd({rows, K}, ddt(dt), memory::format_tag::ab);
+        memory::desc dmd({rows, N}, ddt(dt), memory::format_tag::ab);
+        auto key = std::make_tuple(rows, K, N, dt, 2);
+        auto it = c.lin.find(key);
+        if (it == c.lin.end()) {
+            dnnl::post_ops po;
+            po.append_sum(1.0f);
+            dnnl::primitive_attr attr;
+            attr.set_post_ops(po);
+            it = c.lin.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
+        }
+        it->second.execute(c.strm, {{DNNL_ARG_SRC, usm(smd, c.eng, (const char*) x + (size_t) r0 * K * xe)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
+                                    {DNNL_ARG_DST, usm(dmd, c.eng, (char*) out + (size_t) r0 * N * xe)}});
+    }
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 // 1 / sqrt(mean(x[r]^2) + eps) per row of x [M, C] into c.inv. Summed in float32, in a fixed order per row.
 static float* row_inv_rms(Ctx& c, const void* x, int x_dt, int64_t M, int64_t C, float eps) {
     float* inv = c.grow(c.inv, c.inv_cap, (size_t) M);
