@@ -331,11 +331,19 @@ pub struct Conditions {
     pub audio_aug: f32,
     /// the sampling seed (the augmentation noise is drawn from it, as the reference does)
     pub seed: u64,
+    /// reference audio (a voice): normalized latents [32, 2, rt] and rt, in `<Audio j>` order
+    pub ref_audio: Vec<(Vec<f32>, usize)>,
 }
 
 impl Default for Conditions {
     fn default() -> Self {
-        Conditions { keyframes: Vec::new(), visual_aug: crate::layout::VISUAL_COND_TIMESTEP as f32, audio_aug: crate::layout::AUDIO_COND_TIMESTEP as f32, seed: 0 }
+        Conditions {
+            keyframes: Vec::new(),
+            visual_aug: crate::layout::VISUAL_COND_TIMESTEP as f32,
+            audio_aug: crate::layout::AUDIO_COND_TIMESTEP as f32,
+            seed: 0,
+            ref_audio: Vec::new(),
+        }
     }
 }
 
@@ -356,6 +364,8 @@ pub struct Denoiser<'a> {
     cond_rows: Vec<(usize, Tensor)>,
     /// the timesteps conditioning rows are presented at
     cond_t: (f64, f64),
+    /// a masked run's token masks
+    pub masks: Option<RowMasks>,
 }
 
 impl<'a> Denoiser<'a> {
@@ -369,7 +379,8 @@ impl<'a> Denoiser<'a> {
             .iter()
             .map(|k| crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: k.video.as_ref().map(|v| v.1), audio_latent_t: k.audio.as_ref().map(|a| a.1) })
             .collect();
-        let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &kfs)?;
+        let refs: Vec<crate::layout::RefBlock> = cond.ref_audio.iter().map(|(_, t)| crate::layout::RefBlock::Audio { t: *t }).collect();
+        let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &kfs, &refs)?;
         // the keyframes' rows: patches (or stereo rows) through the projections once, the augmentation noise drawn
         // from the seed afresh for every keyframe (the reference restarts the same stream each time; audio rows
         // from seed + 1)
@@ -389,7 +400,7 @@ impl<'a> Denoiser<'a> {
                 }
                 rows
             };
-            let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio));
+            let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio | Kind::RefAudio));
             for k in &cond.keyframes {
                 if let Some((v, vt)) = &k.video {
                     if v.len() != outer.video_c * vt * shape.h * shape.w {
@@ -407,6 +418,14 @@ impl<'a> Denoiser<'a> {
                     let rows = aug(pack_audio(a, outer.audio_c, *rt), cond.audio_aug, cond.seed + 1);
                     cond_rows.push((s.start, embed(rows, &outer.audio_patch)?));
                 }
+            }
+            for (a, rt) in &cond.ref_audio {
+                if *rt == 0 {
+                    continue;
+                }
+                let s = segs.next().ok_or("reference rows missing from the layout")?;
+                let rows = aug(pack_audio(a, outer.audio_c, *rt), cond.audio_aug, cond.seed + 1);
+                cond_rows.push((s.start, embed(rows, &outer.audio_patch)?));
             }
         }
         if text.dtype != DType::BF16 || text.shape[1] != cfg.hidden {
@@ -429,6 +448,7 @@ impl<'a> Denoiser<'a> {
             lora: None,
             cond_rows,
             cond_t: (cond.visual_aug as f64, cond.audio_aug as f64),
+            masks: None,
         })
     }
 
@@ -436,8 +456,9 @@ impl<'a> Denoiser<'a> {
         self.layout.tokens()
     }
 
-    /// Each token's table row and the distinct timesteps at video noise level `sigma`.
-    fn timesteps(&self, sigma: f32) -> Timesteps {
+    /// Each token's table row and the distinct timesteps at video noise level `sigma`, and per target row (video,
+    /// audio) the timestep index the final layer uses.
+    fn timesteps(&self, sigma: f32) -> (Timesteps, Vec<i32>, Vec<i32>) {
         let mut ts = Timesteps::with_cond(&self.layout, sigma as f64, self.schedule.shift_video as f64, self.schedule.shift_audio as f64, self.cond_t.0, self.cond_t.1);
         if let (Some(tags), Some(seg)) = (&self.text_tags, self.layout.segment(Kind::Text)) {
             let base = ts.rows[seg.start] - Kind::Text.modality();
@@ -445,7 +466,56 @@ impl<'a> Denoiser<'a> {
                 *r = base + tag;
             }
         }
-        ts
+        let (sv, sa) = (self.layout.segment(Kind::Video).expect("video rows"), self.layout.segment(Kind::Audio).expect("audio rows"));
+        let mut fv = vec![ts.video_index as i32; sv.stop - sv.start];
+        let mut fa = vec![ts.audio_index as i32; sa.stop - sa.start];
+        let Some(m) = &self.masks else { return (ts, fv, fa) };
+        // masked rows run at their own timestep: 1 - m * sigma, at most the conditioning timestep (in float32)
+        let sigma_v = sigma.max(1e-6);
+        let (t_v, t_a) = (ts.values[ts.video_index] as f32, ts.values[ts.audio_index] as f32);
+        let pin_v = (t_v as f64).max(self.cond_t.0) as f32;
+        let pin_a = (t_a as f64).max(self.cond_t.1) as f32;
+        let sigma_a = 1.0 - t_a;
+        let rv: Vec<f32> = m.video_rows.iter().map(|m| (1.0 - m * sigma_v).min(pin_v)).collect();
+        let ra: Vec<f32> = m.audio_rows.iter().map(|m| (1.0 - m * sigma_a).min(pin_a)).collect();
+        let video_masked = m.video_rows.iter().any(|v| *v < 1.0 - 1e-3);
+        let audio_masked = m.audio_rows.iter().any(|v| *v < 1.0 - 1e-3);
+        let mut values = ts.values.clone();
+        if video_masked {
+            values.extend(rv.iter().map(|v| *v as f64));
+        }
+        if audio_masked {
+            values.extend(ra.iter().map(|v| *v as f64));
+        }
+        values.sort_by(f64::total_cmp);
+        values.dedup();
+        let index = |t: f64| values.iter().position(|v| *v == t).expect("every timestep is in the list") as i32;
+        for r in ts.rows.iter_mut() {
+            let (old, modality) = (*r / 3, *r % 3);
+            *r = index(ts.values[old as usize]) * 3 + modality;
+        }
+        if video_masked {
+            for (i, t) in rv.iter().enumerate() {
+                let k = index(*t as f64);
+                ts.rows[sv.start + i] = k * 3 + Kind::Video.modality();
+                fv[i] = k;
+            }
+        } else {
+            fv.iter_mut().for_each(|f| *f = index(ts.values[ts.video_index]));
+        }
+        if audio_masked {
+            for (i, t) in ra.iter().enumerate() {
+                let k = index(*t as f64);
+                ts.rows[sa.start + i] = k * 3 + Kind::Audio.modality();
+                fa[i] = k;
+            }
+        } else {
+            fa.iter_mut().for_each(|f| *f = index(ts.values[ts.audio_index]));
+        }
+        ts.video_index = index(ts.values[ts.video_index]) as usize;
+        ts.audio_index = index(ts.values[ts.audio_index]) as usize;
+        ts.values = values;
+        (ts, fv, fa)
     }
 
     /// The network at video noise level `sigma`: latents in, velocities out (video [C, T, H, W], audio [C, 2, T]),
@@ -454,7 +524,7 @@ impl<'a> Denoiser<'a> {
         let cfg = self.blocks.cfg;
         let (o, sh) = (self.outer, self.shape);
         let dev = self.x.buf.device().clone();
-        let ts = self.timesteps(sigma);
+        let (ts, final_v, final_a) = self.timesteps(sigma);
         let t_emb = ts.embeddings(&o.t_table, cfg.t_dim);
         let step = Step::new(&dev, self.blocks, &ts.rows, &self.layout.positions, &o.inv_freq, &t_emb)?;
 
@@ -489,14 +559,14 @@ impl<'a> Denoiser<'a> {
         let r = ts.values.len();
         let shift = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&shift))?;
         let scale = Tensor::from_bytes(&dev, DType::F32, &[r, cfg.hidden], &f32_bytes(&scale))?;
-        let head = |start: usize, n: usize, t_index: usize, lin: &Linear| -> Result<Vec<f32>> {
+        let head = |start: usize, n: usize, t_rows: &[i32], lin: &Linear| -> Result<Vec<f32>> {
             let mut out = Vec::with_capacity(n * lin.outputs());
             let mut done = 0;
             while done < n {
                 let m = FINAL_CHUNK.min(n - done);
                 let rows = Tensor::new(&dev, DType::BF16, &[m, cfg.hidden])?;
                 rows.copy_rows(0, &self.x, start + done, m)?;
-                let table = Tensor::from_bytes(&dev, DType::I32, &[m], &vec![t_index as i32; m].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                let table = Tensor::from_bytes(&dev, DType::I32, &[m], &t_rows[done..done + m].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
                 let h = Tensor::new(&dev, DType::F32, &[m, cfg.hidden])?;
                 ops::rms_norm_mod(&rows, &o.final_norm, o.final_eps, Some(&Mod { rows: &table, scale: &scale, shift: &shift }), &h)?;
                 let y = Tensor::new(&dev, DType::F32, &[m, lin.outputs()])?;
@@ -506,8 +576,8 @@ impl<'a> Denoiser<'a> {
             }
             Ok(out)
         };
-        let v = head(ts_video.start, nv, ts.video_index, &o.video_out)?;
-        let a = head(ts_audio.start, na, ts.audio_index, &o.audio_out)?;
+        let v = head(ts_video.start, nv, &final_v, &o.video_out)?;
+        let a = head(ts_audio.start, na, &final_a, &o.audio_out)?;
         let mut v = unpatchify(&v, o.video_c, sh.t, sh.h, sh.w);
         let mut a = unpack_audio(&a, o.audio_c, sh.audio_t);
         v.iter_mut().chain(a.iter_mut()).for_each(|x| *x = -*x);
@@ -523,11 +593,72 @@ impl<'a> Denoiser<'a> {
         let sigma_a = time_shift_sigma(sigma_v as f64, sc.shift_video as f64, sc.shift_audio as f64) as f32;
         let carry = sigma_a / sigma_v;
         let audio_in: Vec<f32> = xa.iter().map(|x| x * carry).collect();
-        let (out_v, out_a) = self.net(xv, &audio_in, sigma, between)?;
+        let (mut out_v, mut out_a) = self.net(xv, &audio_in, sigma, between)?;
+        if let Some(m) = &self.masks {
+            // masked rows predict at mask * sigma: their velocity scaled to match the outer conversion
+            let n = m.video_px.len();
+            out_v.iter_mut().enumerate().for_each(|(i, v)| *v *= m.video_px[i % n]);
+            let at = m.audio_px.len();
+            out_a.iter_mut().enumerate().for_each(|(i, v)| *v *= m.audio_px[i % at]);
+        }
         let k = 1.0 + (sc.audio_scale - 1.0) * sigma_a;
         let dv = xv.iter().zip(&out_v).map(|(x, o)| x - o * sigma).collect();
         let da = xa.iter().zip(audio_in.iter().zip(&out_a)).map(|(x, (ai, o))| x - ((1.0 - sc.audio_scale) * ai + k * o) * sigma).collect();
         Ok((dv, da))
+    }
+}
+
+/// A masked run (regenerate part of a clip, or extend one): the source latents, and per latent pixel / audio frame
+/// whether to generate it (1) or keep the source (0). As the reference does it (ComfyUI's inpainting sampler with
+/// H3's `scale_latent_inpaint` and per-token timesteps): the kept parts are put back, almost clean, before every
+/// step and in every estimate; the model sees them at the conditioning timestep and its velocity there is zeroed.
+pub struct Inpaint {
+    /// normalized video latents [24, T, H, W] and audio latents [32, 2, At] (the model's own scale)
+    pub source_v: Vec<f32>,
+    pub source_a: Vec<f32>,
+    /// [T, H, W] and [At], 1 = generate
+    pub mask_v: Vec<f32>,
+    pub mask_a: Vec<f32>,
+}
+
+/// The masks pooled to the tokens: a video token (2x2 latent pixels) generates if any of its pixels does.
+pub struct RowMasks {
+    /// per video token row, per audio row (channel-major, both channels alike)
+    pub video_rows: Vec<f32>,
+    pub audio_rows: Vec<f32>,
+    /// the token mask back on the latent pixels [T, H, W]; per audio frame [At]
+    pub video_px: Vec<f32>,
+    pub audio_px: Vec<f32>,
+}
+
+impl RowMasks {
+    pub fn new(inp: &Inpaint, sh: Shape) -> RowMasks {
+        let (t, h, w) = (sh.t, sh.h, sh.w);
+        let (hp, wp) = (h / PATCH, w / PATCH);
+        let mut video_rows = vec![0f32; t * hp * wp];
+        let mut video_px = vec![0f32; t * h * w];
+        for ti in 0..t {
+            for y in 0..hp {
+                for x in 0..wp {
+                    let mut m = 0f32;
+                    for dy in 0..PATCH {
+                        for dx in 0..PATCH {
+                            m = m.max(inp.mask_v[(ti * h + y * 2 + dy) * w + x * 2 + dx]);
+                        }
+                    }
+                    let m = (m * 256.0).ceil() / 256.0;
+                    video_rows[(ti * hp + y) * wp + x] = m;
+                    for dy in 0..PATCH {
+                        for dx in 0..PATCH {
+                            video_px[(ti * h + y * 2 + dy) * w + x * 2 + dx] = m;
+                        }
+                    }
+                }
+            }
+        }
+        let audio_px: Vec<f32> = inp.mask_a.iter().map(|m| (m * 256.0).ceil() / 256.0).collect();
+        let audio_rows = (0..2).flat_map(|_| audio_px.iter().copied()).collect();
+        RowMasks { video_rows, audio_rows, video_px, audio_px }
     }
 }
 
@@ -545,19 +676,64 @@ pub fn sample(
     on_step: OnStep,
     between: &mut dyn FnMut(usize, usize) -> Result<()>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    sample_masked(d, noise_v, noise_a, sigmas, None, on_step, between)
+}
+
+/// `sample`, with a masked run when `inpaint` is given (the denoiser's `masks` must be set from it).
+pub fn sample_masked(
+    d: &mut Denoiser,
+    noise_v: &[f32],
+    noise_a: &[f32],
+    sigmas: &[f32],
+    inpaint: Option<&Inpaint>,
+    on_step: OnStep,
+    between: &mut dyn FnMut(usize, usize) -> Result<()>,
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let s0 = sigmas[0];
+    let scale = d.schedule.audio_scale;
     let mut xv: Vec<f32> = noise_v.iter().map(|n| n * s0).collect();
     let mut xa: Vec<f32> = noise_a.iter().map(|n| n * s0).collect();
+    // the source in the sampler's space (the audio carried x audio_scale)
+    let li_a: Vec<f32> = inpaint.map(|p| p.source_a.iter().map(|v| v * scale).collect()).unwrap_or_default();
     for i in 0..sigmas.len() - 1 {
         let (s, next) = (sigmas[i], sigmas[i + 1]);
-        let (dv, da) = d.denoised(&xv, &xa, s, &mut |b| between(i, b))?;
+        let (dv, da) = match (inpaint, &d.masks) {
+            (Some(p), Some(m)) => {
+                // the kept parts put back almost clean: 0.999 source + 0.001 noise (video), the audio rescaled
+                // for the model to see it clean; inside a partly generated token the kept pixels follow x
+                let aug = crate::layout::VISUAL_COND_TIMESTEP as f32;
+                let (n, at) = (m.video_px.len(), p.mask_a.len());
+                let xv2: Vec<f32> = (0..xv.len())
+                    .map(|j| {
+                        let (mk, tok) = (p.mask_v[j % n], m.video_px[j % n]);
+                        let mut inj = aug * p.source_v[j] + (1.0 - aug) * noise_v[j];
+                        if mk < 1.0 {
+                            let wgt = ((tok - mk) / (1.0 - mk).max(1e-6)).clamp(0.0, 1.0);
+                            inj += wgt * (xv[j] - inj);
+                        }
+                        xv[j] * mk + inj * (1.0 - mk)
+                    })
+                    .collect();
+                let sigma_v = s.max(1e-6);
+                let sigma_a = time_shift_sigma(sigma_v as f64, d.schedule.shift_video as f64, d.schedule.shift_audio as f64) as f32;
+                let factor = (sigma_v / sigma_a) / scale;
+                let xa2: Vec<f32> = (0..xa.len()).map(|j| {
+                    let mk = p.mask_a[j % at];
+                    xa[j] * mk + li_a[j] * factor * (1.0 - mk)
+                }).collect();
+                let (dv, da) = d.denoised(&xv2, &xa2, s, &mut |b| between(i, b))?;
+                let dv = (0..dv.len()).map(|j| dv[j] * p.mask_v[j % n] + p.source_v[j] * (1.0 - p.mask_v[j % n])).collect::<Vec<f32>>();
+                let da = (0..da.len()).map(|j| da[j] * p.mask_a[j % at] + li_a[j] * (1.0 - p.mask_a[j % at])).collect::<Vec<f32>>();
+                (dv, da)
+            }
+            _ => d.denoised(&xv, &xa, s, &mut |b| between(i, b))?,
+        };
         on_step(i, &dv, &da)?;
         for (x, dn) in xv.iter_mut().zip(&dv).chain(xa.iter_mut().zip(&da)) {
             let slope = (*x - dn) / s;
             *x += slope * (next - s);
         }
     }
-    let scale = d.schedule.audio_scale;
     xa.iter_mut().for_each(|x| *x /= scale);
     Ok((xv, xa))
 }

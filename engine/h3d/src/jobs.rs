@@ -369,6 +369,20 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
             cond.keyframes.push(KeyframeIn { frame_index: index, video, audio });
         }
     }
+    if let Some(list) = dump.metadata.get("ref_list") {
+        let list: Value = serde_json::from_str(list).map_err(|e| Error(format!("ref_list: {e}")))?;
+        for (i, r) in list.as_array().ok_or("ref_list is not a list")?.iter().enumerate() {
+            match r["kind"].as_str() {
+                Some("audio") => {
+                    let a = f32s(&format!("ref.{i}.audio"))?;
+                    let t = dump.get(&format!("ref.{i}.audio"))?.shape[3];
+                    ctl.say(format!("ref {i}  : audio, {t} latent frames"));
+                    cond.ref_audio.push((a, t));
+                }
+                other => return Err(Error(format!("reference {i}: {other:?} references are not supported (the text encoder in use has no vision tower)"))),
+            }
+        }
+    }
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
     let steps = sigmas.len() - 1;
     let nblocks = e.model.blocks.len();
@@ -691,9 +705,19 @@ pub fn encode(dev: &Arc<Device>, threads: usize, prompt: &str, files: &TeFiles, 
 
 /// The tokenizer and the streamed text encoder: (conditioning [L, hidden], token ids, hidden, seconds).
 pub fn encode_prompt(dev: &Arc<Device>, threads: usize, prompt: &str, files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, Vec<u32>, usize, f64)> {
+    encode_presentation(dev, threads, &[], prompt, files, ctl)
+}
+
+/// The same with labels ahead of the prompt (`<Audio 1>: ` per reference audio): the reference tokenizes every
+/// piece of the presentation on its own and joins the ids.
+pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String], prompt: &str, files: &TeFiles, ctl: &mut Ctl) -> Result<(Vec<f32>, Vec<u32>, usize, f64)> {
     let (te, tokenizer) = (files.te, files.tokenizer);
     let tok = h3_core::tokenizer::Tokenizer::load(tokenizer)?;
-    let mut ids = tok.encode(prompt)?;
+    let mut ids = Vec::new();
+    for l in labels {
+        ids.extend(tok.encode(l)?);
+    }
+    ids.extend(tok.encode(prompt)?);
     if ids.is_empty() {
         ids.push(151643); // the reference encodes an empty prompt as one pad token
     }
@@ -753,6 +777,71 @@ pub struct ClipInputs<'a> {
     pub cond_noise_aug: Option<f32>,
     /// the flow shifts (12 and 3 by default)
     pub shift: Option<(f32, f32)>,
+    /// reference audio, a voice to speak in: `<Audio 1>`, `<Audio 2>` ... in the prompt (up to 3)
+    pub ref_audio: Vec<&'a Path>,
+    /// a masked run: a previous clip's `.latents.safetensors`; the parts not regenerated are kept from it (a source
+    /// shorter than the clip is extended)
+    pub source: Option<&'a Path>,
+    /// the stretch to regenerate, in seconds [from, to)
+    pub regen: Option<(f64, f64)>,
+    /// and only inside this box, in pixels (x0, y0, x1, y1)
+    pub regen_box: Option<(usize, usize, usize, usize)>,
+}
+
+/// The masks of a masked run from the source latents and the stretch / box to regenerate.
+fn clip_inpaint(inp: &ClipInputs, shape: Shape) -> Result<Option<denoiser::Inpaint>> {
+    let Some(src) = inp.source else { return Ok(None) };
+    let ck = Checkpoint::open(src)?;
+    let (ev, ea) = (ck.get("samples.video")?.clone(), ck.get("samples.audio")?.clone());
+    let (st, sh_, sw) = (ev.shape[2], ev.shape[3], ev.shape[4]);
+    let sat = ea.shape[3];
+    if sh_ != shape.h || sw != shape.w {
+        return Err(Error(format!("{}: a {}x{} latent for a {}x{} clip", src.display(), sw, sh_, shape.w, shape.h)));
+    }
+    let v = h3_core::dtype::bytes_to_f32(&ck.read("samples.video")?, ev.dtype)?;
+    let a = h3_core::dtype::bytes_to_f32(&ck.read("samples.audio")?, ea.dtype)?;
+    let (t, n, at) = (shape.t, shape.h * shape.w, shape.audio_t);
+    // the source fitted to the clip (cut, or padded with zeros where the clip extends it)
+    let mut source_v = vec![0f32; 24 * t * n];
+    for c in 0..24 {
+        for ti in 0..t.min(st) {
+            source_v[(c * t + ti) * n..][..n].copy_from_slice(&v[(c * st + ti) * n..][..n]);
+        }
+    }
+    let mut source_a = vec![0f32; 32 * 2 * at];
+    for c in 0..64 {
+        let k = at.min(sat);
+        source_a[c * at..c * at + k].copy_from_slice(&a[c * sat..c * sat + k]);
+    }
+    // 1 = generate: where the source ends, and the stretch / box asked for
+    let mut mask_v: Vec<f32> = (0..t * n).map(|i| if i / n >= st { 1.0 } else { 0.0 }).collect();
+    let mut mask_a: Vec<f32> = (0..at).map(|i| if i >= sat { 1.0 } else { 0.0 }).collect();
+    if let Some((from, to)) = inp.regen {
+        let (f0, f1) = (from * 24.0, to * 24.0);
+        let (bx0, by0, bx1, by1) = inp.regen_box.map(|(x0, y0, x1, y1)| (x0 / 16, y0 / 16, x1.div_ceil(16), y1.div_ceil(16))).unwrap_or((0, 0, shape.w, shape.h));
+        for ti in 0..t {
+            // the pixel frames latent frame ti covers: frame 0 alone, then four each
+            let (p0, p1) = if ti == 0 { (0.0, 1.0) } else { ((1 + 4 * (ti - 1)) as f64, (1 + 4 * ti) as f64) };
+            if p1 <= f0 || p0 >= f1 {
+                continue;
+            }
+            for y in by0..by1.min(shape.h) {
+                for x in bx0..bx1.min(shape.w) {
+                    mask_v[ti * n + y * shape.w + x] = 1.0;
+                }
+            }
+        }
+        for (j, m) in mask_a.iter_mut().enumerate() {
+            let (s0, s1) = (j as f64 / 40.0, (j + 1) as f64 / 40.0);
+            if s1 > from && s0 < to {
+                *m = 1.0;
+            }
+        }
+    }
+    if mask_v.iter().all(|m| *m == 0.0) && mask_a.iter().all(|m| *m == 0.0) {
+        return Err(Error("a source and nothing to regenerate: give regen (seconds) or a longer clip than the source".into()));
+    }
+    Ok(Some(denoiser::Inpaint { source_v, source_a, mask_v, mask_a }))
 }
 
 /// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
@@ -866,7 +955,8 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let (frames, lt, at) = temporal_shape(c.seconds);
     let shape = Shape { t: lt, h: c.height / 16, w: c.width / 16, audio_t: at };
     ctl.say(format!("clip   : {}x{}, {frames} frames ({:.2} s), {} steps, seed {}", c.width, c.height, frames as f64 / 24.0, c.steps, c.seed));
-    let (ctx, ids, hidden, te_secs) = encode_prompt(&e.dev, e.threads, &c.prompt, &c.te, ctl)?;
+    let labels: Vec<String> = (1..=c.inputs.ref_audio.len()).map(|j| format!("<Audio {j}>: ")).collect();
+    let (ctx, ids, hidden, te_secs) = encode_presentation(&e.dev, e.threads, &labels, &c.prompt, &c.te, ctl)?;
     ctl.check()?;
     let lora = match c.lora {
         Some((p, strength)) => {
@@ -898,8 +988,24 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         cond.visual_aug = a;
     }
     cond.keyframes = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
+    if !c.inputs.ref_audio.is_empty() {
+        let aenc = h3_core::audio::AudioEncoder::load(&e.dev, &Checkpoint::open(c.vaes.audio.ok_or("reference audio needs the audio decoder's checkpoint (audio_vae)")?)?)?;
+        for (j, p) in c.inputs.ref_audio.iter().enumerate() {
+            let chans = crate::media::read_audio_tail(p, 0.0, h3_core::audio::SAMPLE_RATE)?;
+            let (z, t) = aenc.encode(&chans)?;
+            ctl.say(format!("ref    : <Audio {}> = {} ({:.1} s, {t} latent frames)", j + 1, p.display(), chans[0].len() as f64 / h3_core::audio::SAMPLE_RATE as f64));
+            cond.ref_audio.push((z, t));
+        }
+    }
+    let inpaint = clip_inpaint(&c.inputs, shape)?;
     let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
+    if let Some(p) = &inpaint {
+        let gen_v = p.mask_v.iter().filter(|m| **m > 0.0).count() as f64 / p.mask_v.len() as f64;
+        let gen_a = p.mask_a.iter().filter(|m| **m > 0.0).count() as f64 / p.mask_a.len() as f64;
+        ctl.say(format!("masked : regenerating {:.0}% of the video, {:.0}% of the sound; the rest kept from the source", gen_v * 100.0, gen_a * 100.0));
+        d.masks = Some(denoiser::RowMasks::new(p, shape));
+    }
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = h3_core::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
     let sigmas = denoiser::sigmas(c.steps, schedule.shift_video);
@@ -913,7 +1019,7 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         let mut progress = ctl.progress.take();
         let mut times = Vec::new();
         let mut t_step = Instant::now();
-        let r = denoiser::sample(&mut d, &noise_v, &noise_a, &sigmas, &mut |_, _, _| {
+        let r = denoiser::sample_masked(&mut d, &noise_v, &noise_a, &sigmas, inpaint.as_ref(), &mut |_, _, _| {
             times.push(t_step.elapsed().as_secs_f64());
             t_step = Instant::now();
             Ok(())
@@ -942,6 +1048,12 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         let last: Vec<f32> = (0..24).flat_map(|ch| v[(ch * shape.t + shape.t - 1) * n..][..n].to_vec()).collect();
         let p = out.with_extension("lastlat.safetensors");
         h3_core::safetensors::write_f32(&p, &BTreeMap::from([("latent".to_string(), (vec![1, 24, 1, shape.h, shape.w], last))]), &BTreeMap::new())?;
+        // and the whole clip's latents: a later masked run regenerates part of it or extends it
+        let p = out.with_extension("latents.safetensors");
+        h3_core::safetensors::write_f32(&p, &BTreeMap::from([
+            ("samples.video".to_string(), (vec![1, 24, shape.t, shape.h, shape.w], v.clone())),
+            ("samples.audio".to_string(), (vec![1, 32, 2, shape.audio_t], a.clone())),
+        ]), &BTreeMap::new())?;
     }
     let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), ctl)?;
     let total = t_all.elapsed().as_secs_f64();
@@ -1022,6 +1134,16 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                         (None, None) => None,
                         (v, a) => Some((v.unwrap_or(12.0) as f32, a.unwrap_or(3.0) as f32)),
                     },
+                    ref_audio: s("ref_audio").map(|r| r.split(',').map(Path::new).take(3).collect()).unwrap_or_default(),
+                    source: s("source").map(Path::new),
+                    regen: s("regen").and_then(|r| {
+                        let (a, b) = r.split_once('-')?;
+                        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                    }),
+                    regen_box: s("regen_box").and_then(|r| {
+                        let v: Vec<usize> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
+                    }),
                 },
             };
             let lora = match s("lora") {

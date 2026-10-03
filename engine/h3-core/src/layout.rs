@@ -25,6 +25,8 @@ pub enum Kind {
     Cond,
     /// Audio rows of a keyframe.
     CondAudio,
+    /// Audio rows of a reference (a voice to speak in: `<Audio j>` in the prompt).
+    RefAudio,
     Audio,
     Video,
 }
@@ -35,7 +37,7 @@ impl Kind {
         match self {
             Kind::Video | Kind::Cond => 0,
             Kind::Text => 1,
-            Kind::Audio | Kind::CondAudio => 2,
+            Kind::Audio | Kind::CondAudio | Kind::RefAudio => 2,
         }
     }
 }
@@ -47,6 +49,24 @@ pub struct Keyframe {
     pub frame_index: f64,
     pub video_latent_t: Option<usize>,
     pub audio_latent_t: Option<usize>,
+}
+
+/// A reference the prompt refers to (ref2va), packed between the text and the targets. Reference pictures and
+/// videos also go through the text encoder's vision tower, which the 32B checkpoint in use cannot run; audio
+/// references never enter the text encoder (the prompt carries only their `<Audio j>` label).
+#[derive(Clone, Copy, Debug)]
+pub enum RefBlock {
+    /// `t` audio latent frames
+    Audio { t: usize },
+}
+
+impl RefBlock {
+    /// The stretch of the time axis it takes ahead of the targets.
+    fn span(&self) -> f64 {
+        match self {
+            RefBlock::Audio { t } => *t as f64,
+        }
+    }
 }
 
 /// `[start, stop)` rows of one kind.
@@ -87,7 +107,7 @@ fn video_times(n: usize, origin: f64) -> Vec<f64> {
 impl Layout {
     /// `latent_h`, `latent_w`: the video latent's size (two latent pixels per token along each); `audio_t`: audio
     /// latent frames (each gives two rows, one per stereo channel).
-    pub fn new(text_len: usize, latent_t: usize, latent_h: usize, latent_w: usize, audio_t: usize, keyframes: &[Keyframe]) -> Result<Layout> {
+    pub fn new(text_len: usize, latent_t: usize, latent_h: usize, latent_w: usize, audio_t: usize, keyframes: &[Keyframe], refs: &[RefBlock]) -> Result<Layout> {
         if !latent_h.is_multiple_of(2) || !latent_w.is_multiple_of(2) || latent_h == 0 || latent_w == 0 {
             return Err(Error(format!("the video latent must have even height and width, got {latent_h} x {latent_w}")));
         }
@@ -123,7 +143,8 @@ impl Layout {
             positions.extend_from_slice(&[i as f64, 0.0, 0.0]);
         }
         push(Kind::Text, text_len, &mut row);
-        let cursor = text_len as f64;
+        // the references sit right after the text on the time axis; the targets start after them
+        let cursor = text_len as f64 + refs.iter().map(|r| r.span()).sum::<f64>();
         for kf in keyframes {
             let at = cursor + FRAME_RESCALE * kf.frame_index;
             if let Some(vt) = kf.video_latent_t {
@@ -134,6 +155,18 @@ impl Layout {
                 audio(&mut positions, rt, at);
                 push(Kind::CondAudio, rt * 2, &mut row);
             }
+        }
+        let mut rc = text_len as f64;
+        for r in refs {
+            match r {
+                RefBlock::Audio { t } => {
+                    if *t > 0 {
+                        audio(&mut positions, *t, rc);
+                        push(Kind::RefAudio, t * 2, &mut row);
+                    }
+                }
+            }
+            rc += r.span();
         }
         audio(&mut positions, audio_t, cursor);
         push(Kind::Audio, audio_t * 2, &mut row);
@@ -187,7 +220,7 @@ impl Timesteps {
             Kind::Text | Kind::Video => t_v,
             Kind::Audio => t_a,
             Kind::Cond => t_v.max(visual_cond),
-            Kind::CondAudio => t_a.max(audio_cond),
+            Kind::CondAudio | Kind::RefAudio => t_a.max(audio_cond),
         };
         let mut values = vec![t_v, t_a];
         values.extend(layout.segments.iter().map(|s| of(s.kind)));
@@ -234,7 +267,7 @@ mod tests {
     fn layout_matches_the_reference() {
         let fx = fixture();
         let m = |k: &str| fx.metadata[k].parse::<usize>().unwrap();
-        let l = Layout::new(m("text_len"), m("latent_t"), m("latent_h"), m("latent_w"), m("audio_t"), &[]).unwrap();
+        let l = Layout::new(m("text_len"), m("latent_t"), m("latent_h"), m("latent_w"), m("audio_t"), &[], &[]).unwrap();
         assert_eq!(
             l.segments,
             vec![
@@ -253,7 +286,7 @@ mod tests {
     fn table_rows_match_the_reference() {
         let fx = fixture();
         let m = |k: &str| fx.metadata[k].parse::<usize>().unwrap();
-        let l = Layout::new(m("text_len"), m("latent_t"), m("latent_h"), m("latent_w"), m("audio_t"), &[]).unwrap();
+        let l = Layout::new(m("text_len"), m("latent_t"), m("latent_h"), m("latent_w"), m("audio_t"), &[], &[]).unwrap();
         // the first step: noise level 1 for both streams, so one timestep (0) and three table rows
         let ts = Timesteps::new(&l, 1.0, 12.0, 3.0);
         assert_eq!(ts.values, vec![0.0]);
@@ -270,7 +303,7 @@ mod tests {
         assert!(time_shift_sigma(0.5, 12.0, 3.0) < 0.5);
         // the curve: a table of 5 rows, 2 wide; t = 0.375 is half-way between rows 1 and 2
         let table: Vec<f32> = (0..10).map(|i| i as f32).collect();
-        let l = Layout::new(1, 1, 2, 2, 1, &[]).unwrap();
+        let l = Layout::new(1, 1, 2, 2, 1, &[], &[]).unwrap();
         let mut ts = Timesteps::new(&l, 1.0, 12.0, 3.0);
         ts.values = vec![0.375, 1.0];
         assert_eq!(ts.embeddings(&table, 2), vec![3.0, 4.0, 8.0, 9.0]);

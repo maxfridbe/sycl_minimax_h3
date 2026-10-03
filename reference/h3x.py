@@ -1024,12 +1024,20 @@ def cmd_gen(args):
                 _d[f"kf.{_i}.audio"] = _kf["audio_latent"].detach().float().cpu().contiguous()
                 _e["audio"] = True
             _kmeta.append(_e)
+        _rmeta = []
+        for _i, _r in enumerate(positive[0][1].get("minimax_refs", []) or []):
+            _e = {"kind": _r.get("kind")}
+            if _r.get("audio_latent") is not None:
+                _d[f"ref.{_i}.audio"] = _r["audio_latent"].detach().float().cpu().contiguous()
+                _e["t"] = int(_r.get("ref_audio_t", _r["audio_latent"].shape[-1]))
+            _rmeta.append(_e)
         save_file(_d, _run, metadata={"seed": str(args.seed), "steps": str(args.steps), "frames": str(frame_count),
                                       "width": str(args.width), "height": str(args.height),
                                       "audio_scale": repr(float(getattr(_ms, "audio_scale", 1.0))),
                                       "shift": repr(float(_ms.shift)), "audio_shift": repr(float(_ms.audio_shift or 0)),
                                       "keyframes": str(bool(positive[0][1].get("minimax_keyframes"))),
                                       "keyframe_list": json.dumps(_kmeta),
+                                      "ref_list": json.dumps(_rmeta),
                                       "visual_cond_noise_aug": repr(float(positive[0][1].get("minimax_visual_cond_noise_aug", 0.999))),
                                       "audio_cond_noise_aug": repr(float(positive[0][1].get("minimax_audio_cond_noise_aug", 1.0)))})
         print(f"  run dump -> {_run}: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in _d.items() if not k.startswith("x0.")), flush=True)
