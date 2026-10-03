@@ -121,6 +121,7 @@ struct Ctx {
     struct Conv3 { dnnl::convolution_forward prim; dnnl::convolution_forward::primitive_desc pd; };
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Conv3> conv3;
     std::map<const void*, dnnl::memory> conv3_w;
+    std::map<std::tuple<std::vector<int64_t>>, Conv3> conv3x;   // strided, unpadded (h3s_conv3d_ex)
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
@@ -801,44 +802,98 @@ int h3s_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W
 
 // GroupNorm over [N, C] (N voxels, channels last), G groups of C / G channels, statistics over every voxel of a
 // group; then the affine weight and bias, optionally * (1 + scale[c]) + shift[c], then SiLU.
-int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t F, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
                         float eps, const float* scale, const float* shift, void* out) try {
     auto& c = *static_cast<Ctx*>(ctx);
-    if (N <= 0 || C <= 0) return 0;
+    if (F <= 0 || N <= 0 || C <= 0) return 0;
     const int64_t cg = C / G;
-    constexpr int64_t kParts = 256;               // partial sums per group
-    float* gs = c.grow(c.gn, c.gn_cap, (size_t) (G * kParts * 2 + G * 2));
+    constexpr int64_t kParts = 256;               // partial sums per (frame, group)
+    float* gs = c.grow(c.gn, c.gn_cap, (size_t) (F * G * kParts * 2 + F * G * 2));
     if (!gs) return -1;
-    float* stat = gs + G * kParts * 2;
+    float* stat = gs + F * G * kParts * 2;
     const int64_t per = (N + kParts - 1) / kParts;
-    c.q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (G * kParts), 64), sycl::range<2>(1, 64)), [=](sycl::nd_item<2> it) {
-        const int64_t gp = it.get_global_id(0), g = gp / kParts, part = gp % kParts;
+    c.q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (F * G * kParts), 64), sycl::range<2>(1, 64)), [=](sycl::nd_item<2> it) {
+        const int64_t gp = it.get_global_id(0), fg = gp / kParts, part = gp % kParts, f = fg / G, g = fg % G;
         const int64_t lane = it.get_local_id(1);
         float s = 0.0f, s2 = 0.0f;
         const int64_t n0 = part * per, n1 = sycl::min(N, n0 + per);
         for (int64_t n = n0; n < n1; ++n)
             for (int64_t j = lane; j < cg; j += 64) {
-                const float v = load(x, dt, (size_t) (n * C + g * cg + j));
+                const float v = load(x, dt, (size_t) ((f * N + n) * C + g * cg + j));
                 s += v; s2 += v * v;
             }
         s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
         s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
         if (lane == 0) { gs[gp * 2] = s; gs[gp * 2 + 1] = s2; }
     });
-    c.q.parallel_for(sycl::range<1>((size_t) G), [=](sycl::id<1> g) {
+    c.q.parallel_for(sycl::range<1>((size_t) (F * G)), [=](sycl::id<1> fg) {
         float s = 0.0f, s2 = 0.0f;
-        for (int64_t p = 0; p < kParts; ++p) { s += gs[(g * kParts + p) * 2]; s2 += gs[(g * kParts + p) * 2 + 1]; }
+        for (int64_t p = 0; p < kParts; ++p) { s += gs[(fg * kParts + p) * 2]; s2 += gs[(fg * kParts + p) * 2 + 1]; }
         const float cnt = (float) N * (float) cg, mean = s / cnt, var = sycl::fmax(s2 / cnt - mean * mean, 0.0f);
-        stat[g * 2] = mean;
-        stat[g * 2 + 1] = sycl::rsqrt(var + eps);
+        stat[fg * 2] = mean;
+        stat[fg * 2 + 1] = sycl::rsqrt(var + eps);
     });
-    c.q.parallel_for(sycl::range<2>((size_t) N, (size_t) C), [=](sycl::id<2> id) {
-        const size_t n = id[0], ch = id[1], i = n * C + ch;
-        const int64_t g = ch / cg;
+    c.q.parallel_for(sycl::range<2>((size_t) (F * N), (size_t) C), [=](sycl::id<2> id) {
+        const size_t fn = id[0], ch = id[1], i = fn * C + ch;
+        const int64_t g = (int64_t) (fn / N) * G + ch / cg;
         float v = (load(x, dt, i) - stat[g * 2]) * stat[g * 2 + 1] * weight[ch] + bias[ch];
         if (scale) v = v * (1.0f + scale[ch]) + shift[ch];
         store(out, dt, i, v / (1.0f + sycl::exp(-v)));
     });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// [T, H, W, C] -> [T + front, H + top + bottom, W + left + right, C]: zeros in front along T (causal), the spatial
+// border reflected (PyTorch's "reflect": the edge row itself not repeated)
+int h3s_pad3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t front, int64_t top, int64_t bottom,
+              int64_t left, int64_t right, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    const int64_t To = T + front, Ho = H + top + bottom, Wo = W + left + right;
+    if (To <= 0 || Ho <= 0 || Wo <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
+        const int64_t o = id[0], ch = id[1];
+        const int64_t t = o / (Ho * Wo) - front, h0 = (o / Wo) % Ho - top, w0 = o % Wo - left;
+        float v = 0.0f;
+        if (t >= 0) {
+            const int64_t h = h0 < 0 ? -h0 : (h0 >= H ? 2 * (H - 1) - h0 : h0);
+            const int64_t w = w0 < 0 ? -w0 : (w0 >= W ? 2 * (W - 1) - w0 : w0);
+            v = load(x, dt, (size_t) (((t * H + h) * W + w) * C + ch));
+        }
+        store(out, dt, (size_t) (o * C + ch), v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// a kt x kh x kw convolution with strides and no padding (pad first: h3s_pad3d), channels last
+int h3s_conv3d_ex(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co,
+                  int64_t kt, int64_t kh, int64_t kw, int64_t st, int64_t sh, int64_t sw, const float* bias, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    const int64_t To = (T - kt) / st + 1, Ho = (H - kh) / sh + 1, Wo = (W - kw) / sw + 1;
+    if (To <= 0 || Ho <= 0 || Wo <= 0) return 0;
+    using dnnl::memory;
+    memory::desc smd({1, Ci, T, H, W}, ddt(dt), memory::format_tag::ndhwc);
+    memory::desc dmd({1, Co, To, Ho, Wo}, ddt(dt), memory::format_tag::ndhwc);
+    memory::desc wany({Co, Ci, kt, kh, kw}, ddt(dt), memory::format_tag::any);
+    memory::desc bmd({Co}, memory::data_type::f32, memory::format_tag::a);
+    auto key = std::make_tuple(std::vector<int64_t>{T, H, W, Ci, Co, kt, kh, kw, st, sh, sw, bias ? 1 : 0, dt});
+    auto it = c.conv3x.find(key);
+    if (it == c.conv3x.end()) {
+        auto pd = dnnl::convolution_forward::primitive_desc(c.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct,
+                                                            smd, wany, bias ? bmd : memory::desc(), dmd, {st, sh, sw}, {0, 0, 0}, {0, 0, 0});
+        it = c.conv3x.emplace(key, Ctx::Conv3{dnnl::convolution_forward(pd), pd}).first;
+    }
+    auto wit = c.conv3_w.find(w);
+    if (wit == c.conv3_w.end() || wit->second.get_desc() != it->second.pd.weights_desc()) {
+        memory::desc wmd({Co, Ci, kt, kh, kw}, ddt(dt), memory::format_tag::oidhw);
+        memory wm(it->second.pd.weights_desc(), c.eng);
+        memory src = usm(wmd, c.eng, w);
+        dnnl::reorder(src, wm).execute(c.strm, src, wm);
+        c.conv3_w[w] = wm;
+        wit = c.conv3_w.find(w);
+    }
+    std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, x)}, {DNNL_ARG_WEIGHTS, wit->second}, {DNNL_ARG_DST, usm(dmd, c.eng, out)}};
+    if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, c.eng, bias)});
+    it->second.prim.execute(c.strm, args);
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 

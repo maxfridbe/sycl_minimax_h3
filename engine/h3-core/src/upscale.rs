@@ -174,7 +174,7 @@ impl Upscaler {
         let (sc, sh) = mod_.map_or((std::ptr::null(), std::ptr::null()), |(a, b)| (a.buf.ptr().cast_const().cast(), b.buf.ptr().cast_const().cast()));
         // SAFETY: as in `conv`; the norm and modulation vectors are float32 [c].
         let rc = unsafe {
-            (d.api.group_norm_silu)(d.ctx, v.x.buf.ptr(), DType::BF16.kernel_code()?, (v.t * v.h * v.w) as i64, v.c as i64, GROUPS, n.w.buf.ptr().cast(),
+            (d.api.group_norm_silu)(d.ctx, v.x.buf.ptr(), DType::BF16.kernel_code()?, 1, (v.t * v.h * v.w) as i64, v.c as i64, GROUPS, n.w.buf.ptr().cast(),
                                     n.b.buf.ptr().cast(), EPS, sc, sh, y.x.buf.ptr())
         };
         d.check(rc)?;

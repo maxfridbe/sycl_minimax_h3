@@ -103,8 +103,14 @@ int h3s_attention_causal(void* ctx, const void* q, const void* k, const void* v,
  * trilinear: resize to [To, Ho, Wo, C], align_corners=False. */
 int h3s_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
                const float* bias, void* out);
-int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t F, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
                         float eps, const float* scale, const float* shift, void* out);
+/* pad3d: zeros in front along T, the spatial border reflected; conv3d_ex: strided, no padding (out dims (D - k) / s + 1).
+ * group_norm_silu takes F frames of N voxels: statistics per frame and group (F = 1: over the whole volume). */
+int h3s_pad3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t front, int64_t top, int64_t bottom,
+              int64_t left, int64_t right, void* out);
+int h3s_conv3d_ex(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co,
+                  int64_t kt, int64_t kh, int64_t kw, int64_t st, int64_t sh, int64_t sw, const float* bias, void* out);
 int h3s_temporal_dwconv(void* ctx, const void* x, int dt, int64_t T, int64_t P, int64_t C, const float* w, int64_t K,
                         const float* bias, void* out);
 int h3s_trilinear(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t To, int64_t Ho, int64_t Wo,

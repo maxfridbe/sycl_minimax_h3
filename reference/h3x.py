@@ -8,7 +8,7 @@ libraries. No server, no node graph, no browser.
 Runs inside the h3-xpu image because the HOST has no Intel level-zero runtime
 (torch.xpu sees 0 devices there); the image carries Intel 26.31 userspace.
 """
-import argparse, os, sys, time
+import argparse, json, os, sys, time
 
 COMFY = "/comfy"
 MODELS = "/models"
@@ -806,6 +806,33 @@ def cmd_gen(args):
         positive = node_helpers.conditioning_set_values(positive, {"minimax_keyframes": kfs})
         _t("keyframes encoded", t0)
 
+    if getattr(args, "guide_clip", None):
+        # MOTION GUIDE (comfy's MiniMaxH3AddGuide with an image batch): the last N frames of a clip, encoded together,
+        # anchored as one keyframe at frame_idx - position AND velocity, not one pose (h3cli/node-features.md #3)
+        import node_helpers, av, numpy as np
+        t0 = time.time()
+        _gp, _gn, _gi = (args.guide_clip.split(":") + ["22", "0"])[:3]
+        _gn, _gi = int(_gn), int(_gi)
+        with av.open(_gp) as _c:
+            _fr = [f.to_ndarray(format="rgb24") for f in _c.decode(video=0)]
+        _fr = _fr[-_gn:]
+        _n = len(_fr)
+        while _n > 5 and _n % 17 != 5:
+            _n -= 1
+        _fr = _fr[-_n:]
+        _imgs = torch.from_numpy(np.stack(_fr).astype(np.float32) / 255.0)
+        _imgs = h3nodes._resize(_imgs, args.width, args.height, "center")
+        _vv = comfy.sd.VAE(sd=load_file(P["vae_video"]), device=mm.get_torch_device())
+        _vv.disable_offload = True
+        _gl = _vv.encode(_imgs)
+        del _vv; gc.collect()
+        _idx = _gi if _gi >= 0 else frames + _gi
+        kfs = list(positive[0][1].get("minimax_keyframes", []))
+        kfs.append({"resolved_frame_index": _idx, "latent": _gl})
+        positive = node_helpers.conditioning_set_values(positive, {"minimax_keyframes": kfs})
+        print(f"  motion guide: last {_n} frames of {_gp} -> keyframe latent {tuple(_gl.shape)} at frame {_idx}", flush=True)
+        _t("motion guide encoded", t0)
+
     if getattr(args, "first_audio", None):
         # AUDIO KEYFRAME (comfy's MiniMaxH3AddGuide with an audio input): the last
         # --first-audio-s seconds of the source are encoded with the audio VAE and pinned at
@@ -986,11 +1013,25 @@ def cmd_gen(args):
         if _tags is not None:
             _d["token_tags"] = _tags.detach().to("cpu").to(torch.int32).contiguous()
         _d.update(_run_x0)
+        # keyframes, as the denoiser receives them (h3x: for the Rust engine's keyframe check)
+        _kmeta = []
+        for _i, _kf in enumerate(positive[0][1].get("minimax_keyframes", []) or []):
+            _e = {"index": int(_kf["resolved_frame_index"])}
+            if _kf.get("latent") is not None:
+                _d[f"kf.{_i}.video"] = _kf["latent"].detach().float().cpu().contiguous()
+                _e["video"] = True
+            if _kf.get("audio_latent") is not None:
+                _d[f"kf.{_i}.audio"] = _kf["audio_latent"].detach().float().cpu().contiguous()
+                _e["audio"] = True
+            _kmeta.append(_e)
         save_file(_d, _run, metadata={"seed": str(args.seed), "steps": str(args.steps), "frames": str(frame_count),
                                       "width": str(args.width), "height": str(args.height),
                                       "audio_scale": repr(float(getattr(_ms, "audio_scale", 1.0))),
                                       "shift": repr(float(_ms.shift)), "audio_shift": repr(float(_ms.audio_shift or 0)),
-                                      "keyframes": str(bool(positive[0][1].get("minimax_keyframes")))})
+                                      "keyframes": str(bool(positive[0][1].get("minimax_keyframes"))),
+                                      "keyframe_list": json.dumps(_kmeta),
+                                      "visual_cond_noise_aug": repr(float(positive[0][1].get("minimax_visual_cond_noise_aug", 0.999))),
+                                      "audio_cond_noise_aug": repr(float(positive[0][1].get("minimax_audio_cond_noise_aug", 1.0)))})
         print(f"  run dump -> {_run}: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in _d.items() if not k.startswith("x0.")), flush=True)
     if _prof:
         print("  profile (seconds, synchronized; slower than a normal run):", flush=True)
@@ -1366,6 +1407,9 @@ def main():
                    help="reference image whose exposure the keyframe is matched to. Each decode/encode hop "
                         "darkens the anchor by ~1 luminance unit, which cost 19%% over a 19-clip chain; "
                         "rescaling to a fixed reference cancels the drift instead of diluting it")
+    g.add_argument("--guide-clip", default=None, metavar="VIDEO[:N[:IDX]]",
+                   help="anchor the last N frames (default 22, cut to 17k+5) of VIDEO as one moving keyframe at frame IDX "
+                        "(default 0; negative counts from the end): a motion guide")
     g.add_argument("--first-latent", default=None,
                    help="chain from a saved last-latent (<clip>.lastlat.pt) instead of a picture: skips the VAE "
                         "round trip AND the h264 round trip, which is what degrades a long chain")

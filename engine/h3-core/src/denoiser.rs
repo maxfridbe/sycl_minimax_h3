@@ -308,6 +308,37 @@ pub fn sigmas(steps: usize, shift: f32) -> Vec<f32> {
 /// Called before each block with its index (cancel checks, progress).
 pub type Between<'a> = &'a mut dyn FnMut(usize) -> Result<()>;
 
+/// A keyframe: latents pinned at a pixel frame of the clip, presented to every step and never denoised. A video
+/// keyframe is one latent frame (a picture, or a previous clip's last latent) or several (a moving guide: the
+/// last frames of a previous clip); an audio keyframe is a stretch of sound (a previous clip's room tone and
+/// voice tail).
+pub struct KeyframeIn {
+    /// pixel frame of the clip the keyframe starts at (24 fps)
+    pub frame_index: usize,
+    /// normalized video latents [24, vt, H, W] and vt (the clip's H and W)
+    pub video: Option<(Vec<f32>, usize)>,
+    /// normalized audio latents [32, 2, rt] and rt
+    pub audio: Option<(Vec<f32>, usize)>,
+}
+
+/// What a clip is conditioned on besides its text: keyframes, and how much the denoiser is told to trust them.
+pub struct Conditions {
+    pub keyframes: Vec<KeyframeIn>,
+    /// a keyframe's video rows are mixed `aug * latent + (1 - aug) * noise` and presented at timestep
+    /// max(t, aug) (0.999 by default; lower: trust a degraded anchor less)
+    pub visual_aug: f32,
+    /// the same for audio rows (1.0: no noise)
+    pub audio_aug: f32,
+    /// the sampling seed (the augmentation noise is drawn from it, as the reference does)
+    pub seed: u64,
+}
+
+impl Default for Conditions {
+    fn default() -> Self {
+        Conditions { keyframes: Vec::new(), visual_aug: crate::layout::VISUAL_COND_TIMESTEP as f32, audio_aug: crate::layout::AUDIO_COND_TIMESTEP as f32, seed: 0 }
+    }
+}
+
 /// One clip's network: the text tokens, the token layout and the buffers, for the block stack loaded in `blocks`.
 pub struct Denoiser<'a> {
     pub blocks: &'a Blocks,
@@ -321,15 +352,63 @@ pub struct Denoiser<'a> {
     scratch: Scratch,
     /// LoRAs on the blocks, if any
     pub lora: Option<&'a crate::lora::LoraSet>,
+    /// the keyframes' rows, embedded once: (first row in the sequence, rows)
+    cond_rows: Vec<(usize, Tensor)>,
+    /// the timesteps conditioning rows are presented at
+    cond_t: (f64, f64),
 }
 
 impl<'a> Denoiser<'a> {
     /// `text`: the refined text tokens [L, hidden]; `text_tags`: per text token, the modality whose tables it uses
     /// (1 = text; the reference marks some tokens otherwise), or `None` for all text.
-    pub fn new(blocks: &'a Blocks, outer: &'a Outer, text: Tensor, text_tags: Option<Vec<i32>>, shape: Shape, schedule: Schedule) -> Result<Denoiser<'a>> {
+    pub fn new(blocks: &'a Blocks, outer: &'a Outer, text: Tensor, text_tags: Option<Vec<i32>>, shape: Shape, schedule: Schedule, cond: &Conditions) -> Result<Denoiser<'a>> {
         let cfg = &blocks.cfg;
         let dev = text.buf.device().clone();
-        let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &[])?;
+        let kfs: Vec<crate::layout::Keyframe> = cond
+            .keyframes
+            .iter()
+            .map(|k| crate::layout::Keyframe { frame_index: k.frame_index as f64, video_latent_t: k.video.as_ref().map(|v| v.1), audio_latent_t: k.audio.as_ref().map(|a| a.1) })
+            .collect();
+        let layout = Layout::new(text.shape[0], shape.t, shape.h, shape.w, shape.audio_t, &kfs)?;
+        // the keyframes' rows: patches (or stereo rows) through the projections once, the augmentation noise drawn
+        // from the seed afresh for every keyframe (the reference restarts the same stream each time; audio rows
+        // from seed + 1)
+        let mut cond_rows = Vec::new();
+        {
+            let embed = |rows: Vec<f32>, lin: &Linear| -> Result<Tensor> {
+                let n = rows.len() / lin.inputs();
+                let input = Tensor::from_bytes(&dev, DType::F32, &[n, lin.inputs()], &f32_bytes(&rows))?;
+                let out = Tensor::new(&dev, DType::BF16, &[n, cfg.hidden])?;
+                lin.forward(&input, &out)?;
+                Ok(out)
+            };
+            let aug = |mut rows: Vec<f32>, a: f32, seed: u64| -> Vec<f32> {
+                if a < 1.0 {
+                    let noise = crate::noise::Mt19937::new(seed).randn(rows.len());
+                    rows.iter_mut().zip(noise).for_each(|(r, n)| *r = a * *r + (1.0 - a) * n);
+                }
+                rows
+            };
+            let mut segs = layout.segments.iter().filter(|s| matches!(s.kind, Kind::Cond | Kind::CondAudio));
+            for k in &cond.keyframes {
+                if let Some((v, vt)) = &k.video {
+                    if v.len() != outer.video_c * vt * shape.h * shape.w {
+                        return Err(Error(format!("a video keyframe of {} values for {} x {vt} x {} x {}", v.len(), outer.video_c, shape.h, shape.w)));
+                    }
+                    let s = segs.next().ok_or("keyframe rows missing from the layout")?;
+                    let rows = aug(patchify(v, outer.video_c, *vt, shape.h, shape.w), cond.visual_aug, cond.seed);
+                    cond_rows.push((s.start, embed(rows, &outer.video_patch)?));
+                }
+                if let Some((a, rt)) = &k.audio {
+                    if a.len() != outer.audio_c * 2 * rt {
+                        return Err(Error(format!("an audio keyframe of {} values for {} x 2 x {rt}", a.len(), outer.audio_c)));
+                    }
+                    let s = segs.next().ok_or("keyframe rows missing from the layout")?;
+                    let rows = aug(pack_audio(a, outer.audio_c, *rt), cond.audio_aug, cond.seed + 1);
+                    cond_rows.push((s.start, embed(rows, &outer.audio_patch)?));
+                }
+            }
+        }
         if text.dtype != DType::BF16 || text.shape[1] != cfg.hidden {
             return Err(Error(format!("the text tokens must be bfloat16 [L, {}], got {:?} {:?}", cfg.hidden, text.dtype, text.shape)));
         }
@@ -348,6 +427,8 @@ impl<'a> Denoiser<'a> {
             text,
             text_tags,
             lora: None,
+            cond_rows,
+            cond_t: (cond.visual_aug as f64, cond.audio_aug as f64),
         })
     }
 
@@ -357,7 +438,7 @@ impl<'a> Denoiser<'a> {
 
     /// Each token's table row and the distinct timesteps at video noise level `sigma`.
     fn timesteps(&self, sigma: f32) -> Timesteps {
-        let mut ts = Timesteps::new(&self.layout, sigma as f64, self.schedule.shift_video as f64, self.schedule.shift_audio as f64);
+        let mut ts = Timesteps::with_cond(&self.layout, sigma as f64, self.schedule.shift_video as f64, self.schedule.shift_audio as f64, self.cond_t.0, self.cond_t.1);
         if let (Some(tags), Some(seg)) = (&self.text_tags, self.layout.segment(Kind::Text)) {
             let base = ts.rows[seg.start] - Kind::Text.modality();
             for (r, tag) in ts.rows[seg.start..seg.stop].iter_mut().zip(tags) {
@@ -393,6 +474,9 @@ impl<'a> Denoiser<'a> {
         self.x.copy_rows(ts_text.start, &self.text, 0, ts_text.stop - ts_text.start)?;
         self.x.copy_rows(ts_audio.start, &ae, 0, na)?;
         self.x.copy_rows(ts_video.start, &ve, 0, nv)?;
+        for (start, rows) in &self.cond_rows {
+            self.x.copy_rows(*start, rows, 0, rows.shape[0])?;
+        }
 
         for i in 0..self.blocks.blocks.len() {
             between(i)?;

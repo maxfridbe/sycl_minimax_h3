@@ -172,6 +172,12 @@ pub struct Timesteps {
 impl Timesteps {
     /// `sigma_video`: the sampler's noise level for the video stream, in (0, 1].
     pub fn new(layout: &Layout, sigma_video: f64, shift_video: f64, shift_audio: f64) -> Timesteps {
+        Timesteps::with_cond(layout, sigma_video, shift_video, shift_audio, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP)
+    }
+
+    /// The same, with the timesteps conditioning rows are presented at (the keyframes' noise augmentation: 0.999
+    /// and 1.0 unless a run asks for a less trusted anchor).
+    pub fn with_cond(layout: &Layout, sigma_video: f64, shift_video: f64, shift_audio: f64, visual_cond: f64, audio_cond: f64) -> Timesteps {
         // the reference does this arithmetic in float32; the values are table keys, so it is followed exactly
         let sigma_v = (sigma_video as f32).max(1e-6);
         let base = sigma_v / (shift_video as f32 + sigma_v * (1.0 - shift_video as f32));
@@ -180,8 +186,8 @@ impl Timesteps {
         let of = |kind: Kind| match kind {
             Kind::Text | Kind::Video => t_v,
             Kind::Audio => t_a,
-            Kind::Cond => t_v.max(VISUAL_COND_TIMESTEP),
-            Kind::CondAudio => t_a.max(AUDIO_COND_TIMESTEP),
+            Kind::Cond => t_v.max(visual_cond),
+            Kind::CondAudio => t_a.max(audio_cond),
         };
         let mut values = vec![t_v, t_a];
         values.extend(layout.segments.iter().map(|s| of(s.kind)));

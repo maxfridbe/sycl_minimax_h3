@@ -14,7 +14,7 @@ use h3_core::device::{Device, Tensor};
 use h3_core::dtype::{f32_to_bf16, DType};
 use h3_core::rng::Rng;
 use h3_core::safetensors::Checkpoint;
-use h3_core::denoiser::{self, Denoiser, Outer, Schedule, Shape, TextRefiner};
+use h3_core::denoiser::{self, Conditions, Denoiser, KeyframeIn, Outer, Schedule, Shape, TextRefiner};
 use h3_core::{dit, reference, Error, Result};
 use serde_json::{json, Value};
 
@@ -304,8 +304,8 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     let f32s = |name: &str| -> Result<Vec<f32>> { h3_core::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
     let meta = |k: &str, d: f32| -> f32 { dump.metadata.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
     let schedule = Schedule { shift_video: meta("shift", 12.0), shift_audio: meta("audio_shift", 3.0), audio_scale: meta("audio_scale", 4.0) };
-    if e.model.blocks.len() != e.model.cfg.blocks || dump.metadata.get("keyframes").is_some_and(|k| k == "True") {
-        return Err(Error("denoise needs every block loaded and a run without keyframes".into()));
+    if e.model.blocks.len() != e.model.cfg.blocks {
+        return Err(Error("denoise needs every block loaded".into()));
     }
     let vs = &dump.get("noise.video")?.shape; // [1, C, T, H, W]
     let as_ = &dump.get("noise.audio")?.shape; // [1, C, 2, T]
@@ -344,7 +344,32 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
         return Err(Error("the engine's starting noise is not the reference's".into()));
     }
 
-    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule)?;
+    // keyframes, as the reference's denoiser received them
+    let mut cond = Conditions { seed, ..Conditions::default() };
+    if let Some(v) = dump.metadata.get("visual_cond_noise_aug").and_then(|v| v.parse().ok()) {
+        cond.visual_aug = v;
+    }
+    if let Some(v) = dump.metadata.get("audio_cond_noise_aug").and_then(|v| v.parse().ok()) {
+        cond.audio_aug = v;
+    }
+    if let Some(list) = dump.metadata.get("keyframe_list") {
+        let list: Value = serde_json::from_str(list).map_err(|e| Error(format!("keyframe_list: {e}")))?;
+        for (i, k) in list.as_array().ok_or("keyframe_list is not a list")?.iter().enumerate() {
+            let index = k["index"].as_u64().ok_or("a keyframe without an index")? as usize;
+            let video = match k.get("video").is_some() {
+                true => Some((f32s(&format!("kf.{i}.video"))?, dump.get(&format!("kf.{i}.video"))?.shape[2])),
+                false => None,
+            };
+            let audio = match k.get("audio").is_some() {
+                true => Some((f32s(&format!("kf.{i}.audio"))?, dump.get(&format!("kf.{i}.audio"))?.shape[3])),
+                false => None,
+            };
+            ctl.say(format!("keyframe {i}: frame {index}{}{}", video.as_ref().map_or(String::new(), |v| format!(", video {} latent frames", v.1)),
+                            audio.as_ref().map_or(String::new(), |a| format!(", audio {} latent frames", a.1))));
+            cond.keyframes.push(KeyframeIn { frame_index: index, video, audio });
+        }
+    }
+    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule, &cond)?;
     let steps = sigmas.len() - 1;
     let nblocks = e.model.blocks.len();
     ctl.say(format!("tokens : {}", d.tokens()));
@@ -681,7 +706,8 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     ctl.say(format!("text   : refined in {:.1} s", t0.elapsed().as_secs_f64()));
     let schedule = Schedule::default();
-    let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule)?;
+    let cond = Conditions { seed: c.seed, ..Conditions::default() };
+    let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
     let n_v = 24 * shape.t * shape.h * shape.w;
     let (noise_v, noise_a) = h3_core::noise::clip_noise(c.seed, n_v, 32 * 2 * shape.audio_t);
