@@ -1,11 +1,11 @@
-//! `h3-sycl` - MiniMax H3 on Intel Arc GPUs: the command line, on the host. It starts two services in containers and
+//! `sycl-h3` - MiniMax H3 on Intel Arc GPUs: the command line, on the host. It starts two services in containers and
 //! talks to the engine over a Unix socket; nothing of the engine runs in this process.
 //!
 //! ```text
-//!   h3-sycl (you) ---- start/stop (podman) ----> [h3-sycl]      h3d daemon -- pipes --> h3d worker per GPU
+//!   sycl-h3 (you) ---- start/stop (podman) ----> [sycl-h3]      h3d daemon -- pipes --> h3d worker per GPU
 //!        |                                            ^ Unix socket (JSON over HTTP)
 //!        +---------- status/jobs/unload -------------+
-//!        +---- serve/stop --web (podman) ----> [h3-sycl-web]   web front end, :8095 -> the same socket
+//!        +---- serve/stop --web (podman) ----> [sycl-h3-web]   web front end, :8095 -> the same socket
 //! ```
 //!
 //! A static binary: it runs on the host whatever the host's C library is.
@@ -29,30 +29,30 @@ pub(crate) fn version() -> String {
     format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
 }
 
-const USAGE: &str = "h3-sycl - MiniMax H3 on Intel Arc GPUs
+const USAGE: &str = "sycl-h3 - MiniMax H3 on Intel Arc GPUs
 
 services (each in its own container; either runs without the other):
-  h3-sycl start [--all | --gpu N ...] [--shared-gpu N ...]
+  sycl-h3 start [--all | --gpu N ...] [--shared-gpu N ...]
                                 the engine daemon; each GPU (all by default) gets its own engine process when a job
                                 needs it, and the model stays loaded on it between jobs
-  h3-sycl serve [--bind ADDR] [--port N]
+  sycl-h3 serve [--bind ADDR] [--port N]
                                 the web front end (default 127.0.0.1:8095); it reaches the engine over the same socket
-  h3-sycl stop [--web | --all]  stop the engine (the default), the web front end, or both - gracefully
+  sycl-h3 stop [--web | --all]  stop the engine (the default), the web front end, or both - gracefully
 
 the engine (over its socket):
-  h3-sycl status [--no-stream]  live, one row per GPU (like docker stats)
-  h3-sycl jobs ps [-a]          queued and running jobs (-a: all)
-  h3-sycl jobs add <kind> [--name value ...] [-f]
+  sycl-h3 status [--no-stream]  live, one row per GPU (like docker stats)
+  sycl-h3 jobs ps [-a]          queued and running jobs (-a: all)
+  sycl-h3 jobs add <kind> [--name value ...] [-f]
                                 queue a job (-f: follow its log); --gpu N pins it to one GPU
                                 kinds: bench-blocks (--tokens N --blocks N), check-block (--dump /out/<file>)
-  h3-sycl jobs stop <id>... | rem <id>... | details <id>
-  h3-sycl unload [--gpu N]      give a GPU back now; the next job loads again
+  sycl-h3 jobs stop <id>... | rem <id>... | details <id>
+  sycl-h3 unload [--gpu N]      give a GPU back now; the next job loads again
 
-  h3-sycl gpus                  the GPUs, numbered as --gpu takes them
-  h3-sycl logs [--web]          a service's log, followed
-  h3-sycl version
+  sycl-h3 gpus                  the GPUs, numbered as --gpu takes them
+  sycl-h3 logs [--web]          a service's log, followed
+  sycl-h3 version
 
-settings (environment, or NAME=value lines in h3-sycl.conf beside the repository or ~/.config/h3-sycl.conf):
+settings (environment, or NAME=value lines in sycl-h3.conf beside the repository or ~/.config/sycl-h3.conf):
   H3_MODELS        host directory with the checkpoints, seen as /models          (required for start)
   H3_MODEL         the checkpoint as seen in the container
                    (default /models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors)
@@ -63,7 +63,7 @@ settings (environment, or NAME=value lines in h3-sycl.conf beside the repository
   H3_LLM_SWITCHER  a front end's model switcher URL: its model stops before loading, comes back after
   H3_LISTEN, H3_PORT   where serve listens (default 127.0.0.1, 8095; 0.0.0.0 = the network, no password)
   H3_LEGACY_API    the server the front end's not yet ported calls go to (e.g. http://127.0.0.1:8090)
-  H3_SOCKET_DIR    where the engine's socket lives (default $XDG_RUNTIME_DIR/h3-sycl)
+  H3_SOCKET_DIR    where the engine's socket lives (default $XDG_RUNTIME_DIR/sycl-h3)
   H3_IMAGE, H3_CONTAINER_ENGINE   the image (h3-build) and podman / docker";
 
 /// `--gpu 0 --gpu 1` -> [0, 1], and the arguments without them.
@@ -92,7 +92,7 @@ fn take_value(raw: &[String], name: &str) -> Result<(Option<String>, Vec<String>
 fn no_more(rest: &[String], cmd: &str) -> Result<()> {
     match rest.first() {
         None => Ok(()),
-        Some(a) => Err(Error(format!("h3-sycl {cmd}: unexpected {a:?} (h3-sycl help)"))),
+        Some(a) => Err(Error(format!("sycl-h3 {cmd}: unexpected {a:?} (sycl-h3 help)"))),
     }
 }
 
@@ -104,7 +104,7 @@ fn wait_until(what: &str, secs: u64, mut ok: impl FnMut() -> bool) -> Result<()>
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err(Error(format!("{what} did not come up in {secs} s (h3-sycl logs)")))
+    Err(Error(format!("{what} did not come up in {secs} s (sycl-h3 logs)")))
 }
 
 fn need_dist(cfg: &Config, file: &str) -> Result<PathBuf> {
@@ -120,7 +120,7 @@ fn socket_ready(cfg: &Config) -> bool {
     std::os::unix::net::UnixStream::connect(cfg.socket()).is_ok()
 }
 
-/// `h3-sycl start`: the engine daemon's container.
+/// `sycl-h3 start`: the engine daemon's container.
 fn start(cfg: &Config, raw: &[String]) -> Result<()> {
     let (gpus, rest) = take_repeated(raw, "--gpu")?;
     let (shared, rest) = take_repeated(&rest, "--shared-gpu")?;
@@ -133,7 +133,7 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
     let gpus: Vec<String> = if all || !gpus.is_empty() { gpus } else { cfg.or("H3_GPUS", "").split_whitespace().map(String::from).collect() };
     let shared: Vec<String> = if shared.is_empty() { cfg.or("H3_SHARED_GPUS", "").split_whitespace().map(String::from).collect() } else { shared };
     for g in gpus.iter().chain(&shared) {
-        g.parse::<usize>().map_err(|_| Error(format!("{g}: not a GPU number (h3-sycl gpus)")))?;
+        g.parse::<usize>().map_err(|_| Error(format!("{g}: not a GPU number (sycl-h3 gpus)")))?;
     }
 
     let ce = Ce::new(cfg)?;
@@ -198,7 +198,7 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
     client::status(&["--no-stream".into()], &|| String::new())
 }
 
-/// `h3-sycl serve`: the web service's container.
+/// `sycl-h3 serve`: the web service's container.
 fn serve(cfg: &Config, raw: &[String]) -> Result<()> {
     let (bind, rest) = take_value(raw, "--bind")?;
     let (port, rest) = take_value(&rest, "--port")?;
@@ -211,7 +211,7 @@ fn serve(cfg: &Config, raw: &[String]) -> Result<()> {
         return Ok(());
     }
     ce.need_image()?;
-    need_dist(cfg, "h3-sycl")?;
+    need_dist(cfg, "sycl-h3")?;
     need_dist(cfg, "wfe/index.html")?;
     ce.remove(WEB);
     let sock_dir = cfg.socket_dir();
@@ -222,8 +222,8 @@ fn serve(cfg: &Config, raw: &[String]) -> Result<()> {
     args.extend(ce.user_args());
     args.extend(mount(&cfg.dist, "/app", true));
     args.extend(mount(&sock_dir, SOCKET_DIR_IN, false));
-    args.extend(["--label".into(), format!("h3-sycl.listen={listen}")]);
-    args.extend([ce.image.clone(), "/app/h3-sycl".into(), "web-service".into(), "--listen".into(), listen.clone(),
+    args.extend(["--label".into(), format!("sycl-h3.listen={listen}")]);
+    args.extend([ce.image.clone(), "/app/sycl-h3".into(), "web-service".into(), "--listen".into(), listen.clone(),
                  "--socket".into(), format!("{SOCKET_DIR_IN}/h3d.sock"), "--ui".into(), "/app/wfe".into()]);
     if let Some(l) = cfg.get("H3_LEGACY_API") {
         args.extend(["--legacy-api".into(), l]);
@@ -245,11 +245,11 @@ fn serve(cfg: &Config, raw: &[String]) -> Result<()> {
 /// "web front end: http://... " or "not running", for status and serve.
 fn web_line(_cfg: &Config, ce: &Ce) -> String {
     if !ce.running(WEB) {
-        return "web front end: not running (h3-sycl serve)".into();
+        return "web front end: not running (sycl-h3 serve)".into();
     }
     let listen = ce
         .cmd()
-        .args(["container", "inspect", "-f", "{{index .Config.Labels \"h3-sycl.listen\"}}", WEB])
+        .args(["container", "inspect", "-f", "{{index .Config.Labels \"sycl-h3.listen\"}}", WEB])
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
@@ -260,7 +260,7 @@ fn web_line(_cfg: &Config, ce: &Ce) -> String {
     format!("web front end: http://{shown}/")
 }
 
-/// `h3-sycl stop [--web | --all]`
+/// `sycl-h3 stop [--web | --all]`
 fn stop(cfg: &Config, raw: &[String]) -> Result<()> {
     let web = raw.iter().any(|a| a == "--web");
     let all = raw.iter().any(|a| a == "--all");
@@ -296,7 +296,7 @@ fn stop(cfg: &Config, raw: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `h3-sycl gpus`: from the running daemon, or from a short-lived container.
+/// `sycl-h3 gpus`: from the running daemon, or from a short-lived container.
 fn gpus(cfg: &Config) -> Result<()> {
     let list = match client::get("/engine/gpus") {
         Ok(v) => v,
@@ -358,10 +358,10 @@ fn run() -> Result<()> {
         "gpus" => gpus(&cfg),
         "logs" => logs(&cfg, rest),
         "version" | "--version" | "-V" => {
-            println!("h3-sycl {}", version());
+            println!("sycl-h3 {}", version());
             Ok(())
         }
-        // inside the web service's container (h3-sycl serve starts it)
+        // inside the web service's container (sycl-h3 serve starts it)
         "web-service" => {
             let (listen, r) = take_value(rest, "--listen")?;
             let (socket, r) = take_value(&r, "--socket")?;
@@ -387,7 +387,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("h3-sycl: {e}");
+            eprintln!("sycl-h3: {e}");
             ExitCode::FAILURE
         }
     }

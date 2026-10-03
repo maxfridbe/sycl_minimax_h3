@@ -78,7 +78,7 @@ it takes computing fewer scores.
                     CPU reference arithmetic
       h3-http/      the small HTTP/JSON layer both programs below share (TCP or Unix socket)
       h3d/          the engine side, in the container: the daemon, the per-GPU engine process, the jobs, checks
-      h3-sycl/      the command line, on the host (a static binary): starts the services, talks over the socket
+      sycl-h3/      the command line, on the host (a static binary): starts the services, talks over the socket
     wfe/          the web front end (TSX + snabbdom, vendored compiler, no node_modules)
     container/    the build-and-run image (podman)
     reference/    the PyTorch pipeline's harness, for comparisons only
@@ -94,30 +94,30 @@ reach the GPU) and nothing else.
     ./build.sh test                 # the Rust tests and lints
     ./teardown.sh [--all]           # stop the services; --all also removes the build output and the image
 
-### Using it: `h3-sycl`
+### Using it: `sycl-h3`
 
-`h3-sycl` is the command line, on the host: a static binary in `dist/` (copy it onto your PATH if you like; it finds
+`sycl-h3` is the command line, on the host: a static binary in `dist/` (copy it onto your PATH if you like; it finds
 `dist/` beside itself, or through `H3_DIST`). It starts two services, each in its own container - either can run
 without the other - and talks to the engine over a Unix socket, like `docker` and `dockerd`.
 
-    ./h3-sycl gpus                  # the GPUs, numbered as --gpu takes them
-    ./h3-sycl start                 # the engine daemon: every GPU (or --gpu 0 --gpu 1 ...); --shared-gpu N for the
+    ./sycl-h3 gpus                  # the GPUs, numbered as --gpu takes them
+    ./sycl-h3 start                 # the engine daemon: every GPU (or --gpu 0 --gpu 1 ...); --shared-gpu N for the
                                     # GPU(s) another program normally holds (see below)
-    ./h3-sycl serve                 # the web front end, http://127.0.0.1:8095/ (--bind 0.0.0.0 --port 9000 ...)
-    ./h3-sycl status                # live, one row per GPU, like docker stats (--no-stream: once)
-    ./h3-sycl jobs add bench-blocks --tokens 47173 -f     # queue a job and follow its log (--gpu N to pin it)
-    ./h3-sycl jobs add check-block --dump /out/blockdump.safetensors
-    ./h3-sycl jobs ps [-a] | stop <id>... | rem <id>... | details <id>
-    ./h3-sycl unload [--gpu N]      # give a GPU back now; the next job loads again
-    ./h3-sycl stop [--web | --all]  # the engine (default), the web front end, or both - gracefully
-    ./h3-sycl logs [--web]
+    ./sycl-h3 serve                 # the web front end, http://127.0.0.1:8095/ (--bind 0.0.0.0 --port 9000 ...)
+    ./sycl-h3 status                # live, one row per GPU, like docker stats (--no-stream: once)
+    ./sycl-h3 jobs add bench-blocks --tokens 47173 -f     # queue a job and follow its log (--gpu N to pin it)
+    ./sycl-h3 jobs add check-block --dump /out/blockdump.safetensors
+    ./sycl-h3 jobs ps [-a] | stop <id>... | rem <id>... | details <id>
+    ./sycl-h3 unload [--gpu N]      # give a GPU back now; the next job loads again
+    ./sycl-h3 stop [--web | --all]  # the engine (default), the web front end, or both - gracefully
+    ./sycl-h3 logs [--web]
 
 How it fits together:
 
-    h3-sycl (host) --start/stop (podman)--> [h3-sycl]      h3d daemon --pipes--> h3d worker --gpu 0, --gpu 1 ...
+    sycl-h3 (host) --start/stop (podman)--> [sycl-h3]      h3d daemon --pipes--> h3d worker --gpu 0, --gpu 1 ...
          |                                     ^ Unix socket, JSON over HTTP
          +--status / jobs / unload ------------+
-         +--serve (podman)------------------> [h3-sycl-web]  web front end, TCP -> the same socket
+         +--serve (podman)------------------> [sycl-h3-web]  web front end, TCP -> the same socket
 
 - `h3d daemon` keeps the job queue and never opens a GPU. Each GPU it serves gets its own engine process,
   `h3d worker --gpu N`, started when a job needs that GPU; the model stays loaded on it between jobs. The worker
@@ -134,7 +134,7 @@ How it fits together:
   loading and restored after the last such engine has ended (`--shared-gpu` / `H3_SHARED_GPUS` say which GPUs these
   are about; all served ones by default). Either way an engine waits until its card really has the memory free.
 
-Settings go in `h3-sycl.conf` beside the repository or `~/.config/h3-sycl.conf` (`h3-sycl help` lists them).
+Settings go in `sycl-h3.conf` beside the repository or `~/.config/sycl-h3.conf` (`sycl-h3 help` lists them).
 
 For measuring and debugging the engine itself, `./run.sh` runs one-shot checks in the container (`H3_MODELS` set):
 
@@ -149,7 +149,7 @@ The version is `yy.mmdd.###` - year, month and day, then that day's sequence num
 file (`h3 version` prints it; a test keeps Cargo's copy in step). `.github/workflows/build.yml` builds the image,
 runs `./build.sh` and `./build.sh test` on every push and pull request and keeps the result as a workflow artifact;
 on `main` it also publishes the build image to the GitHub container registry, and on a tag `v<VERSION>` it publishes
-a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (h3-sycl, h3d, the kernel library with its oneDNN, the built
+a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (sycl-h3, h3d, the kernel library with its oneDNN, the built
 front end).
 
 One model per GPU: Intel's `xe` driver has no out-of-memory error, an over-committed card stalls the whole machine.

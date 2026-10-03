@@ -18,7 +18,7 @@ for a in "$@"; do
 done
 
 # the services first (the daemon unloads its engines at a block boundary; the web service holds nothing)
-[ -x "$ROOT/dist/h3-sycl" ] && "$ROOT/dist/h3-sycl" stop --all
+[ -x "$ROOT/dist/sycl-h3" ] && "$ROOT/dist/sycl-h3" stop --all
 if $CE container inspect h3-engine >/dev/null 2>&1; then
   # stop, with time to finish: a GPU process killed inside a kernel can wedge the xe driver
   echo "==> stopping the engine (up to 120 s)"

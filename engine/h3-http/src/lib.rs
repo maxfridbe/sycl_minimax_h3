@@ -1,5 +1,5 @@
 //! Just enough HTTP/1.1, one request per connection, over TCP or a Unix socket - shared by the daemon (`h3d`, which
-//! answers on a Unix socket) and the host command line (`h3-sycl`, which calls it, and whose `serve` answers the web
+//! answers on a Unix socket) and the host command line (`sycl-h3`, which calls it, and whose `serve` answers the web
 //! front end on TCP). JSON bodies for the API, files for the front end, and a byte-for-byte pass-through.
 //! Standard library and serde_json only.
 

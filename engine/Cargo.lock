@@ -18,14 +18,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "h3-sycl"
-version = "26.1002.1"
-dependencies = [
- "h3-http",
- "serde_json",
-]
-
-[[package]]
 name = "h3-sys"
 version = "26.1002.1"
 
@@ -108,6 +100,14 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sycl-h3"
+version = "26.1002.1"
+dependencies = [
+ "h3-http",
+ "serde_json",
 ]
 
 [[package]]

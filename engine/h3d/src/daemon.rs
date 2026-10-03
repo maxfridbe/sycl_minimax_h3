@@ -9,9 +9,9 @@
 //! Three kinds of process, two kinds of IPC:
 //!
 //! ```text
-//!   h3-sycl (the command line, on the host) --.
+//!   sycl-h3 (the command line, on the host) --.
 //!                                             +-- HTTP/JSON over the Unix socket --> h3d daemon --pipes--> h3d worker (GPU N)
-//!   h3-sycl web service (its own container) --'                                               (JSON lines)
+//!   sycl-h3 web service (its own container) --'                                               (JSON lines)
 //! ```
 //!
 //! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came; a job that names a GPU
@@ -185,7 +185,7 @@ impl Daemon {
         let Some(path) = &self.opts.gpu_lock else { return Ok(()) };
         loop {
             match std::fs::read_to_string(path).ok() {
-                Some(h) if !h.starts_with("h3-sycl ") => {
+                Some(h) if !h.starts_with("sycl-h3 ") => {
                     self.set_engine(k, format!("waiting for the GPU lock (held: {})", h.trim()));
                     if self.stopping(cancel) {
                         return Err(Error("cancelled while waiting for the GPU lock".into()));
@@ -193,7 +193,7 @@ impl Daemon {
                     std::thread::sleep(Duration::from_secs(5));
                 }
                 _ => {
-                    std::fs::write(path, format!("h3-sycl {} engine loaded\n", now() as u64))?;
+                    std::fs::write(path, format!("sycl-h3 {} engine loaded\n", now() as u64))?;
                     return Ok(());
                 }
             }
@@ -202,7 +202,7 @@ impl Daemon {
 
     fn release_lock(&self) {
         if let Some(path) = &self.opts.gpu_lock {
-            if std::fs::read_to_string(path).is_ok_and(|h| h.starts_with("h3-sycl ")) {
+            if std::fs::read_to_string(path).is_ok_and(|h| h.starts_with("sycl-h3 ")) {
                 let _ = std::fs::remove_file(path);
             }
         }
@@ -675,7 +675,7 @@ pub fn serve(opts: Options) -> Result<()> {
     let mut slots = Vec::new();
     for g in &indices {
         let Some(info) = found.iter().find(|f| f["index"].as_u64() == Some(*g as u64)) else {
-            return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `h3-sycl gpus`)", found.len())));
+            return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `sycl-h3 gpus`)", found.len())));
         };
         let shared = hooks && opts.shared_gpus.as_ref().is_none_or(|s| s.contains(g));
         slots.push(Slot {

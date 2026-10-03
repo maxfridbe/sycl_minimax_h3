@@ -1,5 +1,5 @@
-//! The two services as containers: the engine daemon (`h3-sycl`, runs `h3d daemon`, needs the GPUs) and the web
-//! service (`h3-sycl-web`, runs this program's `web-service`). Podman by default (rootless, `crun` for the GPU's render
+//! The two services as containers: the engine daemon (`sycl-h3`, runs `h3d daemon`, needs the GPUs) and the web
+//! service (`sycl-h3-web`, runs this program's `web-service`). Podman by default (rootless, `crun` for the GPU's render
 //! group), docker if that is what there is.
 
 use std::path::Path;
@@ -9,10 +9,10 @@ use h3_http::{Error, Result};
 
 use crate::config::Config;
 
-pub const ENGINE: &str = "h3-sycl";
-pub const WEB: &str = "h3-sycl-web";
+pub const ENGINE: &str = "sycl-h3";
+pub const WEB: &str = "sycl-h3-web";
 /// Where the socket directory appears inside both containers.
-pub const SOCKET_DIR_IN: &str = "/run/h3-sycl";
+pub const SOCKET_DIR_IN: &str = "/run/sycl-h3";
 
 pub struct Ce {
     pub bin: String,

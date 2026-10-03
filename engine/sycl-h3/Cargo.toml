@@ -1,5 +1,5 @@
 [package]
-name = "h3-sycl"
+name = "sycl-h3"
 description = "MiniMax H3 on an Intel Arc GPU: the command line on the host (starts the services, talks to them over a Unix socket)"
 version.workspace = true
 edition.workspace = true

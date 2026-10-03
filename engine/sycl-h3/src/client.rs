@@ -1,14 +1,14 @@
 //! Talking to the daemon over its socket: the status view and the job commands.
 //!
-//!     h3-sycl status [--no-stream]          the engine, live (like `docker stats`): state, the engine process, the GPU,
+//!     sycl-h3 status [--no-stream]          the engine, live (like `docker stats`): state, the engine process, the GPU,
 //!                                      the job running, the queue; --no-stream: once
-//!     h3-sycl jobs ps [-a]                  queued and running jobs (-a: every job the daemon remembers)
-//!     h3-sycl jobs add <kind> [--name value ...] [-f]
+//!     sycl-h3 jobs ps [-a]                  queued and running jobs (-a: every job the daemon remembers)
+//!     sycl-h3 jobs add <kind> [--name value ...] [-f]
 //!                                      queue a job; -f: follow its log until it ends
-//!     h3-sycl jobs stop <id>...             cancel: a queued job is dropped, a running one stops at its next block boundary
-//!     h3-sycl jobs rem <id>...              forget finished or queued jobs
-//!     h3-sycl jobs details <id>             everything about one job: its request, progress, log, result
-//!     h3-sycl unload [--gpu N]
+//!     sycl-h3 jobs stop <id>...             cancel: a queued job is dropped, a running one stops at its next block boundary
+//!     sycl-h3 jobs rem <id>...              forget finished or queued jobs
+//!     sycl-h3 jobs details <id>             everything about one job: its request, progress, log, result
+//!     sycl-h3 unload [--gpu N]
 //!
 //! The daemon answers on a Unix socket (see config.rs); `main` sets where.
 
@@ -37,7 +37,7 @@ pub fn post(path: &str, body: Option<&Value>) -> Result<Value> {
 
 fn not_running(e: Error) -> Error {
     if e.0.starts_with("nothing answers") {
-        Error("the engine is not running: h3-sycl start".into())
+        Error("the engine is not running: sycl-h3 start".into())
     } else {
         e
     }
@@ -107,7 +107,7 @@ fn status_table(st: &Value) -> String {
     out + &notes + &format!("queued: {queued}\n")
 }
 
-/// `h3-sycl status [--no-stream]`; `extra` adds lines under the table (the web service's state).
+/// `sycl-h3 status [--no-stream]`; `extra` adds lines under the table (the web service's state).
 pub fn status(raw: &[String], extra: &dyn Fn() -> String) -> Result<()> {
     let once = raw.iter().any(|a| a == "--no-stream");
     let tty = std::io::stdout().is_terminal();
@@ -159,14 +159,14 @@ fn jobs_table(list: &[Value]) -> String {
     out
 }
 
-/// `h3-sycl jobs ps|add|stop|rem|details ...`
+/// `sycl-h3 jobs ps|add|stop|rem|details ...`
 pub fn jobs(raw: &[String]) -> Result<()> {
-    let usage = "usage: h3-sycl jobs ps [-a] | add <kind> [--name value ...] [-f] | stop <id>... | rem <id>... | details <id>";
+    let usage = "usage: sycl-h3 jobs ps [-a] | add <kind> [--name value ...] [-f] | stop <id>... | rem <id>... | details <id>";
     let sub = raw.first().ok_or(usage)?.as_str();
     let rest = &raw[1..];
     let ids = || -> Result<Vec<u64>> {
         if rest.is_empty() {
-            return Err(Error(format!("h3-sycl jobs {sub} needs at least one job id")));
+            return Err(Error(format!("sycl-h3 jobs {sub} needs at least one job id")));
         }
         rest.iter().map(|s| s.parse::<u64>().map_err(|_| Error(format!("{s}: not a job id")))).collect()
     };
@@ -219,11 +219,11 @@ pub fn jobs(raw: &[String]) -> Result<()> {
     }
 }
 
-/// `h3-sycl jobs add <kind> [--name value ...] [-f]`: numbers become numbers, everything else strings.
+/// `sycl-h3 jobs add <kind> [--name value ...] [-f]`: numbers become numbers, everything else strings.
 fn add(raw: &[String]) -> Result<()> {
     let follow = raw.iter().any(|a| a == "-f" || a == "--follow");
     let rest: Vec<&String> = raw.iter().filter(|a| *a != "-f" && *a != "--follow").collect();
-    let kind = rest.first().ok_or("h3-sycl jobs add needs a kind: bench-blocks, check-block")?;
+    let kind = rest.first().ok_or("sycl-h3 jobs add needs a kind: bench-blocks, check-block")?;
     let mut spec = serde_json::Map::new();
     spec.insert("kind".into(), json!(kind));
     let mut it = rest[1..].iter();
@@ -263,12 +263,12 @@ fn add(raw: &[String]) -> Result<()> {
     }
 }
 
-/// `h3-sycl unload [--gpu N]`
+/// `sycl-h3 unload [--gpu N]`
 pub fn unload(raw: &[String]) -> Result<()> {
     let body = match raw {
         [] => json!({}),
         [flag, n] if flag == "--gpu" => json!({"gpu": n.parse::<u64>().map_err(|_| Error(format!("--gpu {n}: not a GPU number")))?}),
-        _ => return Err(Error("usage: h3-sycl unload [--gpu N]".into())),
+        _ => return Err(Error("usage: sycl-h3 unload [--gpu N]".into())),
     };
     let v = post("/engine/unload", Some(&body))?;
     for u in v["unload"].as_array().cloned().unwrap_or_default() {

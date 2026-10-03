@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# h3-sycl - the command line. The real one is the static binary ./build.sh puts in dist/h3-sycl (copy it anywhere on
-# your PATH; it finds dist/ beside itself, or through H3_DIST). This only starts it from the repository.
-here=$(cd "$(dirname "$0")" && pwd)
-[ -x "$here/dist/h3-sycl" ] || { echo "dist/h3-sycl is not built yet: ./setup.sh, then ./build.sh" >&2; exit 1; }
-exec "$here/dist/h3-sycl" "$@"

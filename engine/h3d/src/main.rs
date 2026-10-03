@@ -1,4 +1,4 @@
-//! `h3d` - the MiniMax H3 engine, inside its container. Not the command a person types: `h3-sycl` (on the host)
+//! `h3d` - the MiniMax H3 engine, inside its container. Not the command a person types: `sycl-h3` (on the host)
 //! starts `h3d daemon` in a container and talks to it over a Unix socket; the daemon starts `h3d worker` per GPU.
 //!
 //!     h3d daemon --socket <path> --model <checkpoint> [--all | --gpu N ...] [--idle 600]
@@ -38,7 +38,7 @@ pub(crate) fn version() -> String {
     format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
 }
 
-const USAGE: &str = "usage (the daemon side; people use h3-sycl on the host):
+const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
   h3d daemon --socket <path> --model <checkpoint.safetensors> [--all | --gpu N ...] [--idle 600]
              [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
   h3d worker --gpu N --model <checkpoint.safetensors>
@@ -261,7 +261,7 @@ fn take_repeated(raw: &[String], name: &str) -> Result<(Vec<usize>, Vec<String>)
     while let Some(a) = it.next() {
         if a == name {
             let v = it.next().ok_or_else(|| Error(format!("{name} needs a GPU number")))?;
-            vals.push(v.parse().map_err(|_| Error(format!("{name} {v}: not a GPU number (see `h3-sycl gpus`)")))?);
+            vals.push(v.parse().map_err(|_| Error(format!("{name} {v}: not a GPU number (see `sycl-h3 gpus`)")))?);
         } else {
             rest.push(a.clone());
         }

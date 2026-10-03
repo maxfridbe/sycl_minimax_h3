@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run.sh - one-shot developer checks on the GPU, inside the container (h3d device, check-linear, bench-blocks ...).
-# Day-to-day use goes through ./h3-sycl (the services); this is for measuring and debugging the engine itself.
+# Day-to-day use goes through ./sycl-h3 (the services); this is for measuring and debugging the engine itself.
 #   ./run.sh device
 #   ./run.sh info /models/<checkpoint>.safetensors
 #   ./run.sh load /models/<checkpoint>.safetensors

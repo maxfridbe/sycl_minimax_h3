@@ -1,5 +1,5 @@
-//! Settings: the environment, then `h3-sycl.conf` beside the repository (one level above dist/), then
-//! `~/.config/h3-sycl.conf`; the first that has a name wins. The files are `NAME=value` lines (`#` comments, quotes
+//! Settings: the environment, then `sycl-h3.conf` beside the repository (one level above dist/), then
+//! `~/.config/sycl-h3.conf`; the first that has a name wins. The files are `NAME=value` lines (`#` comments, quotes
 //! around the value optional) - the same names as the environment variables.
 
 use std::collections::BTreeMap;
@@ -31,9 +31,9 @@ impl Config {
         let exe = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()).unwrap_or_default();
         let dist = std::env::var("H3_DIST").map(PathBuf::from).unwrap_or_else(|_| exe.parent().map(Path::to_path_buf).unwrap_or_default());
         let mut files = BTreeMap::new();
-        let mut candidates = vec![dist.join("../h3-sycl.conf")];
+        let mut candidates = vec![dist.join("../sycl-h3.conf")];
         if let Ok(home) = std::env::var("HOME") {
-            candidates.push(PathBuf::from(home).join(".config/h3-sycl.conf"));
+            candidates.push(PathBuf::from(home).join(".config/sycl-h3.conf"));
         }
         for f in candidates {
             if let Ok(t) = std::fs::read_to_string(&f) {
@@ -57,7 +57,7 @@ impl Config {
             return PathBuf::from(d);
         }
         let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(base).join("h3-sycl")
+        PathBuf::from(base).join("sycl-h3")
     }
 
     pub fn socket(&self) -> PathBuf {

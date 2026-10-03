@@ -1,6 +1,6 @@
 [package]
 name = "h3-http"
-description = "The small HTTP/JSON layer shared by the daemon (h3d) and the host command line (h3-sycl)"
+description = "The small HTTP/JSON layer shared by the daemon (h3d) and the host command line (sycl-h3)"
 version.workspace = true
 edition.workspace = true
 

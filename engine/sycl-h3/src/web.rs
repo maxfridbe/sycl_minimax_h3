@@ -1,4 +1,4 @@
-//! The web service (`h3-sycl serve` starts it in its own container; it runs `h3-sycl web-service`): the web front end
+//! The web service (`sycl-h3 serve` starts it in its own container; it runs `sycl-h3 web-service`): the web front end
 //! (dist/wfe) over HTTP, the engine's API passed through to the daemon's Unix socket, and the front end's calls that
 //! are not ported yet passed through to the server they were written for. It holds no state: stopping or restarting
 //! it touches no job and no GPU.
@@ -21,7 +21,7 @@ fn route(o: &Options, stream: &TcpStream, req: http::Request) -> Result<()> {
     if path.starts_with("/engine/") {
         // the engine's API: the daemon answers on its socket
         if let Err(e) = http::forward(stream, &Target::Unix(o.socket.clone()), &req) {
-            let _ = http::respond(stream, 503, &json!({"error": format!("the engine is not running (h3-sycl start): {}", e.0)}));
+            let _ = http::respond(stream, 503, &json!({"error": format!("the engine is not running (sycl-h3 start): {}", e.0)}));
         }
         return Ok(());
     }
@@ -56,7 +56,7 @@ pub fn run(o: Options) -> Result<()> {
         return Err(Error(format!("{}: no built front end there (./build.sh wfe)", o.ui.display())));
     }
     let listener = TcpListener::bind(&o.listen).map_err(|e| Error(format!("cannot listen on {}: {e}", o.listen)))?;
-    eprintln!("h3-sycl web service {} on http://{}/ - engine API via {}{}", crate::version(), o.listen, o.socket.display(),
+    eprintln!("sycl-h3 web service {} on http://{}/ - engine API via {}{}", crate::version(), o.listen, o.socket.display(),
               o.legacy_api.as_ref().map_or(String::new(), |l| format!(", the rest to {l}")));
     let o = std::sync::Arc::new(o);
     for stream in listener.incoming() {
