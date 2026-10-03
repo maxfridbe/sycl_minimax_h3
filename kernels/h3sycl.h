@@ -85,6 +85,13 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
  *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
  *
  * x, out [M, C]; weight float32 [C]; rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
+/* The text encoder's operations.
+ * dequant: n values (a multiple of 256) of a llama.cpp k-quant (12 = Q4_K, 14 = Q6_K) into out_dt.
+ * attention_causal: softmax(q k^T / sqrt(D)) v with a causal mask, Hq query heads over Hkv key/value heads (head h
+ *   reads kv head h / (Hq / Hkv)); q rows of stride qs, k/v rows of stride kvs, out [L, Hq * D]; for short L. */
+int h3s_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int out_dt);
+int h3s_attention_causal(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t L, int64_t Hq, int64_t Hkv, int64_t D,
+                         int64_t qs, int64_t kvs, void* out);
 /* The latent upscaler's operations, on channels-last volumes [T, H, W, C] in a 16-bit type `dt`.
  * conv3d: a k x k x k convolution (k odd, zero padding k / 2), w [Co, Ci, k, k, k] in dt (reordered once per buffer:
  *   keep it alive and unchanged), bias float32 [Co] or NULL; out [T, H, W, Co].

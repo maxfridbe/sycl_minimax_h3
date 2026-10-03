@@ -14,7 +14,8 @@
 //!     h3d check-block <checkpoint> <dump> [--blocks N]
 //!     h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
 //!     h3d denoise <checkpoint> <run dump> [--out latents.safetensors]
-//!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--out clip.mp4] [--check decode dump]
+//!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
+//!                [--out clip.mp4] [--check decode dump]
 
 mod daemon;
 mod jobs;
@@ -51,7 +52,8 @@ const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
   h3d check-block <checkpoint> <dump.safetensors> [--blocks N] [--threads 8]
   h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
   h3d denoise <checkpoint> <rundump.safetensors> [--out latents.safetensors] [--threads 8]
-  h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--out clip.mp4] [--check decodedump.safetensors]";
+  h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
+             [--out clip.mp4] [--check decodedump.safetensors]";
 
 /// `--name value` options after the positional arguments.
 struct Args {
@@ -255,7 +257,9 @@ fn cmd_decode(args: &Args) -> Result<()> {
     log(format!("device : {}", dev.name()));
     let cancel = AtomicBool::new(false);
     let opt = |k: &str| args.options.get(k).map(Path::new);
-    jobs::decode(&dev, args.number("threads", 8)?, args.path(1)?, &jobs::Vaes { video: args.path(0)?, audio: opt("audio-vae") }, opt("out"), opt("check"), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
+    let scale: f32 = args.options.get("upscale").map(|s| s.parse().map_err(|_| Error(format!("--upscale {s}: not a number")))).transpose()?.unwrap_or(2.0);
+    let upscale = opt("upscaler").map(|p| (p, scale));
+    jobs::decode(&dev, args.number("threads", 8)?, args.path(1)?, &jobs::Vaes { video: args.path(0)?, audio: opt("audio-vae"), upscale }, opt("out"), opt("check"), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
 /// `h3d gpus [--json]`: the GPUs the runtime sees, numbered as `--gpu` takes them.

@@ -413,6 +413,8 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
 pub struct Vaes<'a> {
     pub video: &'a Path,
     pub audio: Option<&'a Path>,
+    /// the latent upscaler and its factor (the video latents are upscaled before the video decoder)
+    pub upscale: Option<(&'a Path, f32)>,
 }
 
 /// Latents -> a clip: the video decoder (and the audio decoder) on the latents in `latents` (a `.safetensors` with
@@ -424,8 +426,36 @@ pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, ou
     let lat = Checkpoint::open(latents)?;
     let key = ["samples.video", "latents.video"].into_iter().find(|k| lat.entries.contains_key(*k)).ok_or("the latents file has no samples.video")?;
     let shape = lat.get(key)?.shape.clone(); // [1, 24, T, H, W]
-    let (t, h, w) = (shape[2], shape[3], shape[4]);
-    let z = h3_core::dtype::bytes_to_f32(&lat.read(key)?, lat.get(key)?.dtype)?;
+    let (t, mut h, mut w) = (shape[2], shape[3], shape[4]);
+    let mut z = h3_core::dtype::bytes_to_f32(&lat.read(key)?, lat.get(key)?.dtype)?;
+    let mut report = json!({});
+    if let Some((up, s)) = vaes.upscale {
+        let t0 = Instant::now();
+        let u = h3_core::upscale::Upscaler::load(dev, &Checkpoint::open(up)?)?;
+        let cancel = ctl.cancel;
+        let (z2, ho, wo) = u.upscale(&z, t, h, w, s, &mut || {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(Error("cancelled".into()));
+            }
+            Ok(())
+        })?;
+        let secs = t0.elapsed().as_secs_f64();
+        ctl.say(format!("upscale: latents {w}x{h} -> {wo}x{ho} (x{s}) in {secs:.1} s"));
+        report["upscale_seconds"] = json!(secs);
+        if let Some(c) = check {
+            let d = Checkpoint::open(c)?;
+            let want = h3_core::dtype::bytes_to_f32(&d.read("latents.video")?, d.get("latents.video")?.dtype)?;
+            if want.len() == z2.len() {
+                let (rel, cos) = reference::compare(&z2, &want);
+                ctl.say(format!("check  : against the reference's upscaled latents: rel err {rel:.2e}, cosine {cos:.6}"));
+                report["upscale_cosine"] = json!(cos);
+            } else {
+                ctl.say(format!("check  : the reference's latents have {} values ({:?}), ours {}", want.len(), d.get("latents.video")?.shape, z2.len()));
+            }
+        }
+        drop(u);
+        (z, h, w) = (z2, ho, wo);
+    }
     let ck = Checkpoint::open(vae)?;
     let dec = h3_core::vae::VideoDecoder::load(dev, &ck, threads)?;
     ctl.say(format!("vae    : {} loaded, {:.2} GiB in {:.1} s", vae.display(), gib(dec.load_bytes), dec.load_seconds));
@@ -444,7 +474,9 @@ pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, ou
     let secs = t0.elapsed().as_secs_f64();
     let (fh, fw) = (h * 16, w * 16);
     ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} tiles)"));
-    let mut report = json!({"frames": frames, "width": fw, "height": fh, "seconds": secs, "tiles": tiles});
+    for (k, v) in [("frames", json!(frames)), ("width", json!(fw)), ("height", json!(fh)), ("seconds", json!(secs)), ("tiles", json!(tiles))] {
+        report[k] = v;
+    }
     if let Some(c) = check {
         let d = Checkpoint::open(c)?;
         let want = h3_core::dtype::bytes_to_f32(&d.read("images")?, d.get("images")?.dtype)?; // [.., F, H, W, 3]
@@ -523,7 +555,8 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str()).map(Path::new);
             let latents = s("latents").ok_or("decode needs \"latents\": a latents file the engine can read")?;
             let video = s("vae").ok_or("decode needs \"vae\": the video decoder's checkpoint")?;
-            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae") }, s("out"), s("check"), ctl)
+            let upscale = s("upscaler").map(|p| (p, spec.get("upscale").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32));
+            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale }, s("out"), s("check"), ctl)
         }
         other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode)"))),
     }
