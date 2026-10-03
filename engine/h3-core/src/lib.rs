@@ -19,6 +19,7 @@ pub mod safetensors;
 pub mod te;
 pub mod tokenizer;
 pub mod upscale;
+pub mod venc;
 pub mod vae;
 
 pub type Result<T> = std::result::Result<T, Error>;

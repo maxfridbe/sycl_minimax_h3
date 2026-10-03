@@ -192,7 +192,7 @@ impl VideoEncoder {
     }
 
     /// One piece through the network: normalized pixels [t, h, w, 3] -> the 48 moments [t', h/16, w/16, 48].
-    fn moments(&self, px: &[f32], t: usize, h: usize, w: usize) -> Result<(Vec<f32>, usize, usize, usize)> {
+    fn moments(&self, px: &[f32], t: usize, h: usize, w: usize) -> Result<Moments> {
         let bytes: Vec<u8> = px.iter().flat_map(|f| crate::dtype::f32_to_f16(*f).to_le_bytes()).collect();
         let mut v = V { x: Tensor::from_bytes(&self.dev, self.dt, &[t * h * w, 3], &bytes)?, t, h, w, c: 3 };
         v = self.conv3(&v, &self.conv_in)?;
@@ -223,7 +223,7 @@ impl VideoEncoder {
 
     /// Pixels [frames, H, W, 3] in [0, 1] (H, W multiples of 16) -> normalized latents [24, T, H/16, W/16] and T.
     pub fn encode(&self, px: &[f32], frames: usize, h: usize, w: usize, tick: &mut dyn FnMut() -> Result<()>) -> Result<(Vec<f32>, usize)> {
-        if h % RATIO != 0 || w % RATIO != 0 || px.len() != frames * h * w * 3 {
+        if !h.is_multiple_of(RATIO) || !w.is_multiple_of(RATIO) || px.len() != frames * h * w * 3 {
             return Err(Error(format!("encode: {} values for {frames} frames of {w}x{h} (multiples of 16)", px.len())));
         }
         let norm: Vec<f32> = px.iter().enumerate().map(|(i, v)| (v - IMAGENET_MEAN[i % 3]) / IMAGENET_STD[i % 3]).collect();
@@ -267,7 +267,7 @@ impl VideoEncoder {
         let (xs, xo) = split_tiles(w);
         let (th, tw) = (h.min(TILE), w.min(TILE));
         let (lh, lw) = (h / RATIO, w / RATIO);
-        let mut rows: Vec<Vec<(Vec<f32>, usize, usize, usize)>> = Vec::new();
+        let mut rows: Vec<Vec<Moments>> = Vec::new();
         let mut tt = 0;
         for &y0 in &ys {
             let mut row = Vec::new();
@@ -290,7 +290,6 @@ impl VideoEncoder {
         let (lyo, lxo): (Vec<usize>, Vec<usize>) = (yo.iter().map(|o| o / RATIO).collect(), xo.iter().map(|o| o / RATIO).collect());
         let mut out = vec![0f32; tt * lh * lw * 48];
         let mut out_y = 0;
-        let get = |r: &Vec<f32>, (rh, rw): (usize, usize), t: usize, y: usize, x: usize| -> &[f32] { &r[((t * rh + y) * rw + x) * 48..][..48] };
         for (i, row) in rows.iter().enumerate() {
             let mut out_x = 0;
             let mut keep_h = 0;
@@ -329,6 +328,14 @@ impl VideoEncoder {
         }
         Ok((out, tt))
     }
+}
+
+/// A tile's moments [t, h, w, 48] and (t, h, w).
+type Moments = (Vec<f32>, usize, usize, usize);
+
+/// The 48 moments at (t, y, x) of a tile [t, rh, rw, 48].
+fn get(r: &[f32], (rh, rw): (usize, usize), t: usize, y: usize, x: usize) -> &[f32] {
+    &r[((t * rh + y) * rw + x) * 48..][..48]
 }
 
 /// Tile starts and overlaps along one axis (the decoder's rule).

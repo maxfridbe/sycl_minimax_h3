@@ -468,6 +468,13 @@ pub struct Latents {
 
 /// Latents in memory -> frames and sound (and an .mp4); see `decode`.
 pub fn decode_latents(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+    decode_latents_chain(dev, threads, lat, vaes, out, check, None, ctl)
+}
+
+/// The same; `chain`: also write the next clip's anchors beside it - `<base>.last.png` (the last frame, lossless)
+/// and `<base>.lastaud.safetensors` (the last 2 s of sound at the model's own level).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, chain: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
     let vae = vaes.video;
     let t_all = Instant::now();
     let (t, mut h, mut w) = (lat.t, lat.h, lat.w);
@@ -571,12 +578,76 @@ pub fn decode_latents(dev: &Arc<Device>, threads: usize, lat: Latents, vaes: &Va
         }
         sound = Some(crate::media::Audio { channels: ch, sample_rate: h3_core::audio::SAMPLE_RATE });
     }
+    if let Some(base) = chain {
+        let plane = fh * fw;
+        let last: Vec<f32> = (0..plane).flat_map(|i| (0..3).map(move |c| (c, i))).map(|(c, i)| px[(c * frames + frames - 1) * plane + i]).collect();
+        let png = base.with_extension("last.png");
+        crate::media::write_png(&png, &last, fw, fh)?;
+        let mut written = vec![png.display().to_string()];
+        if let Some(snd) = &sound {
+            let keep = (2 * snd.sample_rate as usize).min(snd.channels[0].len());
+            let n = snd.channels[0].len();
+            let wav: Vec<f32> = snd.channels.iter().flat_map(|c| c[n - keep..].to_vec()).collect();
+            let p = base.with_extension("lastaud.safetensors");
+            h3_core::safetensors::write_f32(&p, &BTreeMap::from([("waveform".to_string(), (vec![1, 2, keep], wav))]),
+                                            &BTreeMap::from([("sr".to_string(), snd.sample_rate.to_string())]))?;
+            written.push(p.display().to_string());
+        }
+        ctl.say(format!("chain  : {}", written.join(", ")));
+    }
     if let Some(o) = out {
         crate::media::write_mp4(o, &crate::media::Frames { px: &px, count: frames, height: fh, width: fw, fps: 24 }, sound.as_ref(), ctl.log)?;
         ctl.say(format!("written: {}", o.display()));
     }
     ctl.say(format!("total  : {:.1} s", t_all.elapsed().as_secs_f64()));
     Ok(report)
+}
+
+/// The encoders against a reference encoder dump (h3x.py encdump): the video encoder on a picture and on a clip's
+/// last frames, the audio encoder on a stretch of sound - the same inputs, the latents compared.
+pub fn check_encoders(dev: &Arc<Device>, vae: &Path, audio_vae: &Path, dump_path: &Path, ctl: &mut Ctl) -> Result<Value> {
+    let d = Checkpoint::open(dump_path)?;
+    let f = |k: &str| -> Result<Vec<f32>> { h3_core::dtype::bytes_to_f32(&d.read(k)?, d.get(k)?.dtype) };
+    let mut report = serde_json::Map::new();
+    let venc = h3_core::venc::VideoEncoder::load(dev, &Checkpoint::open(vae)?)?;
+    for which in ["image", "clip"] {
+        let key = format!("{which}.pixels");
+        if !d.entries.contains_key(&key) {
+            continue;
+        }
+        let sh = d.get(&key)?.shape.clone(); // [F, H, W, 3]
+        let t0 = Instant::now();
+        let (z, t) = venc.encode(&f(&key)?, sh[0], sh[1], sh[2], &mut || ctl.check())?;
+        let secs = t0.elapsed().as_secs_f64();
+        let want = f(&format!("{which}.latent"))?;
+        let ws = d.get(&format!("{which}.latent"))?.shape.clone();
+        if want.len() != z.len() {
+            ctl.say(format!("{which:6}: {} frames -> {t} latent frames, the reference {:?}: sizes differ", sh[0], ws));
+            continue;
+        }
+        let (rel, cos) = reference::compare(&z, &want);
+        ctl.say(format!("{which:6}: {} frames {}x{} -> {t} latent frames in {secs:.2} s; against the reference: rel err {rel:.2e}, cosine {cos:.6}", sh[0], sh[2], sh[1]));
+        report.insert(which.into(), json!({"cosine": cos, "seconds": secs}));
+    }
+    drop(venc);
+    if d.entries.contains_key("audio.waveform") {
+        let aenc = h3_core::audio::AudioEncoder::load(dev, &Checkpoint::open(audio_vae)?)?;
+        let sh = d.get("audio.waveform")?.shape.clone(); // [1, C, L]
+        let w = f("audio.waveform")?;
+        let chans: Vec<Vec<f32>> = (0..2).map(|c| w[(c.min(sh[1] - 1)) * sh[2]..][..sh[2]].to_vec()).collect();
+        let t0 = Instant::now();
+        let (z, t) = aenc.encode(&chans)?;
+        let secs = t0.elapsed().as_secs_f64();
+        let want = f("audio.latent")?;
+        if want.len() == z.len() {
+            let (rel, cos) = reference::compare(&z, &want);
+            ctl.say(format!("audio : {} samples -> {t} latent frames in {secs:.2} s; against the reference: rel err {rel:.2e}, cosine {cos:.6}", sh[2]));
+            report.insert("audio".into(), json!({"cosine": cos, "seconds": secs}));
+        } else {
+            ctl.say(format!("audio : {t} latent frames, the reference {:?}: sizes differ", d.get("audio.latent")?.shape));
+        }
+    }
+    Ok(Value::Object(report))
 }
 
 /// The text encoder's files: its GGUF weights and the tokenizer's directory.
@@ -661,6 +732,118 @@ pub struct ClipSpec<'a> {
     pub vaes: Vaes<'a>,
     /// a LoRA and its strength
     pub lora: Option<(&'a Path, f32)>,
+    pub inputs: ClipInputs<'a>,
+}
+
+/// What a clip is anchored to, as the reference's options name them (reference/h3x.py gen --help).
+#[derive(Default)]
+pub struct ClipInputs<'a> {
+    /// a previous clip's `.lastlat.safetensors`: its last latent frame pinned at frame 0 (no decode, no codec)
+    pub first_latent: Option<&'a Path>,
+    /// a picture (or a video's last frame) pinned at frame 0 / at the last frame
+    pub first_frame: Option<&'a Path>,
+    pub last_frame: Option<&'a Path>,
+    /// a picture whose exposure the keyframe pictures are matched to (a chain's drift fix)
+    pub frame_ref: Option<&'a Path>,
+    /// motion guides: the last N frames of a clip anchored as one moving keyframe at a frame (negative: from the end)
+    pub guides: Vec<(&'a Path, usize, i64)>,
+    /// the last seconds of a sound (`.lastaud.safetensors` or any media file) pinned at frame 0
+    pub first_audio: Option<(&'a Path, f64)>,
+    /// how much to trust the video keyframes (0.999 by default; lower = trust a degraded anchor less)
+    pub cond_noise_aug: Option<f32>,
+    /// the flow shifts (12 and 3 by default)
+    pub shift: Option<(f32, f32)>,
+}
+
+/// The video keyframes and audio keyframe of a clip, encoded (the encoders loaded only when a picture or sound
+/// needs them).
+fn clip_keyframes(dev: &Arc<Device>, inp: &ClipInputs, vaes: &Vaes, (w, h, frames): (usize, usize, usize), ctl: &mut Ctl) -> Result<Vec<KeyframeIn>> {
+    let mut kfs: Vec<KeyframeIn> = Vec::new();
+    let needs_venc = inp.first_frame.is_some() || inp.last_frame.is_some() || !inp.guides.is_empty();
+    let venc = match needs_venc {
+        true => Some(h3_core::venc::VideoEncoder::load(dev, &Checkpoint::open(vaes.video)?)?),
+        false => None,
+    };
+    let reference_luma = match inp.frame_ref {
+        Some(p) => Some(crate::media::luma(&crate::media::read_frames_tail(p, 1, w, h, crate::media::Fit::Stretch)?.0)),
+        None => None,
+    };
+    let picture = |path: &Path, index: usize, what: &str, ctl: &mut Ctl| -> Result<KeyframeIn> {
+        let (mut px, _) = crate::media::read_frames_tail(path, 1, w, h, crate::media::Fit::Stretch)?;
+        if let Some(rl) = reference_luma {
+            let l = crate::media::luma(&px);
+            if l > 1e-4 {
+                // correct the drift, never re-grade the shot
+                let g = (rl / l).clamp(0.75, 1.35);
+                px.iter_mut().for_each(|v| *v = (*v * g).clamp(0.0, 1.0));
+                ctl.say(format!("exposure: {what} Y {:.1} -> {:.1}, gain {g:.3}", l * 255.0, rl * 255.0));
+            }
+        }
+        let (z, vt) = venc.as_ref().expect("encoder loaded").encode(&px, 1, h, w, &mut || Ok(()))?;
+        ctl.say(format!("keyframe: {what} {} at frame {index}", path.display()));
+        Ok(KeyframeIn { frame_index: index, video: Some((z, vt)), audio: None })
+    };
+    if let Some(p) = inp.first_latent {
+        let ck = Checkpoint::open(p)?;
+        let e = ck.get("latent")?; // [1, 24, 1, H, W]
+        if e.shape[3] != h / 16 || e.shape[4] != w / 16 {
+            return Err(Error(format!("{}: a {:?} latent for a {w}x{h} clip", p.display(), e.shape)));
+        }
+        let z = h3_core::dtype::bytes_to_f32(&ck.read("latent")?, e.dtype)?;
+        ctl.say(format!("keyframe: last latent of {} at frame 0", p.display()));
+        kfs.push(KeyframeIn { frame_index: 0, video: Some((z, e.shape[2])), audio: None });
+    } else if let Some(p) = inp.first_frame {
+        kfs.push(picture(p, 0, "first frame", ctl)?);
+    }
+    if let Some(p) = inp.last_frame {
+        kfs.push(picture(p, frames - 1, "last frame", ctl)?);
+    }
+    for (p, n, idx) in &inp.guides {
+        let (px, mut got) = crate::media::read_frames_tail(p, *n, w, h, crate::media::Fit::Cover)?;
+        // guide clips run 5, 22, 39 ... frames (17k + 5); fewer than 5: the first picture alone
+        let fsz = w * h * 3;
+        let mut start = 0;
+        if got < 5 {
+            got = 1;
+        } else {
+            while got % 17 != 5 {
+                got -= 1;
+                start += 1;
+            }
+        }
+        let index = if *idx >= 0 { *idx as usize } else { (frames as i64 + idx).max(0) as usize };
+        if index + got > frames {
+            return Err(Error(format!("a {got}-frame guide at frame {idx} does not fit in the clip's {frames} frames")));
+        }
+        let (z, vt) = venc.as_ref().expect("encoder loaded").encode(&px[start * fsz..(start + got) * fsz], got, h, w, &mut || ctl.check())?;
+        ctl.say(format!("keyframe: motion guide, last {got} frames of {} ({vt} latent frames) at frame {index}", p.display()));
+        kfs.push(KeyframeIn { frame_index: index, video: Some((z, vt)), audio: None });
+    }
+    drop(venc);
+    if let Some((p, secs)) = inp.first_audio {
+        // the audio encoder needs ~0.6 s at least; the reference anchors at least 1 s
+        let secs = secs.max(1.0);
+        let rate = h3_core::audio::SAMPLE_RATE;
+        let chans: Vec<Vec<f32>> = if p.extension().is_some_and(|e| e == "safetensors") {
+            let ck = Checkpoint::open(p)?;
+            let e = ck.get("waveform")?; // [1, C, L]
+            let w = h3_core::dtype::bytes_to_f32(&ck.read("waveform")?, e.dtype)?;
+            let (c, l) = (e.shape[1], e.shape[2]);
+            let keep = ((secs * rate as f64) as usize).min(l);
+            (0..2).map(|ch| w[ch.min(c - 1) * l + l - keep..ch.min(c - 1) * l + l].to_vec()).collect()
+        } else {
+            crate::media::read_audio_tail(p, secs, rate)?
+        };
+        let aenc = h3_core::audio::AudioEncoder::load(dev, &Checkpoint::open(vaes.audio.ok_or("an audio keyframe needs the audio decoder's checkpoint (audio_vae)")?)?)?;
+        let (z, rt) = aenc.encode(&chans)?;
+        ctl.say(format!("keyframe: last {secs:.2} s of the sound of {} ({rt} latent frames) at frame 0", p.display()));
+        // shares the frame-0 entry with a picture anchor, as the reference does
+        match kfs.iter_mut().find(|k| k.frame_index == 0 && k.audio.is_none()) {
+            Some(k) => k.audio = Some((z, rt)),
+            None => kfs.push(KeyframeIn { frame_index: 0, video: None, audio: Some((z, rt)) }),
+        }
+    }
+    Ok(kfs)
 }
 
 /// The model's frame grid: frames at 24 fps snapped up to 17k + 5; (frames, video latent frames, audio latent frames).
@@ -705,8 +888,16 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
         r
     };
     ctl.say(format!("text   : refined in {:.1} s", t0.elapsed().as_secs_f64()));
-    let schedule = Schedule::default();
-    let cond = Conditions { seed: c.seed, ..Conditions::default() };
+    let mut schedule = Schedule::default();
+    if let Some((sv, sa)) = c.inputs.shift {
+        schedule.shift_video = sv;
+        schedule.shift_audio = sa;
+    }
+    let mut cond = Conditions { seed: c.seed, ..Conditions::default() };
+    if let Some(a) = c.inputs.cond_noise_aug {
+        cond.visual_aug = a;
+    }
+    cond.keyframes = clip_keyframes(&e.dev, &c.inputs, &c.vaes, (c.width, c.height, frames), ctl)?;
     let mut d = Denoiser::new(&e.model, &e.outer, text, None, shape, schedule, &cond)?;
     d.lora = lora.as_ref();
     let n_v = 24 * shape.t * shape.h * shape.w;
@@ -745,7 +936,14 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     };
     let sample_secs = t0.elapsed().as_secs_f64();
     drop(d);
-    let mut rep = decode_latents(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, ctl)?;
+    // the next clip's latent anchor: the last latent frame, before any upscaling
+    {
+        let n = shape.h * shape.w;
+        let last: Vec<f32> = (0..24).flat_map(|ch| v[(ch * shape.t + shape.t - 1) * n..][..n].to_vec()).collect();
+        let p = out.with_extension("lastlat.safetensors");
+        h3_core::safetensors::write_f32(&p, &BTreeMap::from([("latent".to_string(), (vec![1, 24, 1, shape.h, shape.w], last))]), &BTreeMap::new())?;
+    }
+    let mut rep = decode_latents_chain(&e.dev, e.threads, Latents { video: v, t: shape.t, h: shape.h, w: shape.w, audio: Some((a, shape.audio_t)) }, &c.vaes, Some(out), None, Some(out), ctl)?;
     let total = t_all.elapsed().as_secs_f64();
     rep["text_encoder_seconds"] = json!(te_secs);
     rep["sample_seconds"] = json!(sample_secs);
@@ -803,6 +1001,28 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     upscale: upscale.map(|u| (Path::new(s("upscaler").unwrap_or("/models/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")), u as f32)),
                 },
                 lora: None,
+                inputs: ClipInputs {
+                    first_latent: s("first_latent").map(Path::new),
+                    first_frame: s("first_frame").map(Path::new),
+                    last_frame: s("last_frame").map(Path::new),
+                    frame_ref: s("first_frame_ref").map(Path::new),
+                    guides: match s("guide_clip") {
+                        Some(g) => {
+                            let mut it = g.split(':');
+                            let p = it.next().unwrap_or(g);
+                            let n = it.next().and_then(|v| v.parse().ok()).unwrap_or(22);
+                            let i = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                            vec![(Path::new(p), n, i)]
+                        }
+                        None => Vec::new(),
+                    },
+                    first_audio: s("first_audio").map(|p| (Path::new(p), n("first_audio_s").unwrap_or(1.0))),
+                    cond_noise_aug: n("cond_noise_aug").map(|v| v as f32),
+                    shift: match (n("shift_video"), n("shift_audio")) {
+                        (None, None) => None,
+                        (v, a) => Some((v.unwrap_or(12.0) as f32, a.unwrap_or(3.0) as f32)),
+                    },
+                },
             };
             let lora = match s("lora") {
                 Some(l) => {

@@ -72,3 +72,85 @@ pub fn write_mp4(path: &Path, v: &Frames, audio: Option<&Audio>, log: &mut dyn F
     }
     Ok(())
 }
+
+/// How a picture is fitted to the canvas: stretched (the reference's keyframe anchors) or scaled to cover and
+/// cropped in the middle (its guide clips).
+#[derive(Clone, Copy)]
+pub enum Fit {
+    Stretch,
+    Cover,
+}
+
+fn scale_filter(w: usize, h: usize, fit: Fit) -> String {
+    match fit {
+        Fit::Stretch => format!("scale={w}:{h}:flags=lanczos"),
+        Fit::Cover => format!("scale={w}:{h}:flags=lanczos:force_original_aspect_ratio=increase,crop={w}:{h}"),
+    }
+}
+
+/// Every frame of a picture or video, fitted to w x h: [frames, h, w, 3] in [0, 1], and the frame count.
+pub fn read_frames(path: &Path, w: usize, h: usize, fit: Fit) -> Result<(Vec<f32>, usize)> {
+    let out = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vf", &scale_filter(w, h, fit), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .ctx("starting ffmpeg")?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(Error(format!("{}: ffmpeg could not read frames ({})", path.display(), String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let frame = w * h * 3;
+    let n = out.stdout.len() / frame;
+    Ok((out.stdout[..n * frame].iter().map(|b| *b as f32 / 255.0).collect(), n))
+}
+
+/// The last `n` frames of a picture or video (fewer if it has fewer): [frames, h, w, 3].
+pub fn read_frames_tail(path: &Path, n: usize, w: usize, h: usize, fit: Fit) -> Result<(Vec<f32>, usize)> {
+    let (all, count) = read_frames(path, w, h, fit)?;
+    let keep = n.min(count);
+    let frame = w * h * 3;
+    Ok((all[(count - keep) * frame..].to_vec(), keep))
+}
+
+/// The last `seconds` of a file's sound (or all of it when 0) as stereo at `rate`: one buffer per channel.
+pub fn read_audio_tail(path: &Path, seconds: f64, rate: u32) -> Result<Vec<Vec<f32>>> {
+    let out = Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-vn", "-ac", "2", "-ar", &rate.to_string(), "-f", "f32le", "-"])
+        .output()
+        .ctx("starting ffmpeg")?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(Error(format!("{}: ffmpeg could not read sound ({})", path.display(), String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    let v: Vec<f32> = out.stdout.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    let n = v.len() / 2;
+    let keep = if seconds > 0.0 { ((seconds * rate as f64).round() as usize).min(n) } else { n };
+    Ok((0..2).map(|c| (n - keep..n).map(|i| v[i * 2 + c]).collect()).collect())
+}
+
+/// A picture [h, w, 3] in [0, 1] as a lossless .png.
+pub fn write_png(path: &Path, px: &[f32], w: usize, h: usize) -> Result<()> {
+    let mut child = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-i", "-", "-frames:v", "1"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .ctx("starting ffmpeg")?;
+    {
+        let mut stdin = child.stdin.take().ok_or("ffmpeg has no stdin")?;
+        let rgb: Vec<u8> = px.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0) as u8).collect();
+        stdin.write_all(&rgb).ctx("writing the picture to ffmpeg")?;
+    }
+    let st = child.wait()?;
+    if !st.success() {
+        return Err(Error(format!("ffmpeg failed writing {} ({st})", path.display())));
+    }
+    Ok(())
+}
+
+/// Mean luminance (Rec. 601) of pictures [.., 3] in [0, 1].
+pub fn luma(px: &[f32]) -> f32 {
+    let n = px.len() / 3;
+    px.chunks_exact(3).map(|p| 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]).sum::<f32>() / n.max(1) as f32
+}

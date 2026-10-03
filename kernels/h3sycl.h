@@ -127,6 +127,8 @@ int h3s_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64
 int h3s_aa_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* log_alpha, const float* log_beta,
                  const float* up, const float* down, float* out);
 int h3s_scale(void* ctx, float* x, int64_t n, float s);
+/* snake: x + sin^2(alpha x) / alpha per channel of [B, C, L] (the audio encoder's activation). */
+int h3s_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* alpha, float* out);
 /* Layer norm of x [M, C] per row: (x - mean) / sqrt(var + eps) * weight + bias (weight, bias float32 [C] or NULL). */
 int h3s_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
                    void* out, int out_dt);

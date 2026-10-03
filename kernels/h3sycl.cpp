@@ -1019,6 +1019,17 @@ int h3s_aa_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, con
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+// the DAC encoder's Snake: x + sin^2(alpha x) / alpha, alpha per channel (as stored, not in log scale)
+int h3s_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* alpha, float* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (B <= 0 || C <= 0 || L <= 0) return 0;
+    c.q.parallel_for(sycl::range<1>((size_t) (B * C * L)), [=](sycl::id<1> i) {
+        const float a = alpha[(i[0] / L) % C], v = x[i[0]], s = sycl::sin(a * v);
+        out[i[0]] = v + s * s / (a + 1e-9f);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 int h3s_scale(void* ctx, float* x, int64_t n, float s) try {
     auto& c = *static_cast<Ctx*>(ctx);
     if (n <= 0) return 0;

@@ -1342,6 +1342,49 @@ def _write_video(images, audio, path, fps=24):
     container.close()
 
 
+def cmd_encdump(args):
+    """h3x: the encoders on known inputs, for the Rust engine's encoder checks: a picture, the last N frames of a clip
+    and the last second(s) of a sound, with the exact pixels / samples fed in and the latents out, in one safetensors."""
+    import torch, gc, av, numpy as np
+    import comfy.sd
+    import comfy.model_management as mm
+    import comfy_extras.nodes_minimax_h3 as h3nodes
+    from safetensors.torch import load_file as _lf, save_file
+    P = _paths()
+    dev = mm.get_torch_device()
+    out = {}
+    vv = comfy.sd.VAE(sd=_lf(P["vae_video"]), device=dev)
+    vv.disable_offload = True
+    if args.image:
+        img = _load_frame(args.image)
+        img = h3nodes._resize(img, args.width, args.height, "disabled")
+        out["image.pixels"] = img.float().contiguous()
+        out["image.latent"] = vv.encode(img).float().cpu().contiguous()
+        print("  image", tuple(img.shape), "->", tuple(out["image.latent"].shape), flush=True)
+    if args.video:
+        path, n = (args.video.split(":") + ["22"])[:2]
+        with av.open(path) as c:
+            fr = [f.to_ndarray(format="rgb24") for f in c.decode(video=0)]
+        fr = fr[-int(n):]
+        imgs = torch.from_numpy(np.stack(fr).astype(np.float32) / 255.0)
+        imgs = h3nodes._resize(imgs, args.width, args.height, "center")
+        out["clip.pixels"] = imgs.float().contiguous()
+        out["clip.latent"] = vv.encode(imgs).float().cpu().contiguous()
+        print("  clip", tuple(imgs.shape), "->", tuple(out["clip.latent"].shape), flush=True)
+    del vv; gc.collect()
+    if args.audio:
+        d = torch.load(args.audio, map_location="cpu")
+        wav, sr = _canon_audio(d["waveform"].float()), int(d.get("sr", 32000))
+        wav = wav[..., -int(args.audio_s * sr):]
+        av_ = comfy.sd.VAE(sd=_lf(P["vae_audio"]), device=dev)
+        z = av_.encode(wav[:1].movedim(1, -1).to(dev))
+        out["audio.waveform"] = wav[:1].float().contiguous()          # [1, C, L]
+        out["audio.latent"] = z.float().cpu().contiguous()
+        print("  audio", tuple(wav.shape), "->", tuple(z.shape), flush=True)
+    save_file(out, args.out)
+    print("  encoder dump ->", args.out, flush=True)
+
+
 def cmd_remux(args):
     """Re-mux from cached frames - seconds, no GPU, no decode."""
     import torch
@@ -1443,6 +1486,14 @@ def main():
     d.add_argument("--no-audio", action="store_true")
     d.add_argument("--no-normalize", action="store_true", help="keep raw audio level")
     d.add_argument("--chunk", type=int, default=0, help="latent frames per decode pass; 0 = all (default)")
+    e = sub.add_parser("encdump", help="run the encoders on known inputs and dump inputs + latents")
+    e.add_argument("--image", default=None)
+    e.add_argument("--video", default=None, metavar="PATH[:N]")
+    e.add_argument("--audio", default=None, help="a .lastaud.pt")
+    e.add_argument("--audio-s", type=float, default=1.0)
+    e.add_argument("--width", type=int, default=384)
+    e.add_argument("--height", type=int, default=288)
+    e.add_argument("--out", default="/out/encdump.safetensors")
     r = sub.add_parser("remux", help="re-mux from cached frames")
     r.add_argument("--frames", default="/out/.frames.pt")
     r.add_argument("--out", default="/out/h3.mp4")
@@ -1482,7 +1533,7 @@ def main():
     with torch.inference_mode():
         assert torch.is_inference_mode_enabled(), "inference mode did not take"
         {"info": cmd_info, "loadtest": cmd_loadtest, "teload": cmd_teload,
-         "gen": cmd_gen, "decode": cmd_decode, "remux": cmd_remux}[args.cmd](args)
+         "gen": cmd_gen, "decode": cmd_decode, "remux": cmd_remux, "encdump": cmd_encdump}[args.cmd](args)
 
 
 if __name__ == "__main__":

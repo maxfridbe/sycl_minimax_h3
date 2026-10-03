@@ -16,6 +16,7 @@
 //!     h3d denoise <checkpoint> <run dump> [--out latents.safetensors]
 //!     h3d generate <checkpoint> --prompt-file <file> --out clip.mp4 [--width 384 --height 288 --seconds 2 --steps 8
 //!                  --seed 0 --upscale 1] [--te .. --vae .. --audio-vae .. --upscaler .. --tokenizer ..]
+//!     h3d check-encoders <video vae> <audio vae> <encoder dump>
 //!     h3d encode <te.gguf> --prompt-file <file> [--tokenizer dir] [--out cond.safetensors] [--check run dump]
 //!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
 //!                [--out clip.mp4] [--check decode dump]
@@ -57,6 +58,7 @@ const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
   h3d denoise <checkpoint> <rundump.safetensors> [--out latents.safetensors] [--threads 8]
   h3d generate <checkpoint> --prompt-file <file> --out clip.mp4 [--width 384] [--height 288] [--seconds 2] [--steps 8]
                [--seed 0] [--upscale 1] [--te <gguf>] [--vae <ckpt>] [--audio-vae <ckpt>] [--upscaler <ckpt>] [--tokenizer <dir>]
+  h3d check-encoders <video vae> <audio vae> <encdump.safetensors>
   h3d encode <te.gguf> --prompt-file <file> [--tokenizer /app/tokenizer] [--out cond.safetensors] [--check rundump.safetensors]
   h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
              [--out clip.mp4] [--check decodedump.safetensors]";
@@ -271,6 +273,14 @@ fn cmd_generate(args: &Args) -> Result<()> {
     jobs::run(&e, &serde_json::Value::Object(spec), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
+fn cmd_check_encoders(args: &Args) -> Result<()> {
+    let mut log = println_log();
+    let dev = Device::open()?;
+    log(format!("device : {}", dev.name()));
+    let cancel = AtomicBool::new(false);
+    jobs::check_encoders(&dev, args.path(0)?, args.path(1)?, args.path(2)?, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
+}
+
 fn cmd_encode(args: &Args) -> Result<()> {
     let mut log = println_log();
     let dev = Device::open()?;
@@ -373,6 +383,7 @@ fn run() -> Result<()> {
         "denoise" => cmd_denoise(&args),
         "decode" => cmd_decode(&args),
         "encode" => cmd_encode(&args),
+        "check-encoders" => cmd_check_encoders(&args),
         "generate" => cmd_generate(&args),
         "daemon" => cmd_daemon(&raw[1..]),
         "gpus" => cmd_gpus(&Args { positional: raw[1..].to_vec(), options: BTreeMap::new() }),
