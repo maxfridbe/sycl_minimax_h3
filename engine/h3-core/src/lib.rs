@@ -7,6 +7,7 @@ pub mod device;
 pub mod dit;
 pub mod dtype;
 pub mod layout;
+pub mod noise;
 pub mod load;
 pub mod ops;
 pub mod reference;

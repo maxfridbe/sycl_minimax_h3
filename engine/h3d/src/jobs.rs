@@ -334,6 +334,16 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     ctl.say(format!("text   : refined in {:.1} s (refiner loaded and freed)", t0.elapsed().as_secs_f64()));
     ctl.check()?;
 
+    // the starting noise: drawn here as PyTorch draws it (same seed), checked against the dump's
+    let seed: u64 = dump.metadata.get("seed").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let (want_v, want_a) = (f32s("noise.video")?, f32s("noise.audio")?);
+    let (noise_v, noise_a) = h3_core::noise::clip_noise(seed, want_v.len(), want_a.len());
+    let worst_noise = noise_v.iter().zip(&want_v).chain(noise_a.iter().zip(&want_a)).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    ctl.say(format!("noise  : seed {seed}, drawn by the engine; differs from the reference's by {worst_noise:.1e} at most"));
+    if worst_noise > 1e-4 {
+        return Err(Error("the engine's starting noise is not the reference's".into()));
+    }
+
     let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule)?;
     let steps = sigmas.len() - 1;
     let nblocks = e.model.blocks.len();
@@ -348,8 +358,8 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
         let mut lines: Vec<String> = Vec::new();
         let r = denoiser::sample(
             &mut d,
-            &f32s("noise.video")?,
-            &f32s("noise.audio")?,
+            &noise_v,
+            &noise_a,
             &sigmas,
             &mut |i, dv, da| {
                 let secs = t_step.elapsed().as_secs_f64();
