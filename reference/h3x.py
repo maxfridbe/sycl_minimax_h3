@@ -948,12 +948,18 @@ def cmd_gen(args):
     # `docker logs` mid-run). The front end parses "  step N/M".
     _t0s = time.time()
     _dump = os.environ.get("H3X_DUMP_STEPS")
+    _run = os.environ.get("H3X_DUMP_RUN")     # h3x: a whole sampling run for the Rust engine (see below)
+    _run_x0 = {}
     def _cb(step, x0, x, total):
         print(f"  step {step+1}/{total}  {time.time()-_t0s:6.1f}s", flush=True)
+        _tt = getattr(x0, "tensors", None)          # video + audio travel as a nested pair
+        _tt = list(_tt) if _tt is not None else [x0]
         if _dump:   # h3x: the denoised estimate after every step, for step-by-step comparisons between engines
-            _tt = getattr(x0, "tensors", None)          # video + audio travel as a nested pair
-            _tt = list(_tt) if _tt is not None else [x0]
             torch.save([t.detach().float().cpu() for t in _tt], f"{_dump}.step{step+1:02d}.pt")
+        if _run:
+            _run_x0[f"x0.{step+1:02d}.video"] = _tt[0].detach().float().cpu().contiguous()
+            if len(_tt) > 1:
+                _run_x0[f"x0.{step+1:02d}.audio"] = _tt[1].detach().float().cpu().contiguous()
     if os.environ.get("H3X_DUMP_BLOCK"):
         _dump_block_install(os.environ["H3X_DUMP_BLOCK"])
     _prof = _profile_install() if os.environ.get("H3X_PROFILE") else None
@@ -961,6 +967,31 @@ def cmd_gen(args):
                                   positive, negative, latent["samples"], denoise=1.0,
                                   seed=args.seed, callback=_cb)
     _t(f"sampled {args.steps} steps", t0)
+    if _run:
+        # h3x: what the Rust engine needs to run the same sampling and be checked against it, in one safetensors file:
+        # the text conditioning as it enters the model (before its projection and refiner), the starting noise (the
+        # sampler starts at sigma 1, so this is the first x), the sigmas, every step's denoised estimate (in the
+        # sampler's space: the audio stream carried x audio_scale), and the final latents (back in the model's space)
+        from safetensors.torch import save_file
+        import comfy.samplers
+        _ms = model.get_model_object("model_sampling")
+        _sig = comfy.samplers.calculate_sigmas(_ms, "simple", args.steps).float().cpu().contiguous()
+        _nt = list(getattr(noise, "tensors", None) or [noise])
+        _st2 = list(getattr(samples, "tensors", None) or [samples])
+        _ctx = positive[0][0]
+        _d = {"context": _ctx.detach().to("cpu").contiguous(), "sigmas": _sig,
+              "noise.video": _nt[0].float().contiguous(), "noise.audio": _nt[1].float().contiguous(),
+              "samples.video": _st2[0].detach().float().cpu().contiguous(), "samples.audio": _st2[1].detach().float().cpu().contiguous()}
+        _tags = positive[0][1].get("minimax_token_tags")
+        if _tags is not None:
+            _d["token_tags"] = _tags.detach().to("cpu").to(torch.int32).contiguous()
+        _d.update(_run_x0)
+        save_file(_d, _run, metadata={"seed": str(args.seed), "steps": str(args.steps), "frames": str(frame_count),
+                                      "width": str(args.width), "height": str(args.height),
+                                      "audio_scale": repr(float(getattr(_ms, "audio_scale", 1.0))),
+                                      "shift": repr(float(_ms.shift)), "audio_shift": repr(float(_ms.audio_shift or 0)),
+                                      "keyframes": str(bool(positive[0][1].get("minimax_keyframes")))})
+        print(f"  run dump -> {_run}: " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in _d.items() if not k.startswith("x0.")), flush=True)
     if _prof:
         print("  profile (seconds, synchronized; slower than a normal run):", flush=True)
         for k, (n, sec) in sorted(_prof.items(), key=lambda kv: -kv[1][1]):
@@ -1022,8 +1053,12 @@ def cmd_decode(args):
     from safetensors.torch import load_file as _lf
     P = _paths()
     T0 = time.time()
-    d = torch.load(args.latents, map_location="cpu")
-    vid_lat, aud_lat = d["video"], d["audio"]
+    if args.latents.endswith(".safetensors"):   # h3x: latents from the Rust engine (h3d denoise --out)
+        d = _lf(args.latents)
+        vid_lat, aud_lat = d["samples.video"], d["samples.audio"]
+    else:
+        d = torch.load(args.latents, map_location="cpu")
+        vid_lat, aud_lat = d["video"], d["audio"]
     print("=== decode ===")
     print("  inference_mode:", torch.is_inference_mode_enabled(), flush=True)
     print("  video latent:", tuple(vid_lat.shape), " audio latent:", tuple(aud_lat.shape))

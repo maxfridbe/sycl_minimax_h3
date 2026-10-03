@@ -38,6 +38,7 @@ pub struct Api {
     pub write: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
     pub read: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
     pub wait: unsafe extern "C" fn(*mut c_void) -> c_int,
+    pub copy: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void, u64) -> c_int,
     #[allow(clippy::type_complexity)]
     pub int8_linear: unsafe extern "C" fn(
         *mut c_void,    // ctx
@@ -206,6 +207,7 @@ impl Api {
             write: sym!("h3s_write"),
             read: sym!("h3s_read"),
             wait: sym!("h3s_wait"),
+            copy: sym!("h3s_copy"),
             int8_linear: sym!("h3s_int8_linear"),
             linear: sym!("h3s_linear"),
             rms_norm_mod: sym!("h3s_rms_norm_mod"),

@@ -23,6 +23,7 @@ Switches of `h3x.py` (environment):
 | `H3X_PRELOAD=1` | put the denoiser's weights on the GPU before step 1, timed |
 | `H3X_PREFETCH=<threads>` | read the checkpoint ahead in parallel while the rest starts |
 | `H3X_DUMP_STEPS=<prefix>` | save the denoised estimate after every step (for `compare.py`) |
+| `H3X_DUMP_RUN=<file>` | save a whole sampling run - conditioning, noise, sigmas, every step's estimate, the final latents - for the Rust engine's `denoise` check |
 | `H3X_DUMP_BLOCK=<file>` | save block 0's input, every intermediate of it, and later blocks' outputs (for `h3 check-block`) |
 | `H3X_INT8_NATIVE=1` | keep int8 weights int8 (ComfyUI turns them back into floats on an Intel GPU) |
 | `H3X_SYCL=1` | the above, with `libh3sycl` in front of comfy-kitchen's own backends |

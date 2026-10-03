@@ -208,6 +208,28 @@ impl Tensor {
         self.shape.iter().product()
     }
 
+    /// Bytes per row (the product of every dimension but the first).
+    pub fn row_bytes(&self) -> usize {
+        self.shape.iter().skip(1).product::<usize>() * self.dtype.size()
+    }
+
+    /// Copies `rows` rows of `src` from row `src_row` into this tensor at row `dst_row`, on the device (queued).
+    pub fn copy_rows(&self, dst_row: usize, src: &Tensor, src_row: usize, rows: usize) -> Result<()> {
+        let rb = self.row_bytes();
+        if src.dtype != self.dtype || src.row_bytes() != rb {
+            return Err(Error(format!("copy_rows: {:?} {:?} into {:?} {:?}", src.dtype, src.shape, self.dtype, self.shape)));
+        }
+        if (dst_row + rows) * rb > self.buf.len() || (src_row + rows) * rb > src.buf.len() {
+            return Err(Error(format!("copy_rows: rows {src_row}+{rows} of {:?} into {dst_row}.. of {:?}", src.shape, self.shape)));
+        }
+        let dev = self.buf.device();
+        // SAFETY: both ranges checked to lie in their buffers.
+        let rc = unsafe {
+            (dev.api.copy)(dev.ctx, self.buf.ptr().cast::<u8>().add(dst_row * rb).cast(), src.buf.ptr().cast::<u8>().add(src_row * rb).cast_const().cast(), (rows * rb) as u64)
+        };
+        dev.check(rc)
+    }
+
     /// The tensor's bytes, read back from the device.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut v = vec![0u8; self.buf.len()];

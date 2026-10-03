@@ -44,7 +44,8 @@ the engine (over its socket):
   sycl-h3 jobs ps [-a]          queued and running jobs (-a: all)
   sycl-h3 jobs add <kind> [--name value ...] [-f]
                                 queue a job (-f: follow its log); --gpu N pins it to one GPU
-                                kinds: bench-blocks (--tokens N --blocks N), check-block (--dump /out/<file>)
+                                kinds: bench-blocks (--tokens N --blocks N), check-block (--dump /out/<file>),
+                                denoise (--dump /out/<run dump> --out /out/<latents>)
   sycl-h3 jobs stop <id>... | rem <id>... | details <id>
   sycl-h3 unload [--gpu N]      give a GPU back now; the next job loads again
 

@@ -223,7 +223,7 @@ pub fn jobs(raw: &[String]) -> Result<()> {
 fn add(raw: &[String]) -> Result<()> {
     let follow = raw.iter().any(|a| a == "-f" || a == "--follow");
     let rest: Vec<&String> = raw.iter().filter(|a| *a != "-f" && *a != "--follow").collect();
-    let kind = rest.first().ok_or("sycl-h3 jobs add needs a kind: bench-blocks, check-block")?;
+    let kind = rest.first().ok_or("sycl-h3 jobs add needs a kind: bench-blocks, check-block, denoise")?;
     let mut spec = serde_json::Map::new();
     spec.insert("kind".into(), json!(kind));
     let mut it = rest[1..].iter();

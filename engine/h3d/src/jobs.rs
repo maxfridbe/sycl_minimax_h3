@@ -4,6 +4,7 @@
 //! A job reports through a log callback and looks at a cancel flag between blocks - never inside one: a GPU process
 //! stopped in the middle of a kernel can leave the xe driver stuck.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use h3_core::device::{Device, Tensor};
 use h3_core::dtype::{f32_to_bf16, DType};
 use h3_core::rng::Rng;
 use h3_core::safetensors::Checkpoint;
+use h3_core::denoiser::{self, Denoiser, Outer, Schedule, Shape, TextRefiner};
 use h3_core::{dit, reference, Error, Result};
 use serde_json::{json, Value};
 
@@ -20,11 +22,13 @@ pub fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
-/// The loaded engine: the GPU, the checkpoint, the denoiser's blocks on the GPU.
+/// The loaded engine: the GPU, the checkpoint, the denoiser's blocks and the small parts around them on the GPU.
 pub struct Engine {
     pub dev: Arc<Device>,
     pub ck: Checkpoint,
     pub model: dit::Blocks,
+    pub outer: Outer,
+    pub threads: usize,
 }
 
 impl Engine {
@@ -39,7 +43,9 @@ impl Engine {
         log(format!("device : {}", dev.name()));
         let model = dit::Blocks::load(&dev, &ck, count, threads)?;
         log(format!("blocks : {} loaded, {:.2} GiB in {:.1} s", model.blocks.len(), gib(model.load_bytes), model.load_seconds));
-        Ok(Engine { dev, ck, model })
+        let outer = Outer::load(&dev, &ck)?;
+        denoiser::check_fits(&model.cfg, &outer)?;
+        Ok(Engine { dev, ck, model, outer, threads })
     }
 
     fn inv_freq(&self) -> Result<Vec<f32>> {
@@ -289,6 +295,110 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
               "gib_in_use": gib(dev.mem_used()), "stages_ms_per_block": out}))
 }
 
+/// A whole sampling run against a run dump of the reference pipeline (reference/h3x.py, H3X_DUMP_RUN): the same
+/// text conditioning, starting noise and schedule; every step's denoised estimate compared with the reference's,
+/// then the finished latents. `out`: where to write the latents (for the reference's decoders).
+pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+    let t_all = Instant::now();
+    let dump = Checkpoint::open(dump_path)?;
+    let f32s = |name: &str| -> Result<Vec<f32>> { h3_core::dtype::bytes_to_f32(&dump.read(name)?, dump.get(name)?.dtype) };
+    let meta = |k: &str, d: f32| -> f32 { dump.metadata.get(k).and_then(|v| v.parse().ok()).unwrap_or(d) };
+    let schedule = Schedule { shift_video: meta("shift", 12.0), shift_audio: meta("audio_shift", 3.0), audio_scale: meta("audio_scale", 4.0) };
+    if e.model.blocks.len() != e.model.cfg.blocks || dump.metadata.get("keyframes").is_some_and(|k| k == "True") {
+        return Err(Error("denoise needs every block loaded and a run without keyframes".into()));
+    }
+    let vs = &dump.get("noise.video")?.shape; // [1, C, T, H, W]
+    let as_ = &dump.get("noise.audio")?.shape; // [1, C, 2, T]
+    let shape = Shape { t: vs[2], h: vs[3], w: vs[4], audio_t: as_[3] };
+    let cs = &dump.get("context")?.shape; // [1, L, text_dim]
+    let (l, text_dim) = (cs[1], cs[2]);
+    let tags: Option<Vec<i32>> = match dump.entries.contains_key("token_tags") {
+        true => Some(dump.read("token_tags")?.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
+        false => None,
+    };
+    let sigmas = f32s("sigmas")?;
+    let own = denoiser::sigmas(sigmas.len() - 1, schedule.shift_video);
+    let worst_sigma = own.iter().zip(&sigmas).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    ctl.say(format!("dump   : {l} text tokens, video latent {}x{}x{}, audio {} frames, {} steps (schedule differs by {worst_sigma:.1e})",
+                    shape.t, shape.h, shape.w, shape.audio_t, sigmas.len() - 1));
+
+    // the text: projection + refiner, loaded for this and dropped
+    let t0 = Instant::now();
+    let text = {
+        let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
+        let ctx = Tensor::from_bytes(&e.dev, DType::BF16, &[l, text_dim], &denoiser::bf16_bytes(&f32s("context")?))?;
+        let t = refiner.run(&e.model.cfg, &ctx)?;
+        e.dev.wait()?;
+        t
+    };
+    ctl.say(format!("text   : refined in {:.1} s (refiner loaded and freed)", t0.elapsed().as_secs_f64()));
+    ctl.check()?;
+
+    let mut d = Denoiser::new(&e.model, &e.outer, text, tags, shape, schedule)?;
+    let steps = sigmas.len() - 1;
+    let nblocks = e.model.blocks.len();
+    ctl.say(format!("tokens : {}", d.tokens()));
+    let mut per_step = Vec::new();
+    let mut worst = 1f64;
+    let mut t_step = Instant::now();
+    let (v, a) = {
+        let dev = e.dev.clone();
+        let cancel = ctl.cancel;
+        let mut progress = ctl.progress.take();
+        let mut lines: Vec<String> = Vec::new();
+        let r = denoiser::sample(
+            &mut d,
+            &f32s("noise.video")?,
+            &f32s("noise.audio")?,
+            &sigmas,
+            &mut |i, dv, da| {
+                let secs = t_step.elapsed().as_secs_f64();
+                t_step = Instant::now();
+                let key = format!("x0.{:02}", i + 1);
+                let (mut cv, mut ca) = (f64::NAN, f64::NAN);
+                if dump.entries.contains_key(&format!("{key}.video")) {
+                    cv = reference::compare(dv, &f32s(&format!("{key}.video"))?).1;
+                    ca = reference::compare(da, &f32s(&format!("{key}.audio"))?).1;
+                    worst = worst.min(cv).min(ca);
+                }
+                lines.push(format!("  step {}/{steps}  sigma {:.4}  {secs:6.2} s   cosine to the reference: video {cv:.5}  audio {ca:.5}", i + 1, sigmas[i]));
+                per_step.push(json!({"step": i + 1, "seconds": secs, "cosine_video": cv, "cosine_audio": ca}));
+                Ok(())
+            },
+            &mut |i, b| {
+                if b == 0 || b == nblocks / 2 {
+                    dev.wait()?;
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(Error("cancelled".into()));
+                    }
+                }
+                if let Some(p) = progress.as_mut() {
+                    p(i * nblocks + b, steps * nblocks);
+                }
+                Ok(())
+            },
+        );
+        ctl.progress = progress;
+        for s in lines {
+            ctl.say(s);
+        }
+        r?
+    };
+    let cv = reference::compare(&v, &f32s("samples.video")?);
+    let ca = reference::compare(&a, &f32s("samples.audio")?);
+    ctl.say(format!("latents: video rel err {:.2e} cosine {:.5}; audio rel err {:.2e} cosine {:.5}", cv.0, cv.1, ca.0, ca.1));
+    if let Some(p) = out {
+        let mut t = BTreeMap::new();
+        t.insert("samples.video".to_string(), (dump.get("samples.video")?.shape.clone(), v));
+        t.insert("samples.audio".to_string(), (dump.get("samples.audio")?.shape.clone(), a));
+        h3_core::safetensors::write_f32(p, &t, &dump.metadata)?;
+        ctl.say(format!("written: {}", p.display()));
+    }
+    let secs = t_all.elapsed().as_secs_f64();
+    ctl.say(format!("total  : {secs:.1} s"));
+    Ok(json!({"tokens": d.tokens(), "steps": per_step, "cosine_video": cv.1, "cosine_audio": ca.1, "worst_step_cosine": worst, "seconds": secs}))
+}
+
 /// One job, as the daemon receives it: `{"kind": "bench-blocks", "tokens": 47173}` and so on.
 pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
     let kind = spec.get("kind").and_then(|k| k.as_str()).ok_or("a job needs a \"kind\"")?;
@@ -299,6 +409,11 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let dump = spec.get("dump").and_then(|d| d.as_str()).ok_or("check-block needs \"dump\": a path the engine can read")?;
             check_block(e, Path::new(dump), ctl)
         }
-        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block)"))),
+        "denoise" => {
+            let dump = spec.get("dump").and_then(|d| d.as_str()).ok_or("denoise needs \"dump\": a run dump the engine can read")?;
+            let out = spec.get("out").and_then(|d| d.as_str()).map(Path::new);
+            denoise(e, Path::new(dump), out, ctl)
+        }
+        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise)"))),
     }
 }

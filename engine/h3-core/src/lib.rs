@@ -2,6 +2,7 @@
 //! everything around it: the device and its memory, reading checkpoints, and (as the port proceeds) the model graph
 //! and the sampler.
 
+pub mod denoiser;
 pub mod device;
 pub mod dit;
 pub mod dtype;

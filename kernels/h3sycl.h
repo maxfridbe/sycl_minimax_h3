@@ -54,6 +54,8 @@ uint64_t h3s_mem_free(void* ctx);
 /* Host <-> device copies; both wait for the copy (the host buffer may be released on return). Thread-safe. */
 int h3s_write(void* ctx, void* dst, const void* src_host, uint64_t bytes);
 int h3s_read(void* ctx, void* dst_host, const void* src, uint64_t bytes);
+/* Device to device, queued like a kernel (it does not wait). */
+int h3s_copy(void* ctx, void* dst, const void* src, uint64_t bytes);
 /* Waits until everything queued has run; reports an asynchronous error if there was one. */
 int h3s_wait(void* ctx);
 

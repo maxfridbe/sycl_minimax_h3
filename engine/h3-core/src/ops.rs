@@ -254,6 +254,21 @@ pub fn gate_add(x: &Tensor, other: &Tensor, rows: &Tensor, gate: &Tensor) -> Res
     dev.check(rc)
 }
 
+/// `x += other`, in place (a residual connection without a gate). x, other [M, C], any float types.
+pub fn add(x: &Tensor, other: &Tensor) -> Result<()> {
+    let c = *x.shape.last().ok_or("add: x has no shape")?;
+    if other.elements() != x.elements() {
+        return Err(Error(format!("add: x {:?} and other {:?} differ", x.shape, other.shape)));
+    }
+    let dev = x.buf.device();
+    // SAFETY: device pointers of this device; sizes checked above; no row table and no gate: a plain add.
+    let rc = unsafe {
+        (dev.api.gate_add)(dev.ctx, x.buf.ptr(), x.dtype.kernel_code()?, (x.elements() / c.max(1)) as i64, c as i64, other.buf.ptr(),
+                           other.dtype.kernel_code()?, std::ptr::null(), std::ptr::null())
+    };
+    dev.check(rc)
+}
+
 /// `out = softmax(q . k^T / sqrt(dim)) . v` per head; out [tokens, heads * dim].
 pub fn attention(q: Rows, k: Rows, v: Rows, out: &Tensor) -> Result<()> {
     if q.layout() != k.layout() || q.layout() != v.layout() {

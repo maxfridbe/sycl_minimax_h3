@@ -89,14 +89,14 @@ pub struct Block {
 
 const LINEARS: [&str; 4] = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
 
-fn small(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
+pub(crate) fn small(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
     let e = ck.get(name)?;
     let v = bytes_to_f32(&ck.read(name)?, e.dtype)?;
     let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
     Tensor::from_bytes(dev, DType::F32, &[v.len()], &bytes)
 }
 
-fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn host(ck: &Checkpoint, name: &str) -> Result<Vec<f32>> {
     bytes_to_f32(&ck.read(name)?, ck.get(name)?.dtype)
 }
 
@@ -213,12 +213,12 @@ impl Step {
 
 /// The buffers a block writes between its kernels; one set serves every block.
 pub struct Scratch {
-    h: Tensor,
-    qkv: Tensor,
-    att: Tensor,
-    proj: Tensor,
-    fc1: Tensor,
-    act: Tensor,
+    pub(crate) h: Tensor,
+    pub(crate) qkv: Tensor,
+    pub(crate) att: Tensor,
+    pub(crate) proj: Tensor,
+    pub(crate) fc1: Tensor,
+    pub(crate) act: Tensor,
 }
 
 impl Scratch {

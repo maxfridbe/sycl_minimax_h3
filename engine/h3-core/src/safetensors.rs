@@ -117,3 +117,30 @@ pub struct Quant {
     pub convrot: bool,
     pub group: usize,
 }
+
+/// Writes float32 tensors (name -> shape, values) and string metadata as a `.safetensors` file.
+pub fn write_f32(path: &Path, tensors: &BTreeMap<String, (Vec<usize>, Vec<f32>)>, metadata: &BTreeMap<String, String>) -> Result<()> {
+    let mut header = serde_json::Map::new();
+    if !metadata.is_empty() {
+        header.insert("__metadata__".into(), serde_json::json!(metadata));
+    }
+    let mut offset = 0usize;
+    for (name, (shape, v)) in tensors {
+        if shape.iter().product::<usize>() != v.len() {
+            return Err(Error(format!("{name}: {} values for shape {shape:?}", v.len())));
+        }
+        header.insert(name.clone(), serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [offset, offset + v.len() * 4]}));
+        offset += v.len() * 4;
+    }
+    let mut h = serde_json::to_vec(&header).ctx("writing the header")?;
+    while h.len() % 8 != 0 {
+        h.push(b' ');
+    }
+    let mut out = Vec::with_capacity(8 + h.len() + offset);
+    out.extend_from_slice(&(h.len() as u64).to_le_bytes());
+    out.extend_from_slice(&h);
+    for (_, v) in tensors.values() {
+        out.extend(v.iter().flat_map(|f| f.to_le_bytes()));
+    }
+    std::fs::write(path, out).ctx(format!("writing {}", path.display()))
+}

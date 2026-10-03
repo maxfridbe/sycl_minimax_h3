@@ -567,7 +567,7 @@ impl Daemon {
                     return (409, json!({"error": "the daemon is shutting down"}));
                 }
                 if body.get("kind").and_then(|k| k.as_str()).is_none() {
-                    return (400, json!({"error": "a job needs a \"kind\" (bench-blocks, check-block)"}));
+                    return (400, json!({"error": "a job needs a \"kind\" (bench-blocks, check-block, denoise)"}));
                 }
                 if let Some(g) = body.get("gpu") {
                     let served: Vec<usize> = s.slots.iter().map(|sl| sl.gpu).collect();

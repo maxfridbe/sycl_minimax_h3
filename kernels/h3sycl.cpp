@@ -296,6 +296,11 @@ int h3s_read(void* ctx, void* dst_host, const void* src, uint64_t bytes) try {
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+int h3s_copy(void* ctx, void* dst, const void* src, uint64_t bytes) try {
+    static_cast<Ctx*>(ctx)->q.memcpy(dst, src, bytes);
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 int h3s_wait(void* ctx) try {
     static_cast<Ctx*>(ctx)->q.wait_and_throw();
     return 0;
