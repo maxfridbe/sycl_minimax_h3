@@ -20,19 +20,23 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | norm, scale+shift, gated residual add | PyTorch | `h3s_rms_norm_mod`, `h3s_gate_add` | done |
 | the 50 denoiser blocks, with their per-step tables and position rotations | ComfyUI `ldm/minimax/model.py` | `h3-core::dit` | done |
 | text projection + the 2 text refiner blocks | ComfyUI | `h3-core::denoiser::TextRefiner` (loaded per clip, freed) | done |
-| time embedding, patch embedding, final layer, token layout | ComfyUI | `h3-core::layout`, `h3-core::denoiser` | done (keyframes, reference media and masks: open) |
+| time embedding, patch embedding, final layer, token layout | ComfyUI | `h3-core::layout`, `h3-core::denoiser` | done |
+| keyframes: pictures, last latents, motion guides (multi-frame), audio keyframes, noise aug | ComfyUI (fl2va / AddGuide) | `denoiser::Conditions`, `jobs::clip_keyframes` | done: cosine 0.999 every step on a chained run |
+| reference audio (voice lock, `<Audio j>`) | ComfyUI (ref2va) | `layout::RefBlock`, `encode_presentation` | done; reference pictures need the TE's vision tower (absent from the 32B GGUF) |
+| masked regeneration / extension | ComfyUI inpainting + H3's scale_latent_inpaint | `denoiser::{Inpaint, sample_masked}` | done: kept parts within 5e-7 of the source |
 | sampler (Euler, simple schedule, the carried audio stream) | ComfyUI | `h3-core::denoiser::sample` | done: 8 steps 6.8 s vs 15.7 s, latents cosine 0.985 / 0.997 |
 | PyTorch-compatible starting noise | ComfyUI | `h3-core::noise` (mt19937 + PyTorch's 16-wide Box-Muller) | done: 83% bit-exact, the rest within 1 ulp |
 | LoRA on the int8 weights | ComfyUI (merged) | `h3-core::lora`: a side path `B (A x)` per touched linear (`h3s_linear_acc`) | done: +1.4 s over 8 steps at 16.8k tokens |
 | latent upscaler (3-D convolutions) | h3_upscaler.py | `h3-core::upscale`: oneDNN 3-D convolutions, `h3s_group_norm_silu`, `h3s_temporal_dwconv`, `h3s_trilinear` | done: cosine 0.99993, 2.4 s vs 5.2 s |
 | video decoder (a 36-block transformer over 16x16x4 patches, tiled) | ComfyUI `ldm/minimax/vae.py` | `h3-core::vae`, the denoiser's kernels + `h3s_layer_norm` | done: PSNR 72.6 dB; faster at small canvases, 0.8x at 1152x864 (tuning open) |
 | audio decoder (BigVGAN) | ComfyUI `ldm/minimax/audio_vae.py` | `h3-core::audio`: `h3s_conv1d`, `h3s_conv_transpose1d`, `h3s_aa_snake` | done: rel err 3e-5, 2.0 s vs 8.3 s |
-| keyframe / reference image encoders | ComfyUI | SYCL kernels + Rust graph | open |
+| video encoder (3-D causal CNN), audio encoder (DAC + attention head) | ComfyUI | `h3-core::venc`, `audio::AudioEncoder` | done: cosine 0.99999 (picture), 0.99994 (22 frames), audio rel err 1e-6 |
 | text encoder (Qwen3-VL 32B, 50 layers, Q4_K/Q6_K GGUF) | ComfyUI-GGUF | `h3-core::gguf` + `te`: streamed layer by layer, `h3s_dequant`, `h3s_attention_causal` | done: worst token cosine 0.999998, 16 s vs ~54 s |
 | tokenizer (text-to-video presentation: the raw prompt) | transformers `Qwen2Tokenizer` | `h3-core::tokenizer` | done: identical ids (picture/video prompts with vision blocks: open) |
 | mp4 writing | PyAV | ffmpeg subprocess from Rust (`h3d/media.rs`) | done |
-| job queue, HTTP API, LLM mode switching | `server.py` | `h3d daemon` + `sycl-h3` (Rust); `generate` jobs | engine side done; the front end's clip/project endpoints: open |
-| web front end | TSX + snabbdom | `wfe/` unchanged | done (needs the Rust server) |
+| job queue, HTTP API, LLM mode switching | `server.py` | `sycl-h3 serve` = the studio (`engine/sycl-h3/src/studio`) on the daemon | done, checked end to end beside the legacy server (docs/LEGACY-API.md) |
+| film tools (speech queue, scene runner, joiner, speech %) | `h3cli/tools/*.py` | `sycl-h3 speech / scene / join / speechpct` | done (data/borg/patter queues: superseded by speech and scene files) |
+| web front end | TSX + snabbdom | `wfe/` unchanged | done (served by the studio) |
 
 ## Order
 
