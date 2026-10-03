@@ -85,6 +85,21 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
  *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
  *
  * x, out [M, C]; weight float32 [C]; rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
+/* The latent upscaler's operations, on channels-last volumes [T, H, W, C] in a 16-bit type `dt`.
+ * conv3d: a k x k x k convolution (k odd, zero padding k / 2), w [Co, Ci, k, k, k] in dt (reordered once per buffer:
+ *   keep it alive and unchanged), bias float32 [Co] or NULL; out [T, H, W, Co].
+ * group_norm_silu: GroupNorm with G groups over [N, C], affine weight/bias float32 [C], then * (1 + scale) + shift
+ *   when scale/shift (float32 [C]) are given, then SiLU.
+ * temporal_dwconv: per channel along T, w float32 [C, K], zero padding K / 2; x, out [T, P, C].
+ * trilinear: resize to [To, Ho, Wo, C], align_corners=False. */
+int h3s_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
+               const float* bias, void* out);
+int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+                        float eps, const float* scale, const float* shift, void* out);
+int h3s_temporal_dwconv(void* ctx, const void* x, int dt, int64_t T, int64_t P, int64_t C, const float* w, int64_t K,
+                        const float* bias, void* out);
+int h3s_trilinear(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t To, int64_t Ho, int64_t Wo,
+                  void* out);
 /* The audio decoder's 1-D operations, float32, signals [B, C, L] row-major.
  * conv1d: w [Co, Ci, K], zero padding `pad` both sides; out [B, Co, Lo], Lo = (L + 2 pad - dil (K - 1) - 1) / stride + 1.
  * conv_transpose1d: w [Ci, Co, K]; out [B, Co, Lo], Lo = (L - 1) stride - 2 pad + K.

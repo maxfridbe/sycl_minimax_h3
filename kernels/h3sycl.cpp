@@ -117,6 +117,11 @@ struct Ctx {
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int>, dnnl::matmul> lin;          // (M, K, N, dt, bias)
     bool fused_ok = true;                          // oneDNN took the post-op form (else: int32 + our rescale kernel)
     bool rot_f32 = true;                           // oneDNN took a float32 result for the 16-bit rotation
+    // the upscaler's 3-D convolutions: a primitive per (T, H, W, Ci, Co, k), the weights reordered once per buffer
+    struct Conv3 { dnnl::convolution_forward prim; dnnl::convolution_forward::primitive_desc pd; };
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Conv3> conv3;
+    std::map<const void*, dnnl::memory> conv3_w;
+    float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
     // library refuses an allocation that would pass the cap instead of asking the driver
@@ -647,6 +652,130 @@ int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, c
             v = v * (1.0f + scale[m]) + shift[m];
         }
         store(out, out_dt, r * C + i, v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// ---- the latent upscaler: channels-last volumes [T, H, W, C], 16-bit
+
+int h3s_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
+               const float* bias, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (T <= 0 || H <= 0 || W <= 0) return 0;
+    using dnnl::memory;
+    const int64_t p = k / 2;
+    memory::desc smd({1, Ci, T, H, W}, ddt(dt), memory::format_tag::ndhwc);
+    memory::desc dmd({1, Co, T, H, W}, ddt(dt), memory::format_tag::ndhwc);
+    memory::desc wany({Co, Ci, k, k, k}, ddt(dt), memory::format_tag::any);
+    memory::desc bmd({Co}, memory::data_type::f32, memory::format_tag::a);
+    auto key = std::make_tuple(T, H, W, Ci, Co, k);
+    auto it = c.conv3.find(key);
+    if (it == c.conv3.end()) {
+        auto pd = dnnl::convolution_forward::primitive_desc(c.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct,
+                                                            smd, wany, bias ? bmd : memory::desc(), dmd, {1, 1, 1}, {p, p, p}, {p, p, p});
+        it = c.conv3.emplace(key, Ctx::Conv3{dnnl::convolution_forward(pd), pd}).first;
+    }
+    auto wit = c.conv3_w.find(w);
+    if (wit == c.conv3_w.end() || wit->second.get_desc() != it->second.pd.weights_desc()) {
+        memory::desc wmd({Co, Ci, k, k, k}, ddt(dt), memory::format_tag::oidhw);
+        memory wm(it->second.pd.weights_desc(), c.eng);
+        dnnl::reorder(usm(wmd, c.eng, w), wm).execute(c.strm, usm(wmd, c.eng, w), wm);
+        c.conv3_w[w] = wm;
+        wit = c.conv3_w.find(w);
+    }
+    std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, x)}, {DNNL_ARG_WEIGHTS, wit->second}, {DNNL_ARG_DST, usm(dmd, c.eng, out)}};
+    if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, c.eng, bias)});
+    it->second.prim.execute(c.strm, args);
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// GroupNorm over [N, C] (N voxels, channels last), G groups of C / G channels, statistics over every voxel of a
+// group; then the affine weight and bias, optionally * (1 + scale[c]) + shift[c], then SiLU.
+int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t N, int64_t C, int64_t G, const float* weight, const float* bias,
+                        float eps, const float* scale, const float* shift, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (N <= 0 || C <= 0) return 0;
+    const int64_t cg = C / G;
+    constexpr int64_t kParts = 256;               // partial sums per group
+    float* gs = c.grow(c.gn, c.gn_cap, (size_t) (G * kParts * 2 + G * 2));
+    if (!gs) return -1;
+    float* stat = gs + G * kParts * 2;
+    const int64_t per = (N + kParts - 1) / kParts;
+    c.q.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (G * kParts), 64), sycl::range<2>(1, 64)), [=](sycl::nd_item<2> it) {
+        const int64_t gp = it.get_global_id(0), g = gp / kParts, part = gp % kParts;
+        const int64_t lane = it.get_local_id(1);
+        float s = 0.0f, s2 = 0.0f;
+        const int64_t n0 = part * per, n1 = sycl::min(N, n0 + per);
+        for (int64_t n = n0; n < n1; ++n)
+            for (int64_t j = lane; j < cg; j += 64) {
+                const float v = load(x, dt, (size_t) (n * C + g * cg + j));
+                s += v; s2 += v * v;
+            }
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
+        if (lane == 0) { gs[gp * 2] = s; gs[gp * 2 + 1] = s2; }
+    });
+    c.q.parallel_for(sycl::range<1>((size_t) G), [=](sycl::id<1> g) {
+        float s = 0.0f, s2 = 0.0f;
+        for (int64_t p = 0; p < kParts; ++p) { s += gs[(g * kParts + p) * 2]; s2 += gs[(g * kParts + p) * 2 + 1]; }
+        const float cnt = (float) N * (float) cg, mean = s / cnt, var = sycl::fmax(s2 / cnt - mean * mean, 0.0f);
+        stat[g * 2] = mean;
+        stat[g * 2 + 1] = sycl::rsqrt(var + eps);
+    });
+    c.q.parallel_for(sycl::range<2>((size_t) N, (size_t) C), [=](sycl::id<2> id) {
+        const size_t n = id[0], ch = id[1], i = n * C + ch;
+        const int64_t g = ch / cg;
+        float v = (load(x, dt, i) - stat[g * 2]) * stat[g * 2 + 1] * weight[ch] + bias[ch];
+        if (scale) v = v * (1.0f + scale[ch]) + shift[ch];
+        store(out, dt, i, v / (1.0f + sycl::exp(-v)));
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// depthwise convolution along T only (kernel K, zero padding K / 2), x and out [T, P, C], w [C, K] float32
+int h3s_temporal_dwconv(void* ctx, const void* x, int dt, int64_t T, int64_t P, int64_t C, const float* w, int64_t K,
+                        const float* bias, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (T <= 0 || P <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<3>((size_t) T, (size_t) P, (size_t) C), [=](sycl::id<3> id) {
+        const int64_t t = id[0], p = id[1], ch = id[2];
+        float acc = bias ? bias[ch] : 0.0f;
+        for (int64_t k = 0; k < K; ++k) {
+            const int64_t ts = t + k - K / 2;
+            if (ts >= 0 && ts < T) acc += w[ch * K + k] * load(x, dt, (size_t) ((ts * P + p) * C + ch));
+        }
+        store(out, dt, (size_t) ((t * P + p) * C + ch), acc);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// trilinear resize of [T, H, W, C] to [To, Ho, Wo, C] (PyTorch's align_corners=False)
+int h3s_trilinear(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t To, int64_t Ho, int64_t Wo,
+                  void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (To <= 0 || Ho <= 0 || Wo <= 0 || C <= 0) return 0;
+    const float st = (float) T / (float) To, sh = (float) H / (float) Ho, sw = (float) W / (float) Wo;
+    c.q.parallel_for(sycl::range<2>((size_t) (To * Ho * Wo), (size_t) C), [=](sycl::id<2> id) {
+        const int64_t o = id[0], ch = id[1];
+        const int64_t ot = o / (Ho * Wo), oh = (o / Wo) % Ho, ow = o % Wo;
+        auto src = [](int64_t d, float scale, int64_t in, int64_t& i0, int64_t& i1, float& l) {
+            float s = ((float) d + 0.5f) * scale - 0.5f;
+            if (s < 0.0f) s = 0.0f;
+            i0 = (int64_t) s;
+            if (i0 > in - 1) i0 = in - 1;
+            i1 = i0 < in - 1 ? i0 + 1 : i0;
+            l = s - (float) i0;
+        };
+        int64_t t0, t1, h0, h1, w0, w1;
+        float lt, lh, lw;
+        src(ot, st, T, t0, t1, lt);
+        src(oh, sh, H, h0, h1, lh);
+        src(ow, sw, W, w0, w1, lw);
+        auto v = [&](int64_t t, int64_t h, int64_t w) { return load(x, dt, (size_t) (((t * H + h) * W + w) * C + ch)); };
+        const float a = (1 - lw) * v(t0, h0, w0) + lw * v(t0, h0, w1), b = (1 - lw) * v(t0, h1, w0) + lw * v(t0, h1, w1);
+        const float cc = (1 - lw) * v(t1, h0, w0) + lw * v(t1, h0, w1), d = (1 - lw) * v(t1, h1, w0) + lw * v(t1, h1, w1);
+        const float r = (1 - lt) * ((1 - lh) * a + lh * b) + lt * ((1 - lh) * cc + lh * d);
+        store(out, dt, (size_t) (o * C + ch), r);
     });
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
