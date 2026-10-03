@@ -1,23 +1,20 @@
-//! `h3` - MiniMax H3 on an Intel Arc GPU.
+//! `h3d` - the MiniMax H3 engine, inside its container. Not the command a person types: `h3-sycl` (on the host)
+//! starts `h3d daemon` in a container and talks to it over a Unix socket; the daemon starts `h3d worker` per GPU.
 //!
-//!     h3 version                              yy.mmdd.###
-//!     h3 device                               the GPU the kernels found, and its memory cap
-//!     h3 info <checkpoint.safetensors>        what is in a checkpoint
-//!     h3 load <checkpoint> [--threads 8]      load it onto the GPU, timed
-//!     h3 check-linear <checkpoint> [--block 0] [--rows 64] [--bench-rows 16384]
-//!                                             a block's int8 linears: the GPU against the CPU reference, and timed
-//!     h3 check-block <checkpoint> <dump> [--blocks N]
-//!                                             the denoiser.s blocks against a dump of the reference pipeline
-//!     h3 bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
-//!                                             what a denoiser step costs at a sequence length, stage by stage
+//!     h3d daemon --socket <path> --model <checkpoint> [--all | --gpu N ...] [--idle 600]
+//!                [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
+//!                                              the engine service (daemon.rs)
+//!     h3d worker --gpu N --model <checkpoint>  the process that holds one GPU (worker.rs); the daemon starts it
+//!     h3d gpus [--json]                        the GPUs, numbered as --gpu takes them
 //!
-//!     h3 serve --model <checkpoint> ...       the engine as a resident daemon (daemon.rs)
-//!     h3 status | jobs ps|add|stop|rem|details | unload | shutdown
-//!                                             its client (client.rs)
+//! and, for development, one-shot checks that load, run and exit (run.sh runs them in the container):
+//!
+//!     h3d version | device | info <checkpoint> | load <checkpoint> [--threads 8]
+//!     h3d check-linear <checkpoint> [--block 0] [--rows 64] [--bench-rows 16384]
+//!     h3d check-block <checkpoint> <dump> [--blocks N]
+//!     h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]
 
-mod client;
 mod daemon;
-mod http;
 mod jobs;
 mod signals;
 mod worker;
@@ -41,28 +38,15 @@ pub(crate) fn version() -> String {
     format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
 }
 
-const USAGE: &str = "usage:
-  h3 version
-  h3 device
-  h3 info <checkpoint.safetensors>
-  h3 load <checkpoint.safetensors> [--threads 8]
-  h3 check-linear <checkpoint.safetensors> [--block 0] [--rows 64] [--bench-rows 16384]
-  h3 check-block <checkpoint.safetensors> <dump.safetensors> [--blocks N] [--threads 8]
-  h3 bench-blocks <checkpoint.safetensors> [--tokens 16500] [--blocks N]
-
-the engine as a resident daemon (the model stays loaded between jobs):
-  h3 gpus [--json]                                    the GPUs, numbered as --gpu takes them
-  h3 serve --model <checkpoint.safetensors> [--all | --gpu N ...] [--bind 127.0.0.1] [--port 8095] [--idle 600]
-           (or --listen ADDR:PORT in place of --bind/--port)
-           [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
-           [--ui <dist/wfe>] [--legacy-api <url>]      the web front end on the same port
-  h3 status [--no-stream]                             the engine, live (like docker stats)
-  h3 jobs ps [-a]                                     queued and running jobs (-a: all)
-  h3 jobs add <kind> [--name value ...] [-f]          queue a job (-f: follow its log); kinds:
-                                                      bench-blocks (--tokens N --blocks N), check-block (--dump <file>)
-  h3 jobs stop <id>... | rem <id>... | details <id>
-  h3 unload | shutdown
-  (the client finds the daemon at $H3_DAEMON, default 127.0.0.1:8095)";
+const USAGE: &str = "usage (the daemon side; people use h3-sycl on the host):
+  h3d daemon --socket <path> --model <checkpoint.safetensors> [--all | --gpu N ...] [--idle 600]
+             [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
+  h3d worker --gpu N --model <checkpoint.safetensors>
+  h3d gpus [--json]
+  h3d version | device | info <checkpoint> | load <checkpoint> [--threads 8]
+  h3d check-linear <checkpoint> [--block 0] [--rows 64] [--bench-rows 16384]
+  h3d check-block <checkpoint> <dump.safetensors> [--blocks N] [--threads 8]
+  h3d bench-blocks <checkpoint> [--tokens 16500] [--blocks N]";
 
 /// `--name value` options after the positional arguments.
 struct Args {
@@ -252,7 +236,7 @@ fn cmd_bench_blocks(args: &Args) -> Result<()> {
     jobs::bench_blocks(&e, args.number("tokens", 16500)?, None, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
-/// `h3 gpus [--json]`: the GPUs the runtime sees, numbered as `--gpu` takes them.
+/// `h3d gpus [--json]`: the GPUs the runtime sees, numbered as `--gpu` takes them.
 fn cmd_gpus(args: &Args) -> Result<()> {
     let list = h3_core::device::Device::list()?;
     if args.positional.iter().any(|a| a == "--json") || args.options.contains_key("json") {
@@ -277,7 +261,7 @@ fn take_repeated(raw: &[String], name: &str) -> Result<(Vec<usize>, Vec<String>)
     while let Some(a) = it.next() {
         if a == name {
             let v = it.next().ok_or_else(|| Error(format!("{name} needs a GPU number")))?;
-            vals.push(v.parse().map_err(|_| Error(format!("{name} {v}: not a GPU number (see `h3 gpus`)")))?);
+            vals.push(v.parse().map_err(|_| Error(format!("{name} {v}: not a GPU number (see `h3-sycl gpus`)")))?);
         } else {
             rest.push(a.clone());
         }
@@ -285,7 +269,7 @@ fn take_repeated(raw: &[String], name: &str) -> Result<(Vec<usize>, Vec<String>)
     Ok((vals, rest))
 }
 
-fn cmd_serve(raw: &[String]) -> Result<()> {
+fn cmd_daemon(raw: &[String]) -> Result<()> {
     let (gpus, raw) = take_repeated(raw, "--gpu")?;
     let (shared, raw) = take_repeated(&raw, "--shared-gpu")?;
     let all = raw.iter().any(|a| a == "--all");
@@ -294,10 +278,11 @@ fn cmd_serve(raw: &[String]) -> Result<()> {
         return Err(Error("give --all or --gpu N ..., not both".into()));
     }
     let args = &Args::parse(&raw)?;
-    let model = args.options.get("model").ok_or("serve needs --model <checkpoint.safetensors>")?;
+    let model = args.options.get("model").ok_or("daemon needs --model <checkpoint.safetensors>")?;
+    let socket = args.options.get("socket").ok_or("daemon needs --socket <path>")?;
     let idle = args.number("idle", 600)?;
     daemon::serve(daemon::Options {
-        listen: listen_addr(args)?,
+        socket: socket.into(),
         model: model.into(),
         idle: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
         gpu_lock: args.options.get("gpu-lock").map(Into::into),
@@ -305,26 +290,7 @@ fn cmd_serve(raw: &[String]) -> Result<()> {
         threads: args.number("threads", 8)?,
         gpus: (!gpus.is_empty()).then_some(gpus),
         shared_gpus: (!shared.is_empty()).then_some(shared),
-        ui: args.options.get("ui").map(Into::into),
-        legacy_api: args.options.get("legacy-api").cloned(),
     })
-}
-
-/// Where `h3 serve` listens: `--listen ADDR:PORT`, or `--bind ADDR` and `--port N` (each optional: 127.0.0.1, 8095).
-fn listen_addr(args: &Args) -> Result<String> {
-    if let Some(l) = args.options.get("listen") {
-        if args.options.contains_key("bind") || args.options.contains_key("port") {
-            return Err(Error("give --listen ADDR:PORT, or --bind / --port, not both".into()));
-        }
-        return Ok(l.clone());
-    }
-    let bind = args.options.get("bind").map_or("127.0.0.1", |b| b.as_str());
-    let port = args.number("port", 8095)?;
-    if port == 0 || port > 65535 {
-        return Err(Error(format!("--port {port}: not a port")));
-    }
-    // an IPv6 address needs brackets before the port
-    Ok(if bind.contains(':') && !bind.starts_with('[') { format!("[{bind}]:{port}") } else { format!("{bind}:{port}") })
 }
 
 fn run() -> Result<()> {
@@ -333,10 +299,10 @@ fn run() -> Result<()> {
         return Err(Error(USAGE.into()));
     };
     // the client commands parse their own arguments (flags like -a, -f, --no-stream)
-    let args = if matches!(cmd.as_str(), "status" | "jobs" | "serve" | "gpus") { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
+    let args = if matches!(cmd.as_str(), "daemon" | "gpus") { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
     match cmd.as_str() {
         "version" | "--version" | "-V" => {
-            println!("h3 {}", version());
+            println!("h3d {}", version());
             Ok(())
         }
         "device" => cmd_device(),
@@ -345,13 +311,20 @@ fn run() -> Result<()> {
         "check-linear" => cmd_check_linear(&args),
         "check-block" => cmd_check_block(&args),
         "bench-blocks" => cmd_bench_blocks(&args),
-        "serve" => cmd_serve(&raw[1..]),
+        "daemon" => cmd_daemon(&raw[1..]),
         "gpus" => cmd_gpus(&Args { positional: raw[1..].to_vec(), options: BTreeMap::new() }),
         "worker" => worker::run(args.number("gpu", 0)?, args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),
-        "status" => client::status(&raw[1..]),
-        "jobs" => client::jobs(&raw[1..]),
-        "unload" | "shutdown" => client::simple(cmd),
         _ => Err(Error(USAGE.into())),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("h3d: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -360,15 +333,5 @@ mod tests {
     #[test]
     fn version_matches_the_version_file() {
         assert_eq!(super::version(), include_str!("../../../VERSION").trim());
-    }
-}
-
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("h3: {e}");
-            ExitCode::FAILURE
-        }
     }
 }

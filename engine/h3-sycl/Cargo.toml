@@ -1,0 +1,9 @@
+[package]
+name = "h3-sycl"
+description = "MiniMax H3 on an Intel Arc GPU: the command line on the host (starts the services, talks to them over a Unix socket)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+h3-http = { path = "../h3-http" }
+serde_json = "1"

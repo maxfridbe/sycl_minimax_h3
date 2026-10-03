@@ -1,5 +1,5 @@
-//! What the engine can be asked to do, written once for both ways of asking: the one-shot commands (`h3 bench-blocks
-//! ...`, which load, run and exit) and the daemon (`h3 serve`, which keeps the model loaded between jobs).
+//! What the engine can be asked to do, written once for both ways of asking: the one-shot commands (`h3d bench-blocks
+//! ...`, which load, run and exit) and the daemon (`h3d daemon`, which keeps the model loaded between jobs).
 //!
 //! A job reports through a log callback and looks at a cancel flag between blocks - never inside one: a GPU process
 //! stopped in the middle of a kernel can leave the xe driver stuck.

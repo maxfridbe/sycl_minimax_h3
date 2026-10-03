@@ -1,0 +1,10 @@
+[package]
+name = "h3d"
+description = "MiniMax H3 on an Intel Arc GPU: the engine side (daemon, per-GPU worker, checks), run in the container"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+h3-core = { path = "../h3-core" }
+serde_json = "1"
+h3-http = { path = "../h3-http" }

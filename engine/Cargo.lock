@@ -3,14 +3,6 @@
 version = 4
 
 [[package]]
-name = "h3"
-version = "26.1002.1"
-dependencies = [
- "h3-core",
- "serde_json",
-]
-
-[[package]]
 name = "h3-core"
 version = "26.1002.1"
 dependencies = [
@@ -19,8 +11,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3-http"
+version = "26.1002.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "h3-sycl"
+version = "26.1002.1"
+dependencies = [
+ "h3-http",
+ "serde_json",
+]
+
+[[package]]
 name = "h3-sys"
 version = "26.1002.1"
+
+[[package]]
+name = "h3d"
+version = "26.1002.1"
+dependencies = [
+ "h3-core",
+ "h3-http",
+ "serde_json",
+]
 
 [[package]]
 name = "itoa"

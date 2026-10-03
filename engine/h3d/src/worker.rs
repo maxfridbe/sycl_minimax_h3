@@ -1,4 +1,4 @@
-//! `h3 worker --gpu N`: the process that holds GPU N (one of `h3 gpus`). `h3 serve` starts it when a job needs the engine and lets it end
+//! `h3d worker --gpu N`: the process that holds GPU N (one of `h3 gpus`). `h3d daemon` starts it when a job needs the engine and lets it end
 //! when the engine is to be unloaded, so the GPU's memory goes back when the process exits - whatever state the
 //! driver was in - and a fault in a kernel takes down this process, not the daemon or the front end.
 //!

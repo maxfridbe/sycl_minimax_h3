@@ -1,20 +1,28 @@
-//! `h3 serve`: the engine as a resident service. This process - the daemon - serves the web front end and the API,
-//! keeps the job queue, and never opens a GPU. Each GPU it was given (`--all`, the default, or `--gpu N` for each) is
-//! a slot with its own engine process, `h3 worker --gpu N` (worker.rs), which the daemon starts when a job needs that
-//! GPU: it loads the model and keeps it for the next jobs. The daemon ends it when told to (`unload`, `shutdown`) or
-//! after a while without jobs, so a GPU shared with other programs is not held for nothing - and the memory comes back
-//! with the process, whatever state the driver was in. A crash in an engine ends that worker, not the front end: the
-//! job is marked failed and the next one starts a fresh worker.
+//! `h3d daemon`: the engine service, in its container. It keeps the job queue and answers the engine's API on a Unix
+//! socket; it never opens a GPU. Each GPU it was given (`--all`, the default, or `--gpu N` for each) is a slot with its
+//! own engine process, `h3d worker --gpu N` (worker.rs), which the daemon starts when a job needs that GPU: it loads
+//! the model and keeps it for the next jobs. The daemon ends it when told to (`unload`, `shutdown`) or after a while
+//! without jobs, so a GPU shared with other programs is not held for nothing - and the memory comes back with the
+//! process, whatever state the driver was in. A crash in an engine ends that worker, not the daemon: the job is marked
+//! failed and the next one starts a fresh worker.
+//!
+//! Three kinds of process, two kinds of IPC:
+//!
+//! ```text
+//!   h3-sycl (the command line, on the host) --.
+//!                                             +-- HTTP/JSON over the Unix socket --> h3d daemon --pipes--> h3d worker (GPU N)
+//!   h3-sycl web service (its own container) --'                                               (JSON lines)
+//! ```
 //!
 //! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came; a job that names a GPU
 //! (`"gpu": 1`) waits for that one. A job can be cancelled; it stops at the next block boundary, never inside a kernel
 //! (a GPU process stopped mid-kernel can leave the xe driver stuck).
 //!
-//! The same port serves the web front end (wfe/, built into dist/wfe) at `/`, and the engine's API (JSON) under
-//! `/engine`:
+//! The API (JSON over HTTP on the socket):
 //!
 //! ```text
 //!   GET  /engine/status              every GPU slot (engine state, process, memory, busy, its job), the queue
+//!   GET  /engine/gpus                the GPUs there are (served or not)
 //!   GET  /engine/jobs                every job, newest first, without logs
 //!   GET  /engine/jobs/<id>           one job with its log and result
 //!   POST /engine/jobs                {"kind": "bench-blocks", ..., "gpu": 1 (optional)}  ->  {"id": 3}
@@ -24,11 +32,6 @@
 //!   POST /engine/shutdown            cancel the queue, finish or cancel the running jobs, unload, exit
 //! ```
 //!
-//! The front end also calls the API of the clip-production server it was written for (`/api/...`, `/rpc/...`:
-//! the clip queue, projects, scenes, films, the LLM switch). Until each of those is ported here, a request the daemon
-//! does not handle itself is passed on, byte for byte, to that server (`--legacy-api`), so the front end keeps
-//! working whole while its pieces move over.
-//!
 //! On a GPU that another program normally holds (`--shared-gpu N`; by default every GPU counts as shared when the
 //! hooks are given), two hooks make the daemon share it politely before loading: a lock file (wait until it is free,
 //! then hold it while an engine on a shared GPU is loaded) and a front end's model switcher (ask the model it serves to
@@ -37,7 +40,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,12 +48,12 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use h3_core::{Error, Result};
+use h3_http as http;
 use serde_json::{json, Value};
 
-use crate::http;
-
 pub struct Options {
-    pub listen: String,
+    /// The Unix socket the API answers on.
+    pub socket: PathBuf,
     pub model: PathBuf,
     /// The GPUs to serve (indices of `h3 gpus`); `None`: every one there is.
     pub gpus: Option<Vec<usize>>,
@@ -64,10 +67,6 @@ pub struct Options {
     /// to stop before loading and restored after unloading.
     pub llm_switcher: Option<String>,
     pub threads: usize,
-    /// The built web front end (dist/wfe), served at `/`.
-    pub ui: Option<PathBuf>,
-    /// The legacy front-end server (`http://host:port`) that answers what is not ported yet.
-    pub legacy_api: Option<String>,
 }
 
 /// An engine process and its event stream.
@@ -151,6 +150,8 @@ struct Hooks {
 
 struct Daemon {
     opts: Options,
+    /// the GPUs `h3d gpus` found at start
+    found: Vec<Value>,
     s: Mutex<Shared>,
     cv: Condvar,
     hooks: Mutex<Hooks>,
@@ -210,11 +211,11 @@ impl Daemon {
     /// Asks the front end's model to stop; returns the mode to restore later.
     fn switch_llm_off(&self) -> Result<Option<String>> {
         let Some(url) = &self.opts.llm_switcher else { return Ok(None) };
-        let (host, path) = http::split_url(url)?;
-        let cur = http::call(&host, "POST", &path, Some(&json!({})))?;
+        let (host, path) = http::split_url(url).map_err(|e| Error(e.0))?;
+        let cur = http::call(&http::Target::Tcp(host.clone()), "POST", &path, Some(&json!({}))).map_err(|e| Error(e.0))?;
         let mode = cur.pointer("/result/mode").and_then(|m| m.as_str()).unwrap_or("none").to_string();
         if mode != "none" {
-            http::call(&host, "POST", &path, Some(&json!({"mode": "none"})))?;
+            http::call(&http::Target::Tcp(host), "POST", &path, Some(&json!({"mode": "none"}))).map_err(|e| Error(e.0))?;
         }
         Ok(Some(mode))
     }
@@ -224,7 +225,7 @@ impl Daemon {
         if mode == "none" {
             return;
         }
-        match http::split_url(url).and_then(|(h, p)| http::call(&h, "POST", &p, Some(&json!({"mode": mode})))) {
+        match http::split_url(url).and_then(|(h, p)| http::call(&http::Target::Tcp(h), "POST", &p, Some(&json!({"mode": mode})))) {
             Ok(_) => eprintln!("[daemon] the front end's model {mode:?} restored"),
             Err(e) => eprintln!("[daemon] could not restore the front end's model {mode:?}: {e}"),
         }
@@ -482,6 +483,9 @@ impl Daemon {
                     match outcome {
                         Ok(v) => {
                             j.state = "done";
+                            if let Some((_, t)) = j.progress {
+                                j.progress = Some((t, t)); // the last report is the start of the last step
+                            }
                             j.result = Some(v);
                         }
                         Err(e) => {
@@ -498,42 +502,14 @@ impl Daemon {
         }
     }
 
-    /// Everything that arrives on the port: the engine's API, the front end's files, or the pass-through.
-    fn route(&self, stream: &std::net::TcpStream, req: http::Request) -> Result<()> {
-        let path = req.path.clone();
-        if let Some(rest) = path.strip_prefix("/engine/") {
-            let (status, body) = match req.json() {
-                Ok(v) => self.handle(&req.method, rest, v),
-                Err(e) => (400, json!({"error": e.0})),
-            };
-            return http::respond(stream, status, &body);
-        }
-        if let Some(ui) = &self.opts.ui {
-            if req.method == "GET" && (path == "/" || path == "/index.html") {
-                // the page carries its style sheet inline (the legacy server's layout of the same build)
-                let html = std::fs::read_to_string(ui.join("index.html"))?;
-                let css = std::fs::read_to_string(ui.join("style.css")).unwrap_or_default();
-                return http::respond_bytes(stream, 200, "text/html; charset=utf-8", html.replace("__CSS__", &css).as_bytes());
-            }
-            if let Some(rel) = path.strip_prefix("/ui/") {
-                if req.method == "GET" && !rel.split('/').any(|c| c == ".." || c.is_empty()) {
-                    return match std::fs::read(ui.join(rel)) {
-                        Ok(b) => http::respond_bytes(stream, 200, http::content_type(rel), &b),
-                        Err(_) => http::respond(stream, 404, &json!({"error": format!("no front-end file {rel}")})),
-                    };
-                }
-            }
-        }
-        match &self.opts.legacy_api {
-            Some(url) => {
-                let (host, _) = http::split_url(url)?;
-                if let Err(e) = http::forward(stream, &host, &req) {
-                    let _ = http::respond(stream, 502, &json!({"error": e.0}));
-                }
-                Ok(())
-            }
-            None => http::respond(stream, 404, &json!({"error": format!("no route {} {}", req.method, path)})),
-        }
+    /// One request on the socket.
+    fn route(&self, stream: &std::os::unix::net::UnixStream, req: http::Request) -> Result<()> {
+        let (status, body) = match (req.path.strip_prefix("/engine/"), req.json()) {
+            (Some(rest), Ok(v)) => self.handle(&req.method, rest, v),
+            (None, _) => (404, json!({"error": format!("no route {} {}", req.method, req.path)})),
+            (_, Err(e)) => (400, json!({"error": e.0})),
+        };
+        http::respond(stream, status, &body).map_err(|e| Error(e.0))
     }
 
     fn handle(&self, method: &str, path: &str, body: Value) -> (u16, Value) {
@@ -567,6 +543,19 @@ impl Daemon {
                 (200, json!({"version": crate::version(), "model": self.opts.model, "gpus": gpus,
                              "queued": s.queue.iter().collect::<Vec<_>>(),
                              "unload_after_idle_seconds": self.opts.idle.map(|d| d.as_secs())}))
+            }
+            ("GET", ["gpus"]) => {
+                let served: Vec<usize> = s.slots.iter().map(|sl| sl.gpu).collect();
+                let list: Vec<Value> = self
+                    .found
+                    .iter()
+                    .map(|g| {
+                        let mut g = g.clone();
+                        g["served"] = json!(g["index"].as_u64().is_some_and(|i| served.contains(&(i as usize))));
+                        g
+                    })
+                    .collect();
+                (200, json!(list))
             }
             ("GET", ["jobs"]) => (200, json!(s.jobs.values().rev().map(JobRec::summary).collect::<Vec<_>>())),
             ("GET", ["jobs", id]) => match id.parse::<u64>().ok().and_then(|i| s.jobs.get(&i)) {
@@ -657,13 +646,13 @@ impl Daemon {
     }
 }
 
-/// The GPUs there are, asked of a short-lived `h3 gpus --json` (the daemon itself does not start the GPU runtime).
+/// The GPUs there are, asked of a short-lived `h3d gpus --json` (the daemon itself does not start the GPU runtime).
 fn list_gpus() -> Result<Vec<Value>> {
     let out = Command::new(std::env::current_exe()?).args(["gpus", "--json"]).stderr(Stdio::inherit()).output()?;
     if !out.status.success() {
-        return Err(Error("cannot list the GPUs".into()));
+        return Err(Error("cannot list the GPUs (h3d gpus failed)".into()));
     }
-    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| Error(format!("h3 gpus: {e}")))?;
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| Error(format!("h3d gpus: {e}")))?;
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
@@ -686,7 +675,7 @@ pub fn serve(opts: Options) -> Result<()> {
     let mut slots = Vec::new();
     for g in &indices {
         let Some(info) = found.iter().find(|f| f["index"].as_u64() == Some(*g as u64)) else {
-            return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `h3 gpus`)", found.len())));
+            return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `h3-sycl gpus`)", found.len())));
         };
         let shared = hooks && opts.shared_gpus.as_ref().is_none_or(|s| s.contains(g));
         slots.push(Slot {
@@ -705,23 +694,26 @@ pub fn serve(opts: Options) -> Result<()> {
             busy_sample: None,
         });
     }
-    let listener = TcpListener::bind(&opts.listen).map_err(|e| Error(format!("cannot listen on {}: {e}", opts.listen)))?;
-    eprintln!("h3 {} serving on {} - model {} (loaded on the first job){}", crate::version(), opts.listen, opts.model.display(),
+    // a socket left by a daemon that did not end cleanly would make bind fail; one that answers means another daemon
+    if opts.socket.exists() {
+        if std::os::unix::net::UnixStream::connect(&opts.socket).is_ok() {
+            return Err(Error(format!("{}: another daemon answers there", opts.socket.display())));
+        }
+        std::fs::remove_file(&opts.socket)?;
+    }
+    let listener = UnixListener::bind(&opts.socket).map_err(|e| Error(format!("cannot listen on {}: {e}", opts.socket.display())))?;
+    eprintln!("h3d {} on {} - model {} (loaded on the first job){}", crate::version(), opts.socket.display(), opts.model.display(),
               opts.idle.map_or(String::new(), |d| format!(", unloaded after {} s idle", d.as_secs())));
     for sl in &slots {
         eprintln!("  GPU {}: {} ({:.0} GiB{}){}", sl.gpu, sl.name, sl.mem_gib,
                   if sl.pci.is_empty() { String::new() } else { format!(", {}", sl.pci) },
                   if sl.shared { " - shared: lock file / model switch before loading" } else { "" });
     }
-    if let Some(ui) = &opts.ui {
-        eprintln!("  web front end: {} at http://{}/", ui.display(), opts.listen);
-    }
-    if let Some(l) = &opts.legacy_api {
-        eprintln!("  not yet ported front-end calls go to {l}");
-    }
     let n = slots.len();
+    let socket = opts.socket.clone();
     let d = Arc::new(Daemon {
         opts,
+        found,
         s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, shutdown: false, slots }),
         cv: Condvar::new(),
         hooks: Mutex::new(Hooks::default()),
@@ -775,6 +767,7 @@ pub fn serve(opts: Options) -> Result<()> {
     for t in threads {
         let _ = t.join();
     }
+    let _ = std::fs::remove_file(&socket);
     eprintln!("[daemon] stopped");
     Ok(())
 }

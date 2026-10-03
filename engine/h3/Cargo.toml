@@ -1,9 +1,0 @@
-[package]
-name = "h3"
-description = "MiniMax H3 on an Intel Arc GPU: the command line"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-h3-core = { path = "../h3-core" }
-serde_json = "1"

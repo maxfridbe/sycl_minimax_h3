@@ -59,7 +59,7 @@ jobs:
         run: |
           name="h3-engine-$(cat VERSION)-linux-x86_64"
           mkdir -p "pkg/$name"
-          cp -r dist/h3 dist/libh3sycl.so dist/libdnnl.so.3 dist/wfe kernels/h3sycl.h README.md VERSION "pkg/$name/"
+          cp -r dist/h3-sycl dist/h3d dist/libh3sycl.so dist/libdnnl.so.3 dist/wfe kernels/h3sycl.h README.md VERSION "pkg/$name/"
           tar -C pkg -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "PKG=$name.tar.gz" >> "$GITHUB_ENV"

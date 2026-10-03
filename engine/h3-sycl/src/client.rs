@@ -1,35 +1,46 @@
-//! The daemon's command-line client.
+//! Talking to the daemon over its socket: the status view and the job commands.
 //!
-//!     h3 status [--no-stream]          the engine, live (like `docker stats`): state, the engine process, the GPU,
+//!     h3-sycl status [--no-stream]          the engine, live (like `docker stats`): state, the engine process, the GPU,
 //!                                      the job running, the queue; --no-stream: once
-//!     h3 jobs ps [-a]                  queued and running jobs (-a: every job the daemon remembers)
-//!     h3 jobs add <kind> [--name value ...] [-f]
+//!     h3-sycl jobs ps [-a]                  queued and running jobs (-a: every job the daemon remembers)
+//!     h3-sycl jobs add <kind> [--name value ...] [-f]
 //!                                      queue a job; -f: follow its log until it ends
-//!     h3 jobs stop <id>...             cancel: a queued job is dropped, a running one stops at its next block boundary
-//!     h3 jobs rem <id>...              forget finished or queued jobs
-//!     h3 jobs details <id>             everything about one job: its request, progress, log, result
-//!     h3 unload | shutdown
+//!     h3-sycl jobs stop <id>...             cancel: a queued job is dropped, a running one stops at its next block boundary
+//!     h3-sycl jobs rem <id>...              forget finished or queued jobs
+//!     h3-sycl jobs details <id>             everything about one job: its request, progress, log, result
+//!     h3-sycl unload [--gpu N]
 //!
-//! The daemon is found at `$H3_DAEMON` (default 127.0.0.1:8095).
+//! The daemon answers on a Unix socket (see config.rs); `main` sets where.
 
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use h3_core::{Error, Result};
+use std::sync::OnceLock;
+
+use h3_http::{self as http, Error, Result, Target};
 use serde_json::{json, Value};
 
-use crate::http;
+/// The daemon's socket; set once by `main`.
+pub static DAEMON: OnceLock<Target> = OnceLock::new();
 
-fn addr() -> String {
-    std::env::var("H3_DAEMON").unwrap_or_else(|_| "127.0.0.1:8095".into())
+fn target() -> &'static Target {
+    DAEMON.get().expect("the daemon's socket is set before any call")
 }
 
-fn get(path: &str) -> Result<Value> {
-    http::call(&addr(), "GET", path, None)
+pub fn get(path: &str) -> Result<Value> {
+    http::call(target(), "GET", path, None).map_err(not_running)
 }
 
-fn post(path: &str, body: Option<&Value>) -> Result<Value> {
-    http::call(&addr(), "POST", path, body)
+pub fn post(path: &str, body: Option<&Value>) -> Result<Value> {
+    http::call(target(), "POST", path, body).map_err(not_running)
+}
+
+fn not_running(e: Error) -> Error {
+    if e.0.starts_with("nothing answers") {
+        Error("the engine is not running: h3-sycl start".into())
+    } else {
+        e
+    }
 }
 
 fn now() -> f64 {
@@ -96,13 +107,15 @@ fn status_table(st: &Value) -> String {
     out + &notes + &format!("queued: {queued}\n")
 }
 
-/// `h3 status [--no-stream]`
-pub fn status(raw: &[String]) -> Result<()> {
+/// `h3-sycl status [--no-stream]`; `extra` adds lines under the table (the web service's state).
+pub fn status(raw: &[String], extra: &dyn Fn() -> String) -> Result<()> {
     let once = raw.iter().any(|a| a == "--no-stream");
     let tty = std::io::stdout().is_terminal();
     loop {
-        let st = get("/engine/status")?;
-        let table = status_table(&st);
+        let table = match get("/engine/status") {
+            Ok(st) => status_table(&st),
+            Err(e) => format!("engine: {e}\n"),
+        } + &extra();
         let mut out = std::io::stdout().lock();
         if once {
             write!(out, "{table}")?;
@@ -133,7 +146,7 @@ fn jobs_table(list: &[Value]) -> String {
         let last: String = last.chars().take(60).collect();
         out += &format!(
             "{:<5} {:<14} {:<10} {:>4} {:>9} {:>9} {:>9}  {}\n",
-            j["id"],
+            j["id"].to_string(),
             j["kind"].as_str().unwrap_or("?"),
             j["state"].as_str().unwrap_or("?"),
             j["gpu"].as_u64().map_or("-".into(), |g| g.to_string()),
@@ -146,14 +159,14 @@ fn jobs_table(list: &[Value]) -> String {
     out
 }
 
-/// `h3 jobs ps|add|stop|rem|details ...`
+/// `h3-sycl jobs ps|add|stop|rem|details ...`
 pub fn jobs(raw: &[String]) -> Result<()> {
-    let usage = "usage: h3 jobs ps [-a] | add <kind> [--name value ...] [-f] | stop <id>... | rem <id>... | details <id>";
+    let usage = "usage: h3-sycl jobs ps [-a] | add <kind> [--name value ...] [-f] | stop <id>... | rem <id>... | details <id>";
     let sub = raw.first().ok_or(usage)?.as_str();
     let rest = &raw[1..];
     let ids = || -> Result<Vec<u64>> {
         if rest.is_empty() {
-            return Err(Error(format!("h3 jobs {sub} needs at least one job id")));
+            return Err(Error(format!("h3-sycl jobs {sub} needs at least one job id")));
         }
         rest.iter().map(|s| s.parse::<u64>().map_err(|_| Error(format!("{s}: not a job id")))).collect()
     };
@@ -206,11 +219,11 @@ pub fn jobs(raw: &[String]) -> Result<()> {
     }
 }
 
-/// `h3 jobs add <kind> [--name value ...] [-f]`: numbers become numbers, everything else strings.
+/// `h3-sycl jobs add <kind> [--name value ...] [-f]`: numbers become numbers, everything else strings.
 fn add(raw: &[String]) -> Result<()> {
     let follow = raw.iter().any(|a| a == "-f" || a == "--follow");
     let rest: Vec<&String> = raw.iter().filter(|a| *a != "-f" && *a != "--follow").collect();
-    let kind = rest.first().ok_or("h3 jobs add needs a kind: bench-blocks, check-block")?;
+    let kind = rest.first().ok_or("h3-sycl jobs add needs a kind: bench-blocks, check-block")?;
     let mut spec = serde_json::Map::new();
     spec.insert("kind".into(), json!(kind));
     let mut it = rest[1..].iter();
@@ -250,11 +263,17 @@ fn add(raw: &[String]) -> Result<()> {
     }
 }
 
-/// `h3 unload` / `h3 shutdown`
-pub fn simple(cmd: &str) -> Result<()> {
-    let v = post(&format!("/engine/{cmd}"), None)?;
-    let msg = v.as_object().and_then(|o| o.values().next()).and_then(|m| m.as_str()).unwrap_or("ok");
-    println!("{cmd}: {msg}");
+/// `h3-sycl unload [--gpu N]`
+pub fn unload(raw: &[String]) -> Result<()> {
+    let body = match raw {
+        [] => json!({}),
+        [flag, n] if flag == "--gpu" => json!({"gpu": n.parse::<u64>().map_err(|_| Error(format!("--gpu {n}: not a GPU number")))?}),
+        _ => return Err(Error("usage: h3-sycl unload [--gpu N]".into())),
+    };
+    let v = post("/engine/unload", Some(&body))?;
+    for u in v["unload"].as_array().cloned().unwrap_or_default() {
+        println!("GPU {}: unload {}", u["gpu"], u["unload"].as_str().unwrap_or("?"));
+    }
     Ok(())
 }
 

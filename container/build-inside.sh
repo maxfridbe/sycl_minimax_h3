@@ -14,9 +14,12 @@ kernels() {
   cp -L "$DNNL/lib/libdnnl.so.3" dist/        # shipped beside the library: hosts without a shared oneDNN load it too
 }
 engine() {
-  echo "==> engine: h3 (cargo, release)"
-  cargo build --release --locked --manifest-path engine/Cargo.toml
-  cp engine/target/release/h3 dist/
+  echo "==> engine: h3d (in the container) and h3-sycl (the host's command line, static) (cargo, release)"
+  cargo build --release --locked --manifest-path engine/Cargo.toml -p h3d
+  cargo build --release --locked --manifest-path engine/Cargo.toml -p h3-sycl --target x86_64-unknown-linux-musl
+  cp engine/target/release/h3d dist/
+  cp engine/target/x86_64-unknown-linux-musl/release/h3-sycl dist/
+  rm -f dist/h3                                  # the name before the split
 }
 wfe() {
   echo "==> wfe: TypeScript -> dist/wfe"

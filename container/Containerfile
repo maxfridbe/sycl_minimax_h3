@@ -31,10 +31,11 @@ RUN git clone -q --depth 1 -b ${ONEDNN} https://github.com/uxlfoundation/oneDNN.
     && touch /opt/onednn/H3_SDPA_NO_FALLBACK \
     && rm -rf /tmp/onednn /tmp/onednn-build.log /tmp/onednn-sdpa-no-fallback.patch
 
-# Rust, for every user id the container may run as; crates are fetched into the mounted source tree's .cache/
+# Rust, for every user id the container may run as (and its static, musl target: the host command line h3-sycl
+# must run on any host); crates are fetched into the mounted source tree's .cache/
 ARG RUST=1.97.1
 ENV RUSTUP_HOME=/opt/rust/rustup PATH=/opt/rust/cargo/bin:$PATH
-RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy \
+RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy -t x86_64-unknown-linux-musl \
     && chmod -R a+rX /opt/rust
 
 ENV ONEAPI_DEVICE_SELECTOR=level_zero:0 ZES_ENABLE_SYSMAN=1
