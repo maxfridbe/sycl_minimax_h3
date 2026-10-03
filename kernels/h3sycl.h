@@ -77,7 +77,9 @@ int h3s_int8_linear(void* ctx, const void* x, int x_dt, int64_t M, int64_t K, co
 /* A plain linear layer: out = x . w^T + bias. x [M, K] and w [N, K] in the same type dt (float32, half or
  * bfloat16); bias float32 [N] or NULL; out [M, N] in out_dt. */
 /* out [M, N] += x [M, K] . W^T (W [N, K]), all in type dt: a LoRA's second factor, accumulated into the layer's output. */
-int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, void* out);
+int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out);
+/* x [M, C] *= s[row] in place (s float32 [M]): folds a per-output scale into a weight matrix. */
+int h3s_scale_rows(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* s);
 int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias,
                void* out, int out_dt);
 

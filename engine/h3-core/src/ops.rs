@@ -106,7 +106,7 @@ impl Lora {
         // SAFETY: device buffers of this device, sizes checked above.
         let rc = unsafe { (dev.api.linear)(dev.ctx, x.buf.ptr(), code, m as i64, k as i64, self.a.buf.ptr(), r as i64, std::ptr::null(), tmp.buf.ptr(), code) };
         dev.check(rc)?;
-        let rc = unsafe { (dev.api.linear_acc)(dev.ctx, tmp.buf.ptr(), code, m as i64, r as i64, self.b.buf.ptr(), n as i64, out.buf.ptr()) };
+        let rc = unsafe { (dev.api.linear_acc)(dev.ctx, tmp.buf.ptr(), code, m as i64, r as i64, self.b.buf.ptr(), n as i64, std::ptr::null(), out.buf.ptr()) };
         dev.check(rc)
     }
 }
@@ -125,6 +125,42 @@ impl Linear {
     }
     pub fn outputs(&self) -> usize {
         self.weight.shape[0]
+    }
+
+    /// `out += linear(x)` (bias included), x and out in the weight's type: a residual add folded into the product.
+    pub fn forward_acc(&self, x: &Tensor, out: &Tensor) -> Result<()> {
+        let (n, k) = (self.outputs(), self.inputs());
+        let m = x.elements() / k;
+        if x.dtype != self.weight.dtype || out.dtype != x.dtype || x.elements() != m * k || out.elements() != m * n {
+            return Err(Error(format!("linear_acc: x {:?} {:?}, out {:?} {:?}, weight [{n}, {k}] {:?}", x.dtype, x.shape, out.dtype, out.shape, self.weight.dtype)));
+        }
+        let bias = match &self.bias {
+            Some(b) => floats(b, "the bias", n)?,
+            None => std::ptr::null(),
+        };
+        let dev = x.buf.device();
+        // SAFETY: device pointers of this device, sizes checked above.
+        let rc = unsafe { (dev.api.linear_acc)(dev.ctx, x.buf.ptr(), x.dtype.kernel_code()?, m as i64, k as i64, self.weight.buf.ptr(), n as i64, bias, out.buf.ptr()) };
+        dev.check(rc)
+    }
+
+    /// Scales output row n of the layer (weight row and bias) by s[n].
+    pub fn scale_outputs(&mut self, s: &[f32]) -> Result<()> {
+        let (n, k) = (self.outputs(), self.inputs());
+        if s.len() != n {
+            return Err(Error(format!("scale_outputs: {} factors for {n} outputs", s.len())));
+        }
+        let dev = self.weight.buf.device().clone();
+        let st = Tensor::from_bytes(&dev, DType::F32, &[n], &s.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())?;
+        // SAFETY: the weight [n, k] and the factors float32 [n] on this device.
+        let rc = unsafe { (dev.api.scale_rows)(dev.ctx, self.weight.buf.ptr(), self.weight.dtype.kernel_code()?, n as i64, k as i64, st.buf.ptr().cast()) };
+        dev.check(rc)?;
+        if let Some(b) = &self.bias {
+            let mut v = b.to_f32()?;
+            v.iter_mut().zip(s).for_each(|(a, f)| *a *= f);
+            self.bias = Some(Tensor::from_bytes(&dev, DType::F32, &[n], &v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>())?);
+        }
+        dev.wait()
     }
 
     /// `out = linear(x)`: x [M, K] in the weight's type, out [M, N] in `out`'s type.

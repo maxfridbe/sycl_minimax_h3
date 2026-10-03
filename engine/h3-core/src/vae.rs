@@ -73,6 +73,8 @@ struct VBlock {
     out: Lin,
     w1: Lin,
     w2: Lin,
+    /// the layer scales are folded into `out` and `w2` (16-bit weights): they accumulate into the stream
+    folded: bool,
 }
 
 pub struct VideoDecoder {
@@ -162,15 +164,25 @@ impl VideoDecoder {
                 })
             };
             let qkv = lin(LIN[0], true)?;
-            let out = lin(LIN[1], false)?;
+            let mut out = lin(LIN[1], false)?;
             let w1 = lin(LIN[2], false)?;
-            let w2 = lin(LIN[3], false)?;
+            let mut w2 = lin(LIN[3], false)?;
+            // 16-bit weights: the layer scales folded into the two linears that feed the stream, so their products
+            // add themselves into it (no separate scaled add)
+            let folded = match (&mut out, &mut w2) {
+                (Lin::F(o), Lin::F(w)) => {
+                    o.scale_outputs(&host(ck, &format!("{p}.scale1"))?)?;
+                    w.scale_outputs(&host(ck, &format!("{p}.scale2"))?)?;
+                    true
+                }
+                _ => false,
+            };
             let s = |k: &str| small(dev, ck, &format!("{p}.{k}"));
             let row = |k: &str| -> Result<Tensor> {
                 let v = host(ck, &format!("{p}.{k}"))?;
                 f32_tensor(dev, &[1, v.len()], &v)
             };
-            blocks.push(VBlock { norm1: s("norm1.weight")?, norm2: s("norm2.weight")?, scale1: row("scale1")?, scale2: row("scale2")?, qkv, out, w1, w2 });
+            blocks.push(VBlock { norm1: s("norm1.weight")?, norm2: s("norm2.weight")?, scale1: row("scale1")?, scale2: row("scale2")?, qkv, out, w1, w2, folded });
         }
         dev.wait()?;
         let lin32 = |name: &str| -> Result<Linear> {
@@ -292,20 +304,28 @@ impl VideoDecoder {
                 }
             }
             lap("attention")?;
-            b.out.forward(&att, &proj)?;
-            lap("linear out")?;
-            ops::gate_add(&x, &proj, &zero_rows, &b.scale1)?;
-            lap("scaled add")?;
+            match (&b.out, b.folded) {
+                (Lin::F(l), true) => l.forward_acc(&att, &x)?,
+                _ => {
+                    b.out.forward(&att, &proj)?;
+                    ops::gate_add(&x, &proj, &zero_rows, &b.scale1)?;
+                }
+            }
+            lap("linear out + add")?;
             ops::rms_norm_mod(&x, &b.norm2, EPS, None, &hbuf)?;
             lap("norm")?;
             b.w1.forward(&hbuf, &f1)?;
             lap("linear w1")?;
             ops::swiglu(&f1, &act)?;
             lap("gated activation")?;
-            b.w2.forward(&act, &proj)?;
-            lap("linear w2")?;
-            ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
-            lap("scaled add")?;
+            match (&b.w2, b.folded) {
+                (Lin::F(l), true) => l.forward_acc(&act, &x)?,
+                _ => {
+                    b.w2.forward(&act, &proj)?;
+                    ops::gate_add(&x, &proj, &zero_rows, &b.scale2)?;
+                }
+            }
+            lap("linear w2 + add")?;
         }
         if prof {
             let sum: f64 = stages.iter().map(|s| s.1).sum();

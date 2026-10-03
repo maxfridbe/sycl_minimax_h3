@@ -625,7 +625,7 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
 
 // out += x . W^T, in the inputs' type (a LoRA's second factor, its strength folded into W): oneDNN's sum post-op,
 // in row chunks like h3s_linear.
-int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, void* out) try {
+int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const void* w, int64_t N, const float* bias, void* out) try {
     auto& c = *static_cast<Ctx*>(ctx);
     if (M <= 0 || K <= 0 || N <= 0) return 0;
     using dnnl::memory;
@@ -636,32 +636,49 @@ int h3s_linear_acc(void* ctx, const void* x, int dt, int64_t M, int64_t K, const
         const int64_t rows = std::min(kRows, M - r0);
         memory::desc smd({rows, K}, ddt(dt), memory::format_tag::ab);
         memory::desc dmd({rows, N}, ddt(dt), memory::format_tag::ab);
-        auto key = std::make_tuple(rows, K, N, dt, 2);
+        auto key = std::make_tuple(rows, K, N, dt, bias ? 3 : 2);
         auto it = c.lin.find(key);
         if (it == c.lin.end()) {
             dnnl::post_ops po;
+            if (bias) po.append_binary(dnnl::algorithm::binary_add, memory::desc({1, N}, memory::data_type::f32, memory::format_tag::ab));
             po.append_sum(1.0f);
             dnnl::primitive_attr attr;
             attr.set_post_ops(po);
             it = c.lin.emplace(key, dnnl::matmul(dnnl::matmul::primitive_desc(c.eng, smd, wmd, dmd, attr))).first;
         }
-        it->second.execute(c.strm, {{DNNL_ARG_SRC, usm(smd, c.eng, (const char*) x + (size_t) r0 * K * xe)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
-                                    {DNNL_ARG_DST, usm(dmd, c.eng, (char*) out + (size_t) r0 * N * xe)}});
+        std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, (const char*) x + (size_t) r0 * K * xe)}, {DNNL_ARG_WEIGHTS, usm(wmd, c.eng, w)},
+                                             {DNNL_ARG_DST, usm(dmd, c.eng, (char*) out + (size_t) r0 * N * xe)}};
+        if (bias) args.insert({DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1, usm(memory::desc({1, N}, memory::data_type::f32, memory::format_tag::ab), c.eng, bias)});
+        it->second.execute(c.strm, args);
     }
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
-// 1 / sqrt(mean(x[r]^2) + eps) per row of x [M, C] into c.inv. Summed in float32, in a fixed order per row.
+// rows of x [M, C] scaled in place, row r by s[r] (folds a per-output scale into a weight matrix)
+int h3s_scale_rows(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* s) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t i = id[0] * C + id[1];
+        store(x, dt, i, load(x, dt, i) * s[id[0]]);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// 1 / sqrt(mean(x[r]^2) + eps) per row of x [M, C] into c.inv: a work-group of 256 per row, summed in float32
 static float* row_inv_rms(Ctx& c, const void* x, int x_dt, int64_t M, int64_t C, float eps) {
     float* inv = c.grow(c.inv, c.inv_cap, (size_t) M);
     if (!inv) return nullptr;
-    c.q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) {
+    constexpr int64_t kWg = 256;
+    c.q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (M * kWg)), sycl::range<1>(kWg)), [=](sycl::nd_item<1> it) {
+        const int64_t r = it.get_group(0), lane = it.get_local_id(0);
         float s = 0.0f;
-        for (int64_t i = 0; i < C; ++i) {
-            const float v = load(x, x_dt, r[0] * C + i);
+        for (int64_t i = lane; i < C; i += kWg) {
+            const float v = load(x, x_dt, (size_t) (r * C + i));
             s += v * v;
         }
-        inv[r[0]] = sycl::rsqrt(s / (float) C + eps);
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        if (lane == 0) inv[r] = sycl::rsqrt(s / (float) C + eps);
     });
     return inv;
 }
