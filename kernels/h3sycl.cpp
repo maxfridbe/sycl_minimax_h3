@@ -220,6 +220,32 @@ void* h3s_open(void) try {
     return c;
 } catch (const std::exception& e) { g_err = e.what(); return nullptr; }
 
+// the GPUs, in the order the runtime lists them (with ONEAPI_DEVICE_SELECTOR=level_zero:* every card is there)
+static std::vector<sycl::device> gpus() { return sycl::device::get_devices(sycl::info::device_type::gpu); }
+
+int h3s_gpu_count(void) try {
+    return (int) gpus().size();
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_gpu_info(int index, char* name, int name_len, uint64_t* mem_bytes, char* pci, int pci_len) try {
+    auto all = gpus();
+    if (index < 0 || index >= (int) all.size()) { g_err = "no GPU " + std::to_string(index); return -1; }
+    const auto& d = all[index];
+    std::snprintf(name, name_len, "%s", d.get_info<sycl::info::device::name>().c_str());
+    *mem_bytes = d.get_info<sycl::info::device::global_mem_size>();
+    std::string addr = d.has(sycl::aspect::ext_intel_pci_address) ? d.get_info<sycl::ext::intel::info::device::pci_address>() : "";
+    std::snprintf(pci, pci_len, "%s", addr.c_str());
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+void* h3s_open_gpu(int index) try {
+    auto all = gpus();
+    if (index < 0 || index >= (int) all.size()) { g_err = "no GPU " + std::to_string(index) + " (" + std::to_string(all.size()) + " found)"; return nullptr; }
+    auto* c = new Ctx{sycl::queue(all[index], sycl::property::queue::in_order())};
+    init(*c);
+    return c;
+} catch (const std::exception& e) { g_err = e.what(); return nullptr; }
+
 const char* h3s_device_name(void* ctx) { return static_cast<Ctx*>(ctx)->name.c_str(); }
 uint64_t h3s_mem_cap(void* ctx) { return static_cast<Ctx*>(ctx)->mem_cap; }
 uint64_t h3s_mem_free(void* ctx) try {

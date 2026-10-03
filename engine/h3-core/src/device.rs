@@ -8,6 +8,16 @@ use h3_sys::Api;
 use crate::dtype::DType;
 use crate::{Error, Result};
 
+/// A GPU as the runtime lists it.
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    pub index: usize,
+    pub name: String,
+    pub mem_bytes: u64,
+    /// "0000:0b:00.0"; empty when the runtime cannot tell
+    pub pci: String,
+}
+
 /// One GPU: the kernel library and its context (an in-order SYCL queue). Shared by reference count; the context is
 /// destroyed, with everything still allocated on it, when the last holder goes.
 pub struct Device {
@@ -21,6 +31,38 @@ unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
+    /// The GPUs there are: (index, name, memory bytes, PCI address).
+    pub fn list() -> Result<Vec<GpuInfo>> {
+        let api = Api::load()?;
+        // SAFETY: plain calls; the buffers are sized as passed.
+        let n = unsafe { (api.gpu_count)() };
+        if n < 0 {
+            return Err(Error(api.error()));
+        }
+        (0..n)
+            .map(|i| {
+                let (mut name, mut pci, mut mem) = (vec![0u8; 256], vec![0u8; 64], 0u64);
+                let rc = unsafe { (api.gpu_info)(i, name.as_mut_ptr().cast(), 256, &mut mem, pci.as_mut_ptr().cast(), 64) };
+                if rc != 0 {
+                    return Err(Error(api.error()));
+                }
+                let s = |b: &[u8]| String::from_utf8_lossy(&b[..b.iter().position(|c| *c == 0).unwrap_or(b.len())]).into_owned();
+                Ok(GpuInfo { index: i as usize, name: s(&name), mem_bytes: mem, pci: s(&pci) })
+            })
+            .collect()
+    }
+
+    /// Opens GPU `index` of `list()`.
+    pub fn open_index(index: usize) -> Result<Arc<Device>> {
+        let api = Api::load()?;
+        // SAFETY: NULL is the failure.
+        let ctx = unsafe { (api.open_gpu)(index as i32) };
+        if ctx.is_null() {
+            return Err(Error(format!("GPU {index}: {}", api.error())));
+        }
+        Ok(Arc::new(Device { api, ctx }))
+    }
+
     /// Opens the first GPU.
     pub fn open() -> Result<Arc<Device>> {
         let api = Api::load()?;

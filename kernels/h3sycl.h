@@ -25,6 +25,11 @@ const char* h3s_last_error(void);
 
 /* A context on the first GPU, with its own in-order queue. The Rust engine's way in. */
 void* h3s_open(void);
+/* The GPUs the runtime sees (ONEAPI_DEVICE_SELECTOR=level_zero:* for every card), and a context on one of them.
+ * h3s_gpu_info fills the name, the memory size and the PCI address ("0000:0b:00.0", empty when unknown). */
+int h3s_gpu_count(void);
+int h3s_gpu_info(int index, char* name, int name_len, uint64_t* mem_bytes, char* pci, int pci_len);
+void* h3s_open_gpu(int index);
 /* A context around an existing `sycl::queue*` (PyTorch: torch.xpu.current_stream().sycl_queue); the queue handle is
  * copied. The reference pipeline's way in: its tensors' device pointers are then valid here. */
 void* h3s_create(void* sycl_queue);

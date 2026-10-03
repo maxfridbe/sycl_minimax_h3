@@ -51,9 +51,10 @@ const USAGE: &str = "usage:
   h3 bench-blocks <checkpoint.safetensors> [--tokens 16500] [--blocks N]
 
 the engine as a resident daemon (the model stays loaded between jobs):
-  h3 serve --model <checkpoint.safetensors> [--bind 127.0.0.1] [--port 8095] [--idle 600]
+  h3 gpus [--json]                                    the GPUs, numbered as --gpu takes them
+  h3 serve --model <checkpoint.safetensors> [--all | --gpu N ...] [--bind 127.0.0.1] [--port 8095] [--idle 600]
            (or --listen ADDR:PORT in place of --bind/--port)
-           [--gpu-lock <file>] [--llm-switcher <url>] [--threads 8]
+           [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
            [--ui <dist/wfe>] [--legacy-api <url>]      the web front end on the same port
   h3 status [--no-stream]                             the engine, live (like docker stats)
   h3 jobs ps [-a]                                     queued and running jobs (-a: all)
@@ -251,7 +252,48 @@ fn cmd_bench_blocks(args: &Args) -> Result<()> {
     jobs::bench_blocks(&e, args.number("tokens", 16500)?, None, &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
-fn cmd_serve(args: &Args) -> Result<()> {
+/// `h3 gpus [--json]`: the GPUs the runtime sees, numbered as `--gpu` takes them.
+fn cmd_gpus(args: &Args) -> Result<()> {
+    let list = h3_core::device::Device::list()?;
+    if args.positional.iter().any(|a| a == "--json") || args.options.contains_key("json") {
+        let v: Vec<serde_json::Value> = list
+            .iter()
+            .map(|g| serde_json::json!({"index": g.index, "name": g.name, "mem_gib": jobs::gib(g.mem_bytes), "pci": g.pci}))
+            .collect();
+        println!("{}", serde_json::Value::from(v));
+    } else {
+        println!("{:<4} {:<34} {:>8}  PCI", "GPU", "NAME", "MEMORY");
+        for g in &list {
+            println!("{:<4} {:<34} {:>5.1}GiB  {}", g.index, g.name, jobs::gib(g.mem_bytes), g.pci);
+        }
+    }
+    Ok(())
+}
+
+/// The values of a repeatable option (`--gpu 0 --gpu 1`), and the arguments without them.
+fn take_repeated(raw: &[String], name: &str) -> Result<(Vec<usize>, Vec<String>)> {
+    let (mut vals, mut rest) = (Vec::new(), Vec::new());
+    let mut it = raw.iter();
+    while let Some(a) = it.next() {
+        if a == name {
+            let v = it.next().ok_or_else(|| Error(format!("{name} needs a GPU number")))?;
+            vals.push(v.parse().map_err(|_| Error(format!("{name} {v}: not a GPU number (see `h3 gpus`)")))?);
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((vals, rest))
+}
+
+fn cmd_serve(raw: &[String]) -> Result<()> {
+    let (gpus, raw) = take_repeated(raw, "--gpu")?;
+    let (shared, raw) = take_repeated(&raw, "--shared-gpu")?;
+    let all = raw.iter().any(|a| a == "--all");
+    let raw: Vec<String> = raw.into_iter().filter(|a| a != "--all").collect();
+    if all && !gpus.is_empty() {
+        return Err(Error("give --all or --gpu N ..., not both".into()));
+    }
+    let args = &Args::parse(&raw)?;
     let model = args.options.get("model").ok_or("serve needs --model <checkpoint.safetensors>")?;
     let idle = args.number("idle", 600)?;
     daemon::serve(daemon::Options {
@@ -261,6 +303,8 @@ fn cmd_serve(args: &Args) -> Result<()> {
         gpu_lock: args.options.get("gpu-lock").map(Into::into),
         llm_switcher: args.options.get("llm-switcher").cloned(),
         threads: args.number("threads", 8)?,
+        gpus: (!gpus.is_empty()).then_some(gpus),
+        shared_gpus: (!shared.is_empty()).then_some(shared),
         ui: args.options.get("ui").map(Into::into),
         legacy_api: args.options.get("legacy-api").cloned(),
     })
@@ -289,7 +333,7 @@ fn run() -> Result<()> {
         return Err(Error(USAGE.into()));
     };
     // the client commands parse their own arguments (flags like -a, -f, --no-stream)
-    let args = if matches!(cmd.as_str(), "status" | "jobs") { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
+    let args = if matches!(cmd.as_str(), "status" | "jobs" | "serve" | "gpus") { Args::parse(&[])? } else { Args::parse(&raw[1..])? };
     match cmd.as_str() {
         "version" | "--version" | "-V" => {
             println!("h3 {}", version());
@@ -301,8 +345,9 @@ fn run() -> Result<()> {
         "check-linear" => cmd_check_linear(&args),
         "check-block" => cmd_check_block(&args),
         "bench-blocks" => cmd_bench_blocks(&args),
-        "serve" => cmd_serve(&args),
-        "worker" => worker::run(args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),
+        "serve" => cmd_serve(&raw[1..]),
+        "gpus" => cmd_gpus(&Args { positional: raw[1..].to_vec(), options: BTreeMap::new() }),
+        "worker" => worker::run(args.number("gpu", 0)?, args.options.get("model").ok_or("worker needs --model")?.into(), args.number("threads", 8)?),
         "status" => client::status(&raw[1..]),
         "jobs" => client::jobs(&raw[1..]),
         "unload" | "shutdown" => client::simple(cmd),

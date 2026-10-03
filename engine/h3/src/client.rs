@@ -54,45 +54,46 @@ fn progress(v: &Value) -> String {
 }
 
 fn status_table(st: &Value) -> String {
-    let short = |e: &str| -> String {
-        // the long states ("waiting for the GPU: 2.4 GiB free, ...") go on their own line below
-        e.split(':').next().unwrap_or(e).to_string()
+    let row = |c: [&str; 10]| {
+        format!("{:<4} {:<24} {:>7} {:>8} {:>8} {:>17} {:>9}  {:<30} {:>9}  {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9])
     };
-    let engine = st["engine"].as_str().unwrap_or("?");
-    let gpu = &st["gpu"];
-    let job = match st["running"].as_object() {
-        Some(_) => {
-            let r = &st["running"];
-            format!("{} {} {} ({})", r["id"], r["kind"].as_str().unwrap_or("?"), progress(r),
-                    dur(r["elapsed_seconds"].as_f64().unwrap_or(0.0)))
+    let mut out = row(["GPU", "ENGINE", "PID", "RSS", "BUSY", "ENGINE GPU MEM", "CARD FREE", "JOB", "UNLOAD IN", "CARD"]);
+    let mut notes = String::new();
+    for g in st["gpus"].as_array().cloned().unwrap_or_default() {
+        let engine = g["engine"].as_str().unwrap_or("?");
+        // a long state ("waiting for the GPU: 2.4 GiB free, ...") gets its own line under the table
+        if engine.contains(':') {
+            notes += &format!("  GPU {}: {engine}\n", g["gpu"]);
         }
-        None => "-".into(),
-    };
-    let engine_mem = match (gpu["engine_gib"].as_f64(), gpu["cap_gib"].as_f64()) {
-        (Some(u), Some(c)) => format!("{u:.1} / {c:.1} GiB"),
-        _ => "-".into(),
-    };
-    let mut out = String::new();
-    out += &format!(
-        "{:<22} {:>7} {:>8} {:>8} {:>17} {:>9}  {:<30} {:>5} {:>9}\n",
-        "ENGINE", "PID", "RSS", "GPU BUSY", "ENGINE GPU MEM", "CARD FREE", "JOB", "QUEUE", "UNLOAD IN"
-    );
-    out += &format!(
-        "{:<22} {:>7} {:>8} {:>8} {:>17} {:>9}  {:<30} {:>5} {:>9}\n",
-        short(engine),
-        st["worker"]["pid"].as_u64().map_or("-".into(), |p| p.to_string()),
-        st["worker"]["rss_gib"].as_f64().map_or("-".into(), |r| format!("{r:.1}GiB")),
-        gpu["busy_pct"].as_f64().map_or("-".into(), |b| format!("{b:.0}%")),
-        engine_mem,
-        gpu["card_free_gib"].as_f64().map_or("-".into(), |f| format!("{f:.1}GiB")),
-        job,
-        st["queued"].as_array().map_or(0, |q| q.len()),
-        st["unload_in_seconds"].as_f64().map_or("-".into(), dur),
-    );
-    if engine.contains(':') {
-        out += &format!("  {engine}\n");
+        let job = match g["running"].as_object() {
+            Some(_) => {
+                let r = &g["running"];
+                format!("{} {} {} ({})", r["id"], r["kind"].as_str().unwrap_or("?"), progress(r),
+                        dur(r["elapsed_seconds"].as_f64().unwrap_or(0.0)))
+            }
+            None => "-".into(),
+        };
+        let mem = match (g["engine_gib"].as_f64(), g["cap_gib"].as_f64()) {
+            (Some(u), Some(c)) => format!("{u:.1} / {c:.1} GiB"),
+            _ => "-".into(),
+        };
+        let card = format!("{} {:.0}GiB{}", g["name"].as_str().unwrap_or("?").replace("Intel(R) ", "").replace("(TM)", ""),
+                           g["mem_gib"].as_f64().unwrap_or(0.0), if g["shared"].as_bool() == Some(true) { " shared" } else { "" });
+        out += &row([
+            &g["gpu"].to_string(),
+            engine.split(':').next().unwrap_or(engine),
+            &g["worker"]["pid"].as_u64().map_or("-".into(), |p| p.to_string()),
+            &g["worker"]["rss_gib"].as_f64().map_or("-".into(), |r| format!("{r:.1}GiB")),
+            &g["busy_pct"].as_f64().map_or("-".into(), |b| format!("{b:.0}%")),
+            &mem,
+            &g["card_free_gib"].as_f64().map_or("-".into(), |f| format!("{f:.1}GiB")),
+            &job,
+            &g["unload_in_seconds"].as_f64().map_or("-".into(), dur),
+            &card,
+        ]);
     }
-    out
+    let queued = st["queued"].as_array().map_or(0, |q| q.len());
+    out + &notes + &format!("queued: {queued}\n")
 }
 
 /// `h3 status [--no-stream]`
@@ -120,7 +121,7 @@ pub fn status(raw: &[String]) -> Result<()> {
 }
 
 fn jobs_table(list: &[Value]) -> String {
-    let mut out = format!("{:<5} {:<14} {:<10} {:>9} {:>9} {:>9}  {}\n", "ID", "KIND", "STATE", "PROGRESS", "CREATED", "TOOK", "LAST");
+    let mut out = format!("{:<5} {:<14} {:<10} {:>4} {:>9} {:>9} {:>9}  {}\n", "ID", "KIND", "STATE", "GPU", "PROGRESS", "CREATED", "TOOK", "LAST");
     let t = now();
     for j in list {
         let took = match (j["started"].as_f64(), j["finished"].as_f64()) {
@@ -131,10 +132,11 @@ fn jobs_table(list: &[Value]) -> String {
         let last = j["error"].as_str().or(j["last"].as_str()).unwrap_or("").trim().to_string();
         let last: String = last.chars().take(60).collect();
         out += &format!(
-            "{:<5} {:<14} {:<10} {:>9} {:>9} {:>9}  {}\n",
+            "{:<5} {:<14} {:<10} {:>4} {:>9} {:>9} {:>9}  {}\n",
             j["id"],
             j["kind"].as_str().unwrap_or("?"),
             j["state"].as_str().unwrap_or("?"),
+            j["gpu"].as_u64().map_or("-".into(), |g| g.to_string()),
             progress(j),
             j["created"].as_f64().map_or("-".into(), |c| format!("{} ago", dur(t - c))),
             took,
@@ -268,15 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn status_line_has_the_running_job() {
-        let st = json!({"engine": "loaded", "worker": {"pid": 42, "rss_gib": 2.04},
-                        "gpu": {"busy_pct": 97.4, "engine_gib": 21.3, "cap_gib": 30.0, "card_free_gib": 8.1},
-                        "running": {"id": 3, "kind": "bench-blocks", "progress": {"done": 24, "total": 100}, "elapsed_seconds": 14.2},
-                        "queued": [4, 5], "unload_in_seconds": null});
+    fn status_rows_per_gpu() {
+        let st = json!({"gpus": [
+            {"gpu": 0, "name": "Intel(R) Arc(TM) Pro B70 Graphics", "mem_gib": 31.9, "shared": true, "engine": "loaded",
+             "worker": {"pid": 42, "rss_gib": 2.04}, "busy_pct": 97.4, "engine_gib": 21.3, "cap_gib": 30.0, "card_free_gib": 8.1,
+             "running": {"id": 3, "kind": "bench-blocks", "progress": {"done": 24, "total": 100}, "elapsed_seconds": 14.2},
+             "unload_in_seconds": null},
+            {"gpu": 1, "name": "Intel(R) Arc(TM) Pro B65 Graphics", "mem_gib": 24.0, "shared": false,
+             "engine": "waiting for the GPU: 2.4 GiB free, 27.5 GiB needed", "worker": {"pid": 43, "rss_gib": 0.3},
+             "busy_pct": null, "running": null, "unload_in_seconds": null}],
+            "queued": [4, 5]});
         let t = status_table(&st);
-        let row = t.lines().nth(1).unwrap();
-        for want in ["loaded", "42", "2.0GiB", "97%", "21.3 / 30.0 GiB", "8.1GiB", "3 bench-blocks 24/100 (14s)", " 2 "] {
-            assert!(row.contains(want), "{want:?} missing from {row:?}");
+        let lines: Vec<&str> = t.lines().collect();
+        for want in ["loaded", "42", "2.0GiB", "97%", "21.3 / 30.0 GiB", "8.1GiB", "3 bench-blocks 24/100 (14s)", "Arc Pro B70 Graphics 32GiB shared"] {
+            assert!(lines[1].contains(want), "{want:?} missing from {:?}", lines[1]);
         }
+        assert!(lines[2].starts_with("1    waiting for the GPU "), "{:?}", lines[2]);
+        assert!(t.contains("GPU 1: waiting for the GPU: 2.4 GiB free"));
+        assert!(t.ends_with("queued: 2\n"));
     }
 }

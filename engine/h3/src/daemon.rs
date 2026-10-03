@@ -1,25 +1,27 @@
-//! `h3 serve`: the engine as a resident service, in two processes. This one - the daemon - serves the web front end
-//! and the API, keeps the job queue, and never opens the GPU. The GPU belongs to a child process, `h3 worker`
-//! (worker.rs), which the daemon starts when a job needs the engine: it loads the model and keeps it for the next
-//! jobs. The daemon ends it when told to (`unload`, `shutdown`) or after a while without jobs, so a GPU shared with
-//! other programs is not held for nothing - and the memory comes back with the process, whatever state the driver
-//! was in. A crash in the engine ends the worker, not the front end: the job is marked failed and the next one starts
-//! a fresh worker.
+//! `h3 serve`: the engine as a resident service. This process - the daemon - serves the web front end and the API,
+//! keeps the job queue, and never opens a GPU. Each GPU it was given (`--all`, the default, or `--gpu N` for each) is
+//! a slot with its own engine process, `h3 worker --gpu N` (worker.rs), which the daemon starts when a job needs that
+//! GPU: it loads the model and keeps it for the next jobs. The daemon ends it when told to (`unload`, `shutdown`) or
+//! after a while without jobs, so a GPU shared with other programs is not held for nothing - and the memory comes back
+//! with the process, whatever state the driver was in. A crash in an engine ends that worker, not the front end: the
+//! job is marked failed and the next one starts a fresh worker.
 //!
-//! Jobs run one at a time, in the order they came. A job can be cancelled; it stops at the next block boundary, never
-//! inside a kernel (a GPU process stopped mid-kernel can leave the xe driver stuck).
+//! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came; a job that names a GPU
+//! (`"gpu": 1`) waits for that one. A job can be cancelled; it stops at the next block boundary, never inside a kernel
+//! (a GPU process stopped mid-kernel can leave the xe driver stuck).
 //!
 //! The same port serves the web front end (wfe/, built into dist/wfe) at `/`, and the engine's API (JSON) under
 //! `/engine`:
 //!
 //! ```text
-//!   GET  /engine/status              engine state, the job running, the queue
+//!   GET  /engine/status              every GPU slot (engine state, process, memory, busy, its job), the queue
 //!   GET  /engine/jobs                every job, newest first, without logs
 //!   GET  /engine/jobs/<id>           one job with its log and result
-//!   POST /engine/jobs                {"kind": "bench-blocks", ...}  ->  {"id": 3}
+//!   POST /engine/jobs                {"kind": "bench-blocks", ..., "gpu": 1 (optional)}  ->  {"id": 3}
 //!   POST /engine/jobs/<id>/cancel
-//!   POST /engine/unload              give the GPU back now (after the running job)
-//!   POST /engine/shutdown            cancel the queue, finish or cancel the running job, unload, exit
+//!   POST /engine/jobs/<id>/remove    forget a job that is not running
+//!   POST /engine/unload              {"gpu": N} or every GPU: give it back now (after the running job)
+//!   POST /engine/shutdown            cancel the queue, finish or cancel the running jobs, unload, exit
 //! ```
 //!
 //! The front end also calls the API of the clip-production server it was written for (`/api/...`, `/rpc/...`:
@@ -27,10 +29,11 @@
 //! does not handle itself is passed on, byte for byte, to that server (`--legacy-api`), so the front end keeps
 //! working whole while its pieces move over.
 //!
-//! On a GPU that another program normally holds, two hooks make the daemon share it politely before loading:
-//! a lock file (wait until it is free, then hold it while loaded) and a front end's model switcher (ask the model it
-//! serves to stop, and put it back after unloading). Either way the daemon then waits until the card really has the
-//! memory free - it never loads into a card that is still occupied.
+//! On a GPU that another program normally holds (`--shared-gpu N`; by default every GPU counts as shared when the
+//! hooks are given), two hooks make the daemon share it politely before loading: a lock file (wait until it is free,
+//! then hold it while an engine on a shared GPU is loaded) and a front end's model switcher (ask the model it serves to
+//! stop, and put it back after the last such engine ended). Either way the engine process then waits until its card
+//! really has the memory free - it never loads into a card that is still occupied.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
@@ -46,17 +49,13 @@ use serde_json::{json, Value};
 
 use crate::http;
 
-/// The worker process and what the daemon took on its behalf (to give back when it ends).
-struct Proc {
-    child: Child,
-    stdin: ChildStdin,
-    events: mpsc::Receiver<Value>,
-    saved_mode: Option<String>,
-}
-
 pub struct Options {
     pub listen: String,
     pub model: PathBuf,
+    /// The GPUs to serve (indices of `h3 gpus`); `None`: every one there is.
+    pub gpus: Option<Vec<usize>>,
+    /// The GPUs the hooks below are about; `None`: every served GPU.
+    pub shared_gpus: Option<Vec<usize>>,
     /// Unload after this long without a job; `None`: stay loaded until told.
     pub idle: Option<Duration>,
     /// A lock file shared with the GPU's other users: wait while someone else's name is in it.
@@ -69,6 +68,15 @@ pub struct Options {
     pub ui: Option<PathBuf>,
     /// The legacy front-end server (`http://host:port`) that answers what is not ported yet.
     pub legacy_api: Option<String>,
+}
+
+/// An engine process and its event stream.
+struct Proc {
+    child: Child,
+    stdin: ChildStdin,
+    events: mpsc::Receiver<Value>,
+    /// it holds a share of the hooks (lock file, the front end's model)
+    shared: bool,
 }
 
 struct JobRec {
@@ -84,6 +92,8 @@ struct JobRec {
     finished: Option<f64>,
     /// (done, total) as the job last reported it
     progress: Option<(u64, u64)>,
+    /// the GPU it runs or ran on
+    gpu: Option<usize>,
 }
 
 impl JobRec {
@@ -91,7 +101,7 @@ impl JobRec {
         json!({"id": self.id, "kind": self.spec.get("kind"), "state": self.state, "created": self.created,
                "started": self.started, "finished": self.finished, "error": self.error,
                "progress": self.progress.map(|(d, t)| json!({"done": d, "total": t})),
-               "last": self.log.last()})
+               "gpu": self.gpu.or_else(|| self.wants_gpu()), "last": self.log.last()})
     }
     fn full(&self) -> Value {
         let mut v = self.summary();
@@ -100,19 +110,23 @@ impl JobRec {
         v["result"] = self.result.clone().unwrap_or(Value::Null);
         v
     }
+    fn wants_gpu(&self) -> Option<usize> {
+        self.spec.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize)
+    }
 }
 
-struct Shared {
-    jobs: BTreeMap<u64, JobRec>,
-    queue: VecDeque<u64>,
-    next: u64,
-    engine: String, // unloaded, waiting for the GPU..., loading, loaded, unloading
+/// One GPU and the engine process on it.
+struct Slot {
+    gpu: usize,
+    name: String,
+    pci: String,
+    mem_gib: f64,
+    shared: bool,
+    engine: String, // unloaded, starting..., waiting for the GPU..., loading, loaded, unloading
     running: Option<u64>,
     last_active: Instant,
     unload_requested: bool,
-    shutdown: bool,
     info: Value,
-    /// the engine process, when there is one
     worker_pid: Option<u32>,
     /// the engine's last report: its GPU memory, the card's free memory
     stats: Value,
@@ -120,10 +134,26 @@ struct Shared {
     busy_sample: Option<(Instant, u64)>,
 }
 
+struct Shared {
+    jobs: BTreeMap<u64, JobRec>,
+    queue: VecDeque<u64>,
+    next: u64,
+    shutdown: bool,
+    slots: Vec<Slot>,
+}
+
+/// The hooks are taken by the first engine on a shared GPU and given back after the last one.
+#[derive(Default)]
+struct Hooks {
+    users: usize,
+    saved_mode: Option<String>,
+}
+
 struct Daemon {
     opts: Options,
     s: Mutex<Shared>,
     cv: Condvar,
+    hooks: Mutex<Hooks>,
 }
 
 fn now() -> f64 {
@@ -138,10 +168,11 @@ impl Daemon {
         }
     }
 
-    fn set_engine(&self, state: impl Into<String>) {
+    fn set_engine(&self, k: usize, state: impl Into<String>) {
         let st = state.into();
-        eprintln!("[engine] {st}");
-        self.s.lock().unwrap().engine = st;
+        let mut s = self.s.lock().unwrap();
+        eprintln!("[gpu {}] {st}", s.slots[k].gpu);
+        s.slots[k].engine = st;
     }
 
     fn stopping(&self, cancel: &AtomicBool) -> bool {
@@ -149,13 +180,12 @@ impl Daemon {
     }
 
     /// The lock file: wait until it is absent or ours, then write our name into it.
-    fn take_lock(&self, cancel: &AtomicBool) -> Result<()> {
+    fn take_lock(&self, k: usize, cancel: &AtomicBool) -> Result<()> {
         let Some(path) = &self.opts.gpu_lock else { return Ok(()) };
         loop {
-            let holder = std::fs::read_to_string(path).ok();
-            match holder {
+            match std::fs::read_to_string(path).ok() {
                 Some(h) if !h.starts_with("h3-sycl ") => {
-                    self.set_engine(format!("waiting for the GPU lock (held: {})", h.trim()));
+                    self.set_engine(k, format!("waiting for the GPU lock (held: {})", h.trim()));
                     if self.stopping(cancel) {
                         return Err(Error("cancelled while waiting for the GPU lock".into()));
                     }
@@ -195,23 +225,51 @@ impl Daemon {
             return;
         }
         match http::split_url(url).and_then(|(h, p)| http::call(&h, "POST", &p, Some(&json!({"mode": mode})))) {
-            Ok(_) => eprintln!("[engine] the front end's model {mode:?} restored"),
-            Err(e) => eprintln!("[engine] could not restore the front end's model {mode:?}: {e}"),
+            Ok(_) => eprintln!("[daemon] the front end's model {mode:?} restored"),
+            Err(e) => eprintln!("[daemon] could not restore the front end's model {mode:?}: {e}"),
         }
     }
 
-    /// Lock and switcher (both cheap, no GPU), then the worker process, which waits for the card's memory and loads.
-    fn start_worker(&self, cancel: &AtomicBool) -> Result<Proc> {
-        self.take_lock(cancel)?;
-        let saved_mode = match self.switch_llm_off() {
-            Ok(m) => m,
-            Err(e) => {
-                self.release_lock();
-                return Err(e);
+    /// The first engine on a shared GPU takes the lock and stops the front end's model.
+    fn acquire_hooks(&self, k: usize, cancel: &AtomicBool) -> Result<()> {
+        let mut h = self.hooks.lock().unwrap();
+        if h.users == 0 {
+            self.take_lock(k, cancel)?;
+            match self.switch_llm_off() {
+                Ok(m) => h.saved_mode = m,
+                Err(e) => {
+                    self.release_lock();
+                    return Err(e);
+                }
             }
+        }
+        h.users += 1;
+        Ok(())
+    }
+
+    /// The last engine on a shared GPU gives them back.
+    fn release_hooks(&self) {
+        let mut h = self.hooks.lock().unwrap();
+        h.users = h.users.saturating_sub(1);
+        if h.users == 0 {
+            let mode = h.saved_mode.take();
+            self.restore_llm(&mode);
+            self.release_lock();
+        }
+    }
+
+    /// Hooks (cheap, no GPU) when the slot's GPU is shared, then the engine process on that GPU, which waits for the
+    /// card's memory and loads.
+    fn start_worker(&self, k: usize, cancel: &AtomicBool) -> Result<Proc> {
+        let (gpu, shared) = {
+            let s = self.s.lock().unwrap();
+            (s.slots[k].gpu, s.slots[k].shared)
         };
+        if shared {
+            self.acquire_hooks(k, cancel)?;
+        }
         let spawned = Command::new(std::env::current_exe()?)
-            .args(["worker", "--model"])
+            .args(["worker", "--gpu", &gpu.to_string(), "--model"])
             .arg(&self.opts.model)
             .args(["--threads", &self.opts.threads.to_string()])
             .stdin(Stdio::piped())
@@ -221,8 +279,9 @@ impl Daemon {
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
-                self.restore_llm(&saved_mode);
-                self.release_lock();
+                if shared {
+                    self.release_hooks();
+                }
                 return Err(Error(format!("cannot start the engine process: {e}")));
             }
         };
@@ -239,24 +298,24 @@ impl Daemon {
             }
         });
         let stdin = child.stdin.take().unwrap();
-        self.set_engine("starting the engine process");
-        self.s.lock().unwrap().worker_pid = Some(child.id());
-        Ok(Proc { child, stdin, events, saved_mode })
+        self.set_engine(k, "starting the engine process");
+        self.s.lock().unwrap().slots[k].worker_pid = Some(child.id());
+        Ok(Proc { child, stdin, events, shared })
     }
 
-    /// What the worker said that is not about a job.
-    fn engine_event(&self, ev: &Value) {
+    /// What a worker said that is not about a job's result.
+    fn engine_event(&self, k: usize, ev: &Value) {
         match ev["event"].as_str() {
             Some("engine") => {
                 if let Some(st) = ev["state"].as_str() {
-                    self.set_engine(st);
+                    self.set_engine(k, st);
                 }
             }
             Some("ready") => {
-                self.s.lock().unwrap().info = ev["info"].clone();
-                self.set_engine("loaded");
+                self.s.lock().unwrap().slots[k].info = ev["info"].clone();
+                self.set_engine(k, "loaded");
             }
-            Some("stats") => self.s.lock().unwrap().stats = ev.clone(),
+            Some("stats") => self.s.lock().unwrap().slots[k].stats = ev.clone(),
             Some("progress") => {
                 if let (Some(id), Some(d), Some(t)) = (ev["job"].as_u64(), ev["done"].as_u64(), ev["total"].as_u64()) {
                     if let Some(j) = self.s.lock().unwrap().jobs.get_mut(&id) {
@@ -268,52 +327,48 @@ impl Daemon {
         }
     }
 
-    fn forget_worker(&self) {
-        let mut s = self.s.lock().unwrap();
-        s.info = Value::Null;
-        s.stats = Value::Null;
-        s.worker_pid = None;
+    /// After a worker ended (asked or not): the slot forgets it, the hooks get their share back.
+    fn worker_gone(&self, k: usize, p: Proc) {
+        if p.shared {
+            self.release_hooks();
+        }
+        {
+            let mut s = self.s.lock().unwrap();
+            let sl = &mut s.slots[k];
+            sl.info = Value::Null;
+            sl.stats = Value::Null;
+            sl.worker_pid = None;
+        }
+        self.set_engine(k, "unloaded");
     }
 
-    /// Ends the worker: asks it to exit (it finishes the kernel it is in, unloads, ends), waits for it, and gives back
-    /// the lock and the front end's model. Never a kill: a GPU process stopped mid-kernel can leave the driver stuck.
-    fn stop_worker(&self, proc: &mut Option<Proc>) {
+    /// Ends a worker: asks it to exit (it finishes the kernel it is in, unloads, ends) and waits for it. Never a kill:
+    /// a GPU process stopped mid-kernel can leave the driver stuck.
+    fn stop_worker(&self, k: usize, proc: &mut Option<Proc>) {
         let Some(mut p) = proc.take() else { return };
-        self.set_engine("unloading");
+        self.set_engine(k, "unloading");
         let _ = writeln!(p.stdin, "{}", json!({"exit": true}));
         let _ = p.stdin.flush();
-        drop(p.stdin);
         while let Ok(ev) = p.events.recv() {
-            self.engine_event(&ev);
+            self.engine_event(k, &ev);
         }
         let status = p.child.wait();
-        eprintln!("[engine] the engine process ended ({})", status.map_or("unknown".into(), |s| s.to_string()));
-        self.restore_llm(&p.saved_mode);
-        self.release_lock();
-        self.forget_worker();
-        self.set_engine("unloaded");
+        eprintln!("[gpu {k}] the engine process ended ({})", status.map_or("unknown".into(), |s| s.to_string()));
+        self.worker_gone(k, p);
     }
 
-    /// The worker ended on its own (a crash): clean up after it.
-    fn reap_if_dead(&self, proc: &mut Option<Proc>) -> Option<String> {
-        let p = proc.as_mut()?;
-        match p.child.try_wait() {
-            Ok(Some(status)) => {
-                let p = proc.take().unwrap();
-                self.restore_llm(&p.saved_mode);
-                self.release_lock();
-                self.forget_worker();
-                self.set_engine("unloaded");
-                Some(format!("the engine process ended unexpectedly ({status})"))
-            }
-            _ => None,
-        }
+    /// A worker that ended on its own (a crash): clean up after it.
+    fn reap_if_dead(&self, k: usize, proc: &mut Option<Proc>) -> Option<String> {
+        let status = proc.as_mut()?.child.try_wait().ok()??;
+        let p = proc.take().unwrap();
+        self.worker_gone(k, p);
+        Some(format!("the engine process ended unexpectedly ({status})"))
     }
 
-    /// Hands a job to the worker and relays its events until the result.
-    fn run_job(&self, proc: &mut Option<Proc>, id: u64, spec: &Value, cancel: &AtomicBool) -> std::result::Result<Value, String> {
+    /// Hands a job to the slot's worker and relays its events until the result.
+    fn run_job(&self, k: usize, proc: &mut Option<Proc>, id: u64, spec: &Value, cancel: &AtomicBool) -> std::result::Result<Value, String> {
         if proc.is_none() {
-            *proc = Some(self.start_worker(cancel).map_err(|e| e.0)?);
+            *proc = Some(self.start_worker(k, cancel).map_err(|e| e.0)?);
         }
         let p = proc.as_mut().unwrap();
         writeln!(p.stdin, "{}", json!({"job": id, "spec": spec})).map_err(|e| format!("the engine process does not listen: {e}"))?;
@@ -341,44 +396,40 @@ impl Daemon {
                         if let Some(l) = ev["line"].as_str() {
                             self.log_job(id, l.to_string());
                         }
-                        self.engine_event(&ev);
+                        self.engine_event(k, &ev);
                     }
                 },
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     // its output closed: it has ended or is ending
-                    let mut waited = 0;
-                    loop {
-                        if let Some(why) = self.reap_if_dead(proc) {
+                    for _ in 0..600 {
+                        if let Some(why) = self.reap_if_dead(k, proc) {
                             return Err(why);
                         }
                         std::thread::sleep(Duration::from_millis(200));
-                        waited += 1;
-                        if waited > 600 {
-                            return Err("the engine process closed its output but did not end".into());
-                        }
                     }
+                    return Err("the engine process closed its output but did not end".into());
                 }
             }
         }
     }
 
-    /// The one thread that deals with the worker process.
-    fn worker(self: Arc<Self>) {
+    /// The thread that keeps slot `k`: takes the jobs it may run, starts and ends its engine process.
+    fn slot_thread(self: Arc<Self>, k: usize) {
         enum Next {
             Run(u64, Value, Arc<AtomicBool>),
             Unload,
+            Tick,
             Exit,
         }
         let mut proc: Option<Proc> = None;
         loop {
-            if let Some(why) = self.reap_if_dead(&mut proc) {
-                eprintln!("[engine] {why}");
+            if let Some(why) = self.reap_if_dead(k, &mut proc) {
+                eprintln!("[gpu {k}] {why}");
             }
-            // events the worker sends between jobs (none expected, but keep the pipe drained)
             if let Some(p) = &proc {
                 while let Ok(ev) = p.events.try_recv() {
-                    self.engine_event(&ev);
+                    self.engine_event(k, &ev);
                 }
             }
             let next = {
@@ -387,39 +438,44 @@ impl Daemon {
                     if s.shutdown {
                         break Next::Exit;
                     }
-                    if s.unload_requested {
-                        s.unload_requested = false;
+                    if s.slots[k].unload_requested {
+                        s.slots[k].unload_requested = false;
                         break Next::Unload;
                     }
-                    if let Some(id) = s.queue.pop_front() {
+                    let gpu = s.slots[k].gpu;
+                    let mine = s.queue.iter().position(|id| s.jobs[id].wants_gpu().is_none_or(|g| g == gpu));
+                    if let Some(pos) = mine {
+                        let id = s.queue.remove(pos).unwrap();
                         let j = s.jobs.get_mut(&id).unwrap();
                         j.state = "running";
                         j.started = Some(now());
+                        j.gpu = Some(gpu);
                         let (spec, cancel) = (j.spec.clone(), j.cancel.clone());
-                        s.running = Some(id);
+                        s.slots[k].running = Some(id);
                         break Next::Run(id, spec, cancel);
                     }
-                    let idle = s.last_active.elapsed();
-                    match self.opts.idle {
-                        Some(limit) if proc.is_some() && idle >= limit => break Next::Unload,
-                        _ => {}
+                    let idle = s.slots[k].last_active.elapsed();
+                    if let Some(limit) = self.opts.idle {
+                        if proc.is_some() && idle >= limit {
+                            break Next::Unload;
+                        }
                     }
                     let (guard, timeout) = self.cv.wait_timeout(s, Duration::from_secs(1)).unwrap();
                     s = guard;
                     if timeout.timed_out() && proc.is_some() {
-                        break Next::Run(0, Value::Null, Arc::new(AtomicBool::new(false))); // a turn of the outer loop
+                        break Next::Tick; // look at the process and drain its events
                     }
                 }
             };
             match next {
                 Next::Exit => {
-                    self.stop_worker(&mut proc);
+                    self.stop_worker(k, &mut proc);
                     return;
                 }
-                Next::Unload => self.stop_worker(&mut proc),
-                Next::Run(0, _, _) => {}
+                Next::Unload => self.stop_worker(k, &mut proc),
+                Next::Tick => {}
                 Next::Run(id, spec, cancel) => {
-                    let outcome = self.run_job(&mut proc, id, &spec, &cancel);
+                    let outcome = self.run_job(k, &mut proc, id, &spec, &cancel);
                     let mut s = self.s.lock().unwrap();
                     let j = s.jobs.get_mut(&id).unwrap();
                     j.finished = Some(now());
@@ -434,8 +490,9 @@ impl Daemon {
                         }
                     }
                     eprintln!("[job {id}] {}", j.state);
-                    s.running = None;
-                    s.last_active = Instant::now();
+                    s.slots[k].running = None;
+                    s.slots[k].last_active = Instant::now();
+                    self.cv.notify_all();
                 }
             }
         }
@@ -484,24 +541,31 @@ impl Daemon {
         let mut s = self.s.lock().unwrap();
         match (method, parts.as_slice()) {
             ("GET", ["status"]) => {
-                let idle = s.last_active.elapsed().as_secs();
-                let busy = gpu_busy(&mut s.busy_sample);
-                let worker = s.worker_pid.map(|pid| json!({"pid": pid, "rss_gib": rss_gib(pid)}));
-                let running = s.running.and_then(|r| s.jobs.get(&r)).map(|j| {
-                    let mut v = j.summary();
-                    v["elapsed_seconds"] = json!(j.started.map(|t| now() - t));
-                    v
-                });
-                let unload_in = match (self.opts.idle, s.worker_pid, s.running) {
-                    (Some(limit), Some(_), None) => Some(limit.as_secs().saturating_sub(idle)),
-                    _ => None,
-                };
-                (200, json!({"version": crate::version(), "engine": s.engine, "info": s.info, "model": self.opts.model,
-                             "worker": worker, "gpu": {"busy_pct": busy, "engine_gib": s.stats["gib_in_use"],
-                                                       "cap_gib": s.stats["gib_cap"], "card_free_gib": s.stats["gib_free_card"]},
-                             "running": running, "queued": s.queue.iter().collect::<Vec<_>>(),
-                             "idle_seconds": if s.running.is_some() { 0 } else { idle },
-                             "unload_in_seconds": unload_in,
+                let idle_limit = self.opts.idle;
+                let mut gpus = Vec::new();
+                for k in 0..s.slots.len() {
+                    let running = s.slots[k].running.and_then(|r| s.jobs.get(&r)).map(|j| {
+                        let mut v = j.summary();
+                        v["elapsed_seconds"] = json!(j.started.map(|t| now() - t));
+                        v
+                    });
+                    let sl = &mut s.slots[k];
+                    let idle = sl.last_active.elapsed().as_secs();
+                    let busy = gpu_busy(&sl.pci, &mut sl.busy_sample);
+                    let unload_in = match (idle_limit, sl.worker_pid, sl.running) {
+                        (Some(limit), Some(_), None) => Some(limit.as_secs().saturating_sub(idle)),
+                        _ => None,
+                    };
+                    gpus.push(json!({
+                        "gpu": sl.gpu, "name": sl.name, "pci": sl.pci, "mem_gib": sl.mem_gib, "shared": sl.shared,
+                        "engine": sl.engine, "info": sl.info,
+                        "worker": sl.worker_pid.map(|pid| json!({"pid": pid, "rss_gib": rss_gib(pid)})),
+                        "busy_pct": busy, "engine_gib": sl.stats["gib_in_use"], "cap_gib": sl.stats["gib_cap"],
+                        "card_free_gib": sl.stats["gib_free_card"], "running": running,
+                        "idle_seconds": if sl.running.is_some() { 0 } else { idle }, "unload_in_seconds": unload_in}));
+                }
+                (200, json!({"version": crate::version(), "model": self.opts.model, "gpus": gpus,
+                             "queued": s.queue.iter().collect::<Vec<_>>(),
                              "unload_after_idle_seconds": self.opts.idle.map(|d| d.as_secs())}))
             }
             ("GET", ["jobs"]) => (200, json!(s.jobs.values().rev().map(JobRec::summary).collect::<Vec<_>>())),
@@ -516,11 +580,17 @@ impl Daemon {
                 if body.get("kind").and_then(|k| k.as_str()).is_none() {
                     return (400, json!({"error": "a job needs a \"kind\" (bench-blocks, check-block)"}));
                 }
+                if let Some(g) = body.get("gpu") {
+                    let served: Vec<usize> = s.slots.iter().map(|sl| sl.gpu).collect();
+                    if !g.as_u64().is_some_and(|g| served.contains(&(g as usize))) {
+                        return (400, json!({"error": format!("\"gpu\": {g} is not one this daemon serves ({served:?})")}));
+                    }
+                }
                 let id = s.next;
                 s.next += 1;
                 s.jobs.insert(id, JobRec { id, spec: body, state: "queued", log: Vec::new(), result: None, error: None,
-                                           cancel: Arc::new(AtomicBool::new(false)), created: now(), started: None, finished: None,
-                                           progress: None });
+                                           cancel: Arc::new(AtomicBool::new(false)), created: now(), started: None,
+                                           finished: None, progress: None, gpu: None });
                 s.queue.push_back(id);
                 self.cv.notify_all();
                 (200, json!({"id": id}))
@@ -555,9 +625,18 @@ impl Daemon {
                 }
             }
             ("POST", ["unload"]) => {
-                s.unload_requested = true;
+                let want = body.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize);
+                let mut hit = Vec::new();
+                for sl in s.slots.iter_mut().filter(|sl| want.is_none_or(|g| g == sl.gpu)) {
+                    sl.unload_requested = true;
+                    hit.push(json!({"gpu": sl.gpu, "unload": if sl.running.is_some() { "after the running job" } else { "now" }}));
+                }
                 self.cv.notify_all();
-                (200, json!({"unload": if s.running.is_some() { "after the running job" } else { "now" }}))
+                if hit.is_empty() {
+                    (400, json!({"error": "no such GPU served"}))
+                } else {
+                    (200, json!({"unload": hit}))
+                }
             }
             ("POST", ["shutdown"]) => {
                 s.shutdown = true;
@@ -566,41 +645,93 @@ impl Daemon {
                         j.state = "cancelled";
                     }
                 }
-                if let Some(r) = s.running {
-                    s.jobs.get(&r).unwrap().cancel.store(true, Ordering::Relaxed);
+                let running: Vec<u64> = s.slots.iter().filter_map(|sl| sl.running).collect();
+                for r in running {
+                    s.jobs[&r].cancel.store(true, Ordering::Relaxed);
                 }
                 self.cv.notify_all();
-                (200, json!({"shutdown": "the running job stops at its next block boundary, then the engine unloads"}))
+                (200, json!({"shutdown": "running jobs stop at their next block boundary, then the engines unload"}))
             }
             _ => (404, json!({"error": format!("no route {method} /engine/{path}")})),
         }
     }
 }
 
+/// The GPUs there are, asked of a short-lived `h3 gpus --json` (the daemon itself does not start the GPU runtime).
+fn list_gpus() -> Result<Vec<Value>> {
+    let out = Command::new(std::env::current_exe()?).args(["gpus", "--json"]).stderr(Stdio::inherit()).output()?;
+    if !out.status.success() {
+        return Err(Error("cannot list the GPUs".into()));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| Error(format!("h3 gpus: {e}")))?;
+    Ok(v.as_array().cloned().unwrap_or_default())
+}
+
 pub fn serve(opts: Options) -> Result<()> {
     if !opts.model.exists() {
         return Err(Error(format!("{}: no such checkpoint", opts.model.display())));
     }
+    let found = list_gpus().unwrap_or_else(|e| {
+        eprintln!("[daemon] {e}: serving GPU 0 blind");
+        vec![json!({"index": 0, "name": "?", "mem_gib": 0.0, "pci": ""})]
+    });
+    let indices: Vec<usize> = match &opts.gpus {
+        Some(g) => g.clone(),
+        None => found.iter().filter_map(|g| g["index"].as_u64()).map(|i| i as usize).collect(),
+    };
+    if indices.is_empty() {
+        return Err(Error("no GPU to serve".into()));
+    }
+    let hooks = opts.gpu_lock.is_some() || opts.llm_switcher.is_some();
+    let mut slots = Vec::new();
+    for g in &indices {
+        let Some(info) = found.iter().find(|f| f["index"].as_u64() == Some(*g as u64)) else {
+            return Err(Error(format!("--gpu {g}: there is no GPU {g} ({} found; see `h3 gpus`)", found.len())));
+        };
+        let shared = hooks && opts.shared_gpus.as_ref().is_none_or(|s| s.contains(g));
+        slots.push(Slot {
+            gpu: *g,
+            name: info["name"].as_str().unwrap_or("?").to_string(),
+            pci: info["pci"].as_str().unwrap_or("").to_string(),
+            mem_gib: info["mem_gib"].as_f64().unwrap_or(0.0),
+            shared,
+            engine: "unloaded".into(),
+            running: None,
+            last_active: Instant::now(),
+            unload_requested: false,
+            info: Value::Null,
+            worker_pid: None,
+            stats: Value::Null,
+            busy_sample: None,
+        });
+    }
     let listener = TcpListener::bind(&opts.listen).map_err(|e| Error(format!("cannot listen on {}: {e}", opts.listen)))?;
     eprintln!("h3 {} serving on {} - model {} (loaded on the first job){}", crate::version(), opts.listen, opts.model.display(),
               opts.idle.map_or(String::new(), |d| format!(", unloaded after {} s idle", d.as_secs())));
+    for sl in &slots {
+        eprintln!("  GPU {}: {} ({:.0} GiB{}){}", sl.gpu, sl.name, sl.mem_gib,
+                  if sl.pci.is_empty() { String::new() } else { format!(", {}", sl.pci) },
+                  if sl.shared { " - shared: lock file / model switch before loading" } else { "" });
+    }
     if let Some(ui) = &opts.ui {
         eprintln!("  web front end: {} at http://{}/", ui.display(), opts.listen);
     }
     if let Some(l) = &opts.legacy_api {
         eprintln!("  not yet ported front-end calls go to {l}");
     }
+    let n = slots.len();
     let d = Arc::new(Daemon {
         opts,
-        s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, engine: "unloaded".into(), running: None,
-                               worker_pid: None, stats: Value::Null, busy_sample: None,
-                               last_active: Instant::now(), unload_requested: false, shutdown: false, info: Value::Null }),
+        s: Mutex::new(Shared { jobs: BTreeMap::new(), queue: VecDeque::new(), next: 1, shutdown: false, slots }),
         cv: Condvar::new(),
+        hooks: Mutex::new(Hooks::default()),
     });
-    let worker = {
-        let d = d.clone();
-        std::thread::spawn(move || d.worker())
-    };
+    let threads: Vec<_> = (0..n)
+        .map(|k| {
+            let d = d.clone();
+            std::thread::spawn(move || d.slot_thread(k))
+        })
+        .collect();
     // SIGTERM (podman stop) -> the same as POST /shutdown
     crate::signals::install();
     listener.set_nonblocking(true)?;
@@ -610,13 +741,14 @@ pub fn serve(opts: Options) -> Result<()> {
             if !s.shutdown {
                 eprintln!("[daemon] terminate signal: shutting down");
                 s.shutdown = true;
-                if let Some(r) = s.running {
-                    s.jobs.get(&r).unwrap().cancel.store(true, Ordering::Relaxed);
+                let running: Vec<u64> = s.slots.iter().filter_map(|sl| sl.running).collect();
+                for r in running {
+                    s.jobs[&r].cancel.store(true, Ordering::Relaxed);
                 }
                 d.cv.notify_all();
             }
         }
-        if worker.is_finished() {
+        if threads.iter().all(|t| t.is_finished()) {
             break;
         }
         match listener.accept() {
@@ -640,23 +772,33 @@ pub fn serve(opts: Options) -> Result<()> {
             Err(e) => eprintln!("[daemon] accept: {e}"),
         }
     }
-    let _ = worker.join();
+    for t in threads {
+        let _ = t.join();
+    }
     eprintln!("[daemon] stopped");
     Ok(())
 }
 
-/// The card's compute-engine busy share since the last call, from the xe driver's idle counter (the whole card, every
-/// process): 100 - (idle ms gained) / (wall ms passed). The driver names that counter "gt<N>-rc" (render/compute; the
-/// media engine's "-mc" is left out). None when the counter is not there, and on the first call.
-fn gpu_busy(last: &mut Option<(Instant, u64)>) -> Option<f64> {
-    let idle: u64 = std::fs::read_dir("/sys/class/drm")
+/// A card's compute-engine busy share since the last call, from the xe driver's idle counter (the whole card, every
+/// process): 100 - (idle ms gained) / (wall ms passed). The card is found by its PCI address; the counter is the one
+/// the driver names "gt<N>-rc" (render/compute; the media engine's "-mc" is left out). None when there is no such
+/// counter, and on the first call.
+fn gpu_busy(pci: &str, last: &mut Option<(Instant, u64)>) -> Option<f64> {
+    let tile = if pci.is_empty() {
+        // no address: the first card (right on a one-GPU machine)
+        std::fs::read_dir("/sys/class/drm")
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("card") && !n.to_string_lossy().contains('-')))
+            .map(|p| p.join("device/tile0"))
+            .find(|t| t.exists())?
+    } else {
+        PathBuf::from(format!("/sys/bus/pci/devices/{pci}/tile0"))
+    };
+    let idle: u64 = std::fs::read_dir(&tile)
         .ok()?
         .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("card") && !n.contains('-')
-        })
-        .flat_map(|card| std::fs::read_dir(card.path().join("device/tile0")).into_iter().flatten().flatten())
         .map(|gt| gt.path().join("gtidle"))
         .filter(|g| std::fs::read_to_string(g.join("name")).is_ok_and(|n| n.trim().ends_with("-rc")))
         .filter_map(|g| std::fs::read_to_string(g.join("idle_residency_ms")).ok())

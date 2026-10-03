@@ -25,6 +25,9 @@ const RTLD_GLOBAL: c_int = 0x100;
 pub struct Api {
     pub last_error: unsafe extern "C" fn() -> *const c_char,
     pub open: unsafe extern "C" fn() -> *mut c_void,
+    pub gpu_count: unsafe extern "C" fn() -> c_int,
+    pub gpu_info: unsafe extern "C" fn(c_int, *mut c_char, c_int, *mut u64, *mut c_char, c_int) -> c_int,
+    pub open_gpu: unsafe extern "C" fn(c_int) -> *mut c_void,
     pub destroy: unsafe extern "C" fn(*mut c_void),
     pub device_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     pub alloc: unsafe extern "C" fn(*mut c_void, u64) -> *mut c_void,
@@ -190,6 +193,9 @@ impl Api {
         Ok(Api {
             last_error: sym!("h3s_last_error"),
             open: sym!("h3s_open"),
+            gpu_count: sym!("h3s_gpu_count"),
+            gpu_info: sym!("h3s_gpu_info"),
+            open_gpu: sym!("h3s_open_gpu"),
             destroy: sym!("h3s_destroy"),
             device_name: sym!("h3s_device_name"),
             alloc: sym!("h3s_alloc"),

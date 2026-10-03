@@ -1,4 +1,4 @@
-//! `h3 worker`: the process that holds the GPU. `h3 serve` starts it when a job needs the engine and lets it end
+//! `h3 worker --gpu N`: the process that holds GPU N (one of `h3 gpus`). `h3 serve` starts it when a job needs the engine and lets it end
 //! when the engine is to be unloaded, so the GPU's memory goes back when the process exits - whatever state the
 //! driver was in - and a fault in a kernel takes down this process, not the daemon or the front end.
 //!
@@ -36,7 +36,7 @@ fn emit(v: Value) {
     let _ = out.flush();
 }
 
-pub fn run(model: PathBuf, threads: usize) -> Result<()> {
+pub fn run(gpu: usize, model: PathBuf, threads: usize) -> Result<()> {
     // stdin is read on its own thread: a cancel must get through while a job runs on this one
     let current = Arc::new(AtomicU64::new(0)); // the job running now (0: none)
     let cancel = Arc::new(AtomicBool::new(false)); // for the job running now
@@ -65,7 +65,7 @@ pub fn run(model: PathBuf, threads: usize) -> Result<()> {
     }
 
     // wait until the card has the room, then load
-    let dev = Device::open()?;
+    let dev = Device::open_index(gpu)?;
     let need = (Checkpoint::open(&model)?.data_bytes() + (8u64 << 30)).min(dev.mem_cap());
     loop {
         if abort.load(Ordering::SeqCst) {
@@ -85,7 +85,7 @@ pub fn run(model: PathBuf, threads: usize) -> Result<()> {
         emit(json!({"event": "engine", "state": "loading", "line": l}));
     };
     let e = Engine::load_on(dev, &model, None, threads, &mut log)?;
-    emit(json!({"event": "ready", "info": {"device": e.dev.name(), "model": model, "blocks": e.model.blocks.len(),
+    emit(json!({"event": "ready", "info": {"gpu": gpu, "device": e.dev.name(), "model": model, "blocks": e.model.blocks.len(),
                                            "gib_in_use": gib(e.dev.mem_used()), "gib_cap": gib(e.dev.mem_cap())}}));
     // once a second: what the engine holds on the card and what the card has free (for `h3 status`)
     let stats_stop = Arc::new(AtomicBool::new(false));
