@@ -163,6 +163,22 @@ pub fn rms_norm_mod(x: &Tensor, weight: &Tensor, eps: f32, m: Option<&Mod>, out:
     dev.check(rc)
 }
 
+/// Layer norm of x [M, C] per row, with an optional weight and bias (float32 [C]). `out` may be `x`.
+pub fn layer_norm(x: &Tensor, c: usize, weight: Option<&Tensor>, bias: Option<&Tensor>, eps: f32, out: &Tensor) -> Result<()> {
+    let rows = x.elements() / c.max(1);
+    if x.elements() != rows * c || out.elements() != x.elements() {
+        return Err(Error(format!("layer_norm: x {:?}, out {:?}, {c} features", x.shape, out.shape)));
+    }
+    let opt = |t: Option<&Tensor>, what: &str| -> Result<*const f32> { t.map_or(Ok(std::ptr::null()), |t| floats(t, what, c)) };
+    let dev = x.buf.device();
+    // SAFETY: device pointers of this device; sizes checked above.
+    let rc = unsafe {
+        (dev.api.layer_norm)(dev.ctx, x.buf.ptr(), x.dtype.kernel_code()?, rows as i64, c as i64, opt(weight, "the norm weight")?, opt(bias, "the norm bias")?,
+                             eps, out.buf.ptr(), out.dtype.kernel_code()?)
+    };
+    dev.check(rc)
+}
+
 /// Token rows of `heads` x `dim` features inside a wider row-major buffer: row s starts at element
 /// `offset + s * stride`. This is how q, k and v sit inside the qkv linear's output.
 #[derive(Clone, Copy)]

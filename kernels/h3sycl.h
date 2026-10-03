@@ -85,6 +85,9 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
  *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
  *
  * x, out [M, C]; weight float32 [C]; rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
+/* Layer norm of x [M, C] per row: (x - mean) / sqrt(var + eps) * weight + bias (weight, bias float32 [C] or NULL). */
+int h3s_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
+                   void* out, int out_dt);
 int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, float eps,
                      const int32_t* rows, const float* scale, const float* shift, void* out, int out_dt);
 

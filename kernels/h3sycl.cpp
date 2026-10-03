@@ -117,6 +117,7 @@ struct Ctx {
     std::map<std::tuple<int64_t, int64_t, int64_t, int, int>, dnnl::matmul> lin;          // (M, K, N, dt, bias)
     bool fused_ok = true;                          // oneDNN took the post-op form (else: int32 + our rescale kernel)
     bool rot_f32 = true;                           // oneDNN took a float32 result for the 16-bit rotation
+    bool rotq_fused = true;                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
     // library refuses an allocation that would pass the cap instead of asking the driver
     std::mutex mem_mu;
@@ -198,6 +199,7 @@ void init(Ctx& c) {
     setenv("_ONEDNN_GRAPH_SDPA_NO_FALLBACK", "1", 1);
 #endif
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
+    c.rotq_fused = std::getenv("H3S_ROTQ_SPLIT") == nullptr;
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
     if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
@@ -320,6 +322,78 @@ void h3s_destroy(void* ctx) {
     delete c;
 }
 
+// Rotation, row scale and quantization in one kernel, for groups of 256 (the int8_convrot checkpoints): reads the
+// 16-bit input once and writes the int8 copy and the row scales, where the passes below write and read a float32
+// copy of the input three times.
+//
+// One work-group per row, 16 sub-groups of 16 lanes; a sub-group rotates one group of 256 features at a time, lane
+// L holding features L*16 .. L*16+15 of it. The normalized Hadamard matrix of 256 is h4 (x) h4 (x) h4 (x) h4, one
+// factor per base-4 digit of the feature index, so it applies digit by digit in any order: the two low digits
+// inside each lane's registers, the two high digits across the lanes (shuffles). For one digit, with x_0..x_3 the
+// four values that differ only in that digit, h4 gives y_a = (x_0 + x_1 + x_2 + x_3) - 2 x_(3-a).
+// KG: the most groups one sub-group holds (in registers) for a row; K <= KG * 16 * 256.
+extern "C++" {
+template <int KG>
+static void rotate_quantize(sycl::queue& q, const void* x, int x_dt, int64_t M, int64_t K, int8_t* xq, float* rs) {
+    constexpr int kSg = 16, kNsg = 16;
+    const int64_t G = K / 256;
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) M * kSg * kNsg), sycl::range<1>(kSg * kNsg)),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+        const auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_id()[0], s = (int) sg.get_group_id()[0];
+        const size_t r = it.get_group(0);
+        float v[KG][16];
+        float m = 0.0f;
+#pragma unroll
+        for (int k = 0; k < KG; ++k) {
+            const int64_t gi = s + (int64_t) k * kNsg;
+            if (gi >= G) break;     // the same for every lane of the sub-group
+            const size_t base = r * K + gi * 256 + lane * 16;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) v[k][e] = load(x, x_dt, base + e);
+            // low two digits: inside the lane
+#pragma unroll
+            for (int d = 1; d <= 4; d *= 4) {
+#pragma unroll
+                for (int e0 = 0; e0 < 16; ++e0) {
+                    if ((e0 / d) % 4 != 0) continue;
+                    const float a0 = v[k][e0], a1 = v[k][e0 + d], a2 = v[k][e0 + 2 * d], a3 = v[k][e0 + 3 * d];
+                    const float t = a0 + a1 + a2 + a3;
+                    v[k][e0] = t - 2.0f * a3; v[k][e0 + d] = t - 2.0f * a2;
+                    v[k][e0 + 2 * d] = t - 2.0f * a1; v[k][e0 + 3 * d] = t - 2.0f * a0;
+                }
+            }
+            // high two digits: across the lanes
+#pragma unroll
+            for (int e = 0; e < 16; ++e) {
+                float a = v[k][e];
+#pragma unroll
+                for (int sh = 0; sh <= 2; sh += 2) {
+                    const float p1 = sycl::permute_group_by_xor(sg, a, 1 << sh);
+                    const float t2 = a + p1;
+                    const float t = t2 + sycl::permute_group_by_xor(sg, t2, 2 << sh);
+                    a = t - 2.0f * sycl::permute_group_by_xor(sg, a, 3 << sh);
+                }
+                a *= 1.0f / 16.0f;
+                v[k][e] = a;
+                m = sycl::fmax(m, sycl::fabs(a));
+            }
+        }
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        const float scale = sycl::fmax(m / 127.0f, 1e-30f);
+        if (it.get_local_id(0) == 0) rs[r] = scale;
+#pragma unroll
+        for (int k = 0; k < KG; ++k) {
+            const int64_t gi = s + (int64_t) k * kNsg;
+            if (gi >= G) break;
+            const size_t base = r * K + gi * 256 + lane * 16;
+#pragma unroll
+            for (int e = 0; e < 16; ++e) xq[base + e] = (int8_t) sycl::clamp(sycl::rint(v[k][e] / scale), -128.0f, 127.0f);
+        }
+    });
+}
+}  // extern "C++"
+
 // The passes (the contract is in h3sycl.h):
 //   1. rotation     x_rot = x . H per group: ONE GEMM [M * K / g, g] x [g, g] on the matrix engine (it is ~0.3 ms;
 //                   a scalar butterfly kernel was 5 ms a pass)
@@ -353,6 +427,18 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
     };
     if (c.profile) { q.wait(); clock = std::chrono::steady_clock::now(); ++c.lin_calls; }
 
+    const bool per_n = n_wscale > 1;
+    const int64_t kg = (K / 256 + 15) / 16;
+    if (rot && g == 256 && c.rotq_fused && kg <= 4) {
+        // ---- 1-3 in one kernel
+        switch (kg) {
+            case 1: rotate_quantize<1>(q, x, x_dt, M, K, xq, rs); break;
+            case 2: rotate_quantize<2>(q, x, x_dt, M, K, xq, rs); break;
+            case 3: rotate_quantize<3>(q, x, x_dt, M, K, xq, rs); break;
+            default: rotate_quantize<4>(q, x, x_dt, M, K, xq, rs); break;
+        }
+        lap(0);
+    } else {
     // ---- 1. rotation on the matrix engine
     const void* xs = x;          // what the quantizer reads
     int xs_dt = x_dt;
@@ -394,7 +480,6 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
         const float m = sycl::reduce_over_group(it.get_group(), v, sycl::maximum<float>());
         if (it.get_local_id(1) == 0) gmax[r * G + it.get_group(1)] = m;
     });
-    const bool per_n = n_wscale > 1;
     q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) {
         float m = 0.0f;
         for (int64_t j = 0; j < G; ++j) m = sycl::fmax(m, gmax[r[0] * G + j]);
@@ -407,12 +492,9 @@ static int int8_linear_rows(Ctx& c, const void* x, int x_dt, int64_t M, int64_t 
         const size_t i = id[0] * K + id[1];
         xq[i] = (int8_t) sycl::clamp(sycl::rint(load(xs, xs_dt, i) / rs[id[0]]), -128.0f, 127.0f);
     });
-    if (!per_n) {
-        const float ws = 0.0f;   // read on the device below
-        (void) ws;
-        q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) { rs[r[0]] *= wscale[0]; });
-    }
     lap(2);
+    }
+    if (!per_n) q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) { rs[r[0]] *= wscale[0]; });
     // ---- 4. int8 GEMM with the rescale and the bias as post-ops
     memory::desc smd({M, K}, memory::data_type::s8, memory::format_tag::ab);
     memory::desc wmd({K, N}, memory::data_type::s8, memory::format_tag::ba);     // the [N, K] buffer, read transposed
@@ -564,6 +646,34 @@ int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, c
             const size_t m = (size_t) rows[r] * C + i;
             v = v * (1.0f + scale[m]) + shift[m];
         }
+        store(out, out_dt, r * C + i, v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
+                   void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    float* st = c.grow(c.inv, c.inv_cap, (size_t) M * 2);   // (mean, 1 / std) per row
+    if (!st) return -1;
+    c.q.parallel_for(sycl::range<1>((size_t) M), [=](sycl::id<1> r) {
+        float s = 0.0f;
+        for (int64_t i = 0; i < C; ++i) s += load(x, x_dt, r[0] * C + i);
+        const float mean = s / (float) C;
+        float v2 = 0.0f;
+        for (int64_t i = 0; i < C; ++i) {
+            const float d = load(x, x_dt, r[0] * C + i) - mean;
+            v2 += d * d;
+        }
+        st[2 * r[0]] = mean;
+        st[2 * r[0] + 1] = sycl::rsqrt(v2 / (float) C + eps);
+    });
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t r = id[0], i = id[1];
+        float v = (load(x, x_dt, r * C + i) - st[2 * r]) * st[2 * r + 1];
+        if (weight) v *= weight[i];
+        if (bias) v += bias[i];
         store(out, out_dt, r * C + i, v);
     });
     return 0;

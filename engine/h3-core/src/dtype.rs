@@ -84,6 +84,42 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// float32 -> IEEE half, round to nearest even (overflow to infinity, small values to subnormals or zero).
+pub fn f32_to_f16(f: f32) -> u16 {
+    let u = f.to_bits();
+    let sign = ((u >> 16) & 0x8000) as u16;
+    let exp = ((u >> 23) & 0xff) as i32;
+    let man = u & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if man != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // subnormal: the implicit bit joins the mantissa, shifted into place with rounding
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rest = m & ((1u32 << shift) - 1);
+        let mut h = m >> shift;
+        if rest > half || (rest == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mut h = ((e as u32) << 10) | (man >> 13);
+    let rest = man & 0x1fff;
+    if rest > 0x1000 || (rest == 0x1000 && h & 1 == 1) {
+        h += 1; // a carry into the exponent is the right rounding (up to infinity)
+    }
+    sign | h as u16
+}
+
 /// Bytes of a tensor as float32 values (F32, F16 and BF16 only).
 pub fn bytes_to_f32(bytes: &[u8], dt: DType) -> Result<Vec<f32>> {
     Ok(match dt {

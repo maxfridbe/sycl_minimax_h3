@@ -13,6 +13,7 @@ pub mod ops;
 pub mod reference;
 pub mod rng;
 pub mod safetensors;
+pub mod vae;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

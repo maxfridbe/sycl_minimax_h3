@@ -1166,6 +1166,16 @@ def cmd_decode(args):
     _t("video decoded", t0)
     print("  frames:", tuple(images.shape))
     del vvae; gc.collect()
+    if os.environ.get("H3X_DUMP_DECODE"):   # h3x: the decoders' output for the Rust engine's decode check
+        from safetensors.torch import save_file
+        _dd = {"images": images.detach().float().cpu().contiguous(),
+               "latents.video": vid_lat.detach().float().cpu().contiguous(),
+               "latents.audio": aud_lat.detach().float().cpu().contiguous()}
+        if audio is not None:
+            _dd["waveform"] = (audio["waveform"] if isinstance(audio, dict) else audio).detach().float().cpu().contiguous()
+        save_file(_dd, os.environ["H3X_DUMP_DECODE"], metadata={
+            "sample_rate": str(audio.get("sample_rate", 32000) if isinstance(audio, dict) else 32000)})
+        print("  decode dump -> " + os.environ["H3X_DUMP_DECODE"] + ": " + ", ".join(f"{k}{tuple(v.shape)}" for k, v in _dd.items()), flush=True)
 
     _fbytes = images.numel() * images.element_size()
     try:
