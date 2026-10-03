@@ -147,8 +147,8 @@ impl Studio {
         if let Some(u) = item["upscale"].as_f64().or_else(|| item["upscale"].as_str().and_then(|v| v.parse().ok())).filter(|u| *u > 1.0) {
             spec["upscale"] = json!(u);
         }
-        if let Some(l) = item["loras"].as_array().and_then(|a| a.first()).and_then(|l| l.as_str()) {
-            spec["lora"] = json!(l);
+        if let Some(ls) = item["loras"].as_array().filter(|a| !a.is_empty()) {
+            spec["lora"] = json!(ls.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join(","));
         }
         if let Some(r) = item["ref_audios"].as_array() {
             spec["ref_audio"] = json!(r.iter().filter_map(|x| x.as_str()).map(|f| format!("{}/{f}", self.out_in)).collect::<Vec<_>>().join(","));
@@ -206,7 +206,7 @@ impl Studio {
         let log: Vec<String> = j["log"].as_array().map(|a| a.iter().filter_map(|l| l.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let has = |p: &str| log.iter().any(|l| l.starts_with(p));
         let secs_after = |p: &str| -> Option<f64> {
-            log.iter().rev().find(|l| l.starts_with(p)).and_then(|l| {
+            log.iter().rev().filter(|l| l.starts_with(p)).find(|l| l.contains(" in ")).and_then(|l| {
                 let i = l.rfind(" in ")?;
                 l[i + 4..].split_whitespace().next()?.parse().ok()
             })

@@ -26,8 +26,8 @@ Methods: `status`, `wait {version?, timeout_s?}`, `generate`, `cancel`, `queue.l
 
 `prompt` (required), `seconds` 1-15.1 (10), `steps` 1-40 (10), `seed`, `width` / `height` (multiples of 32,
 256-1344, at most 768x1344 pixels; 768x576), `label` ("Name NN/MM: ..." - NN is the edit order, the prefix the
-series), `project`, `batch`, `camera`, `upscale` (latent upscale at decode), `loras` (["PATH:STRENGTH"]; the first is
-used), `queue` (true: queue when busy instead of answering 409).
+series), `project`, `batch`, `camera`, `upscale` (latent upscale at decode), `loras` (["PATH:STRENGTH", ...]; they
+stack), `queue` (true: queue when busy instead of answering 409).
 
 Anchors - an anchor is `prev` (the series' previous clip), `prev_cam` (same camera), `first` (the series' first clip),
 `first_cam`, or a file in the clips directory:

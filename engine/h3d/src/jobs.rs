@@ -754,8 +754,8 @@ pub struct ClipSpec<'a> {
     pub steps: usize,
     pub te: TeFiles<'a>,
     pub vaes: Vaes<'a>,
-    /// a LoRA and its strength
-    pub lora: Option<(&'a Path, f32)>,
+    /// LoRAs and their strengths (they stack)
+    pub lora: Vec<(&'a Path, f32)>,
     pub inputs: ClipInputs<'a>,
 }
 
@@ -958,17 +958,18 @@ pub fn generate(e: &Engine, c: &ClipSpec, out: &Path, ctl: &mut Ctl) -> Result<V
     let labels: Vec<String> = (1..=c.inputs.ref_audio.len()).map(|j| format!("<Audio {j}>: ")).collect();
     let (ctx, ids, hidden, te_secs) = encode_presentation(&e.dev, e.threads, &labels, &c.prompt, &c.te, ctl)?;
     ctl.check()?;
-    let lora = match c.lora {
-        Some((p, strength)) => {
-            let l = h3_core::lora::LoraSet::load(&e.dev, &Checkpoint::open(p)?, strength, e.model.blocks.len(), 2)?;
-            if l.max_rank > h3_core::dit::MAX_LORA_RANK {
-                return Err(Error(format!("LoRA rank {} is over {}", l.max_rank, h3_core::dit::MAX_LORA_RANK)));
-            }
-            ctl.say(format!("lora   : {} @ {strength} ({} layers, rank {})", p.display(), l.layers, l.max_rank));
-            Some(l)
+    let mut lora: Option<h3_core::lora::LoraSet> = None;
+    for (p, strength) in &c.lora {
+        let l = h3_core::lora::LoraSet::load(&e.dev, &Checkpoint::open(p)?, *strength, e.model.blocks.len(), 2)?;
+        if l.max_rank > h3_core::dit::MAX_LORA_RANK {
+            return Err(Error(format!("LoRA rank {} is over {}", l.max_rank, h3_core::dit::MAX_LORA_RANK)));
         }
-        None => None,
-    };
+        ctl.say(format!("lora   : {} @ {strength} ({} layers, rank {})", p.display(), l.layers, l.max_rank));
+        match lora.as_mut() {
+            Some(set) => set.stack(l),
+            None => lora = Some(l),
+        }
+    }
     let t0 = Instant::now();
     let text = {
         let refiner = TextRefiner::load(&e.dev, &e.ck, e.threads)?;
@@ -1112,7 +1113,7 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     audio: Some(Path::new(s("audio_vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors"))),
                     upscale: upscale.map(|u| (Path::new(s("upscaler").unwrap_or("/models/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")), u as f32)),
                 },
-                lora: None,
+                lora: Vec::new(),
                 inputs: ClipInputs {
                     first_latent: s("first_latent").map(Path::new),
                     first_frame: s("first_frame").map(Path::new),
@@ -1146,13 +1147,19 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     }),
                 },
             };
-            let lora = match s("lora") {
-                Some(l) => {
-                    let (p, st) = l.rsplit_once(':').filter(|(_, st)| st.parse::<f32>().is_ok()).unwrap_or((l, "1"));
-                    Some((Path::new(p), st.parse::<f32>().unwrap_or(1.0)))
-                }
-                None => None,
-            };
+            // "PATH[:STRENGTH][,PATH[:STRENGTH]...]"
+            let lora: Vec<(&Path, f32)> = s("lora")
+                .map(|l| {
+                    l.split(',')
+                        .filter(|x| !x.trim().is_empty())
+                        .map(|x| {
+                            let x = x.trim();
+                            let (p, st) = x.rsplit_once(':').filter(|(_, st)| st.parse::<f32>().is_ok()).unwrap_or((x, "1"));
+                            (Path::new(p), st.parse::<f32>().unwrap_or(1.0))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let c = ClipSpec { lora, ..c };
             generate(e, &c, Path::new(out), ctl)
         }

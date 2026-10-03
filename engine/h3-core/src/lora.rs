@@ -17,8 +17,8 @@ use crate::{Error, Result};
 /// The four linears of a block, in the order the block runs them.
 pub const LINEARS: [&str; 4] = ["attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2"];
 
-/// A block's LoRAs, per linear of `LINEARS`.
-pub type BlockLora = [Option<Lora>; 4];
+/// A block's LoRAs, per linear of `LINEARS` (several LoRAs stack: each adds its own side path).
+pub type BlockLora = [Vec<Lora>; 4];
 
 pub struct LoraSet {
     pub blocks: Vec<BlockLora>,
@@ -39,7 +39,7 @@ impl LoraSet {
         let mut side = |prefix: &str, n: usize| -> Result<Vec<BlockLora>> {
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
-                let mut bl: BlockLora = [None, None, None, None];
+                let mut bl: BlockLora = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
                 for (j, l) in LINEARS.iter().enumerate() {
                     let p = format!("diffusion_model.{prefix}.{i}.{l}");
                     let (ka, kb) = (format!("{p}.lora_A.weight"), format!("{p}.lora_B.weight"));
@@ -58,7 +58,7 @@ impl LoraSet {
                     };
                     let scale = strength * alpha;
                     b.iter_mut().for_each(|v| *v *= scale);
-                    bl[j] = Some(Lora { a: bf16(dev, &sa, &a)?, b: bf16(dev, &sb, &b)? });
+                    bl[j].push(Lora { a: bf16(dev, &sa, &a)?, b: bf16(dev, &sb, &b)? });
                     max_rank = max_rank.max(r);
                     layers += 1;
                 }
@@ -72,5 +72,16 @@ impl LoraSet {
             return Err(Error(format!("{}: no LoRA layers this model has", ck.path.display())));
         }
         Ok(LoraSet { blocks, refiner, max_rank, layers })
+    }
+
+    /// Another LoRA's layers on top of these.
+    pub fn stack(&mut self, other: LoraSet) {
+        for (mine, theirs) in self.blocks.iter_mut().zip(other.blocks).chain(self.refiner.iter_mut().zip(other.refiner)) {
+            for (m, t) in mine.iter_mut().zip(theirs) {
+                m.extend(t);
+            }
+        }
+        self.max_rank = self.max_rank.max(other.max_rank);
+        self.layers += other.layers;
     }
 }

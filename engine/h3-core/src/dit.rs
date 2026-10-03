@@ -243,10 +243,10 @@ impl Scratch {
 
 /// A LoRA's addition to linear `j`'s output, when the block has one there.
 pub(crate) fn side(lora: Option<&crate::lora::BlockLora>, j: usize, x: &Tensor, out: &Tensor, tmp: &Tensor) -> Result<()> {
-    match lora.and_then(|l| l[j].as_ref()) {
-        Some(l) => l.apply(x, tmp, out),
-        None => Ok(()),
+    for l in lora.map(|l| l[j].as_slice()).unwrap_or(&[]) {
+        l.apply(x, tmp, out)?;
     }
+    Ok(())
 }
 
 /// Called after each stage of a block with the stage's name and its result: how a run is checked against a reference.
