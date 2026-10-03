@@ -61,8 +61,21 @@ The denoiser's 50 blocks run from the Rust engine alone and track the reference 
 | of which attention, per block, 16.5k tokens | 102 ms | 96 ms | |
 | of which everything else, per block, 16.5k tokens | ~99 ms | 81 ms | |
 
-Not a whole clip yet: the embeddings around the blocks, the sampler, the decoders and the text encoder are still to
-port, so the clip timings above come from the PyTorch process with our linear kernel plugged in.
+### A whole denoise in the Rust engine
+
+Text conditioning and starting noise in, finished latents out, with no PyTorch: the text refiner, the patch
+embeddings, the 50 blocks, the final layer and the Euler sampler (`h3d denoise`, checked against a reference run dump).
+The bakery prompt at 384x288, 2 s, 8 steps (2,159 tokens), with the same int8 weights:
+
+| | reference | Rust + SYCL engine | |
+|---|---:|---:|---:|
+| 8 sampler steps | 15.7 s | 6.8 s (0.78 s a step after the first) | 2.3x |
+| text refiner (once per clip) | included above | 3.9 s, loaded and freed | |
+| finished latents against the reference's | | cosine 0.985 video, 0.997 audio | |
+
+Decoded by the reference's decoders, it is the same scene with small differences in detail.
+The decoders, the upscaler and the text encoder are still to port, so the whole-clip timings above come from the
+PyTorch process with our linear kernel plugged in.
 
 What the card can do, measured with bare oneDNN (docs/PHASE0-RESULTS.md): int8 matrix multiply 317-357 T-ops/s
 against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention built from separate steps is bound by

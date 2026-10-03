@@ -18,9 +18,11 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | attention (scores, softmax, weighted sum) | PyTorch -> oneDNN's fused kernel, 102 ms | `h3s_attention`: oneDNN 3.12's fused kernel made fail-safe, 96 ms; our own bounded form behind it (below) | done |
 | gated activation between the MLP's two linears | PyTorch | `h3s_swiglu` (its own pass; folding it into the quantizer is open) | done |
 | norm, scale+shift, gated residual add | PyTorch | `h3s_rms_norm_mod`, `h3s_gate_add` | done |
-| the 50 denoiser blocks, with their per-step tables and position rotations | ComfyUI `ldm/minimax/model.py` | `h3-core::dit` | done (the 2 text refiner blocks: open) |
-| time embedding, patch embedding, final layer, token layout | ComfyUI | `h3-core::dit` | open |
-| sampler (Euler, 8 steps) and PyTorch-compatible noise | ComfyUI | `h3-core::sampler` | open |
+| the 50 denoiser blocks, with their per-step tables and position rotations | ComfyUI `ldm/minimax/model.py` | `h3-core::dit` | done |
+| text projection + the 2 text refiner blocks | ComfyUI | `h3-core::denoiser::TextRefiner` (loaded per clip, freed) | done |
+| time embedding, patch embedding, final layer, token layout | ComfyUI | `h3-core::layout`, `h3-core::denoiser` | done (keyframes, reference media and masks: open) |
+| sampler (Euler, simple schedule, the carried audio stream) | ComfyUI | `h3-core::denoiser::sample` | done: 8 steps 6.8 s vs 15.7 s, latents cosine 0.985 / 0.997 |
+| PyTorch-compatible starting noise | ComfyUI | `h3-core::rng` | open (read from the run dump for now) |
 | LoRA applied to int8 weights | ComfyUI | `h3-core::lora` | open |
 | latent upscaler (3-D convolutions) | ComfyUI | SYCL conv kernels + Rust graph | open |
 | video decoder (3-D convolutions, group norm) | ComfyUI | SYCL conv kernels + Rust graph | open |
