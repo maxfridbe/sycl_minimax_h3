@@ -69,6 +69,10 @@ pub struct Api {
         c_int,          // out_dt
     ) -> c_int,
     #[allow(clippy::type_complexity)]
+    pub conv1d: unsafe extern "C" fn(*mut c_void, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, i64, *mut f32, i64) -> c_int,
+    pub conv_transpose1d: unsafe extern "C" fn(*mut c_void, *const f32, i64, i64, i64, *const f32, i64, i64, *const f32, i64, i64, *mut f32, i64) -> c_int,
+    pub aa_snake: unsafe extern "C" fn(*mut c_void, *const f32, i64, i64, i64, *const f32, *const f32, *const f32, *const f32, *mut f32) -> c_int,
+    pub scale: unsafe extern "C" fn(*mut c_void, *mut f32, i64, f32) -> c_int,
     pub layer_norm: unsafe extern "C" fn(*mut c_void, *const c_void, c_int, i64, i64, *const f32, *const f32, f32, *mut c_void, c_int) -> c_int,
     pub rms_norm_mod: unsafe extern "C" fn(
         *mut c_void,    // ctx
@@ -211,6 +215,10 @@ impl Api {
             copy: sym!("h3s_copy"),
             int8_linear: sym!("h3s_int8_linear"),
             linear: sym!("h3s_linear"),
+            conv1d: sym!("h3s_conv1d"),
+            conv_transpose1d: sym!("h3s_conv_transpose1d"),
+            aa_snake: sym!("h3s_aa_snake"),
+            scale: sym!("h3s_scale"),
             layer_norm: sym!("h3s_layer_norm"),
             rms_norm_mod: sym!("h3s_rms_norm_mod"),
             rms_rope: sym!("h3s_rms_rope"),

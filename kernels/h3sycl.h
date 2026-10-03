@@ -85,6 +85,18 @@ int h3s_linear(void* ctx, const void* x, int dt, int64_t M, int64_t K, const voi
  *   out = n * (1 + scale[rows[r]]) + shift[rows[r]]        (or out = n when rows, scale or shift is NULL)
  *
  * x, out [M, C]; weight float32 [C]; rows int32 [M]; scale, shift float32 [R, C]. out may be x. */
+/* The audio decoder's 1-D operations, float32, signals [B, C, L] row-major.
+ * conv1d: w [Co, Ci, K], zero padding `pad` both sides; out [B, Co, Lo], Lo = (L + 2 pad - dil (K - 1) - 1) / stride + 1.
+ * conv_transpose1d: w [Ci, Co, K]; out [B, Co, Lo], Lo = (L - 1) stride - 2 pad + K.
+ * aa_snake: BigVGAN's anti-aliased SnakeBeta (2x up, x + sin^2(e^a x) / e^b, 2x down), 12-tap filters; out [B, C, L].
+ * scale: x *= s over n values. */
+int h3s_conv1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+               const float* bias, int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo);
+int h3s_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                         const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo);
+int h3s_aa_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* log_alpha, const float* log_beta,
+                 const float* up, const float* down, float* out);
+int h3s_scale(void* ctx, float* x, int64_t n, float s);
 /* Layer norm of x [M, C] per row: (x - mean) / sqrt(var + eps) * weight + bias (weight, bias float32 [C] or NULL). */
 int h3s_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
                    void* out, int out_dt);

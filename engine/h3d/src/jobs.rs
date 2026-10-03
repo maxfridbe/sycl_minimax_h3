@@ -409,6 +409,101 @@ pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) 
     Ok(json!({"tokens": d.tokens(), "steps": per_step, "cosine_video": cv.1, "cosine_audio": ca.1, "worst_step_cosine": worst, "seconds": secs}))
 }
 
+/// The decoders' checkpoints: video, and audio (optional: a silent clip without it).
+pub struct Vaes<'a> {
+    pub video: &'a Path,
+    pub audio: Option<&'a Path>,
+}
+
+/// Latents -> a clip: the video decoder (and the audio decoder) on the latents in `latents` (a `.safetensors` with
+/// `samples.video` / `samples.audio`, as `denoise` writes it, or `latents.*`), written to `out` (.mp4). `check`: a
+/// decode dump of the reference (h3x.py H3X_DUMP_DECODE) to compare the frames and the sound with.
+pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
+    let vae = vaes.video;
+    let t_all = Instant::now();
+    let lat = Checkpoint::open(latents)?;
+    let key = ["samples.video", "latents.video"].into_iter().find(|k| lat.entries.contains_key(*k)).ok_or("the latents file has no samples.video")?;
+    let shape = lat.get(key)?.shape.clone(); // [1, 24, T, H, W]
+    let (t, h, w) = (shape[2], shape[3], shape[4]);
+    let z = h3_core::dtype::bytes_to_f32(&lat.read(key)?, lat.get(key)?.dtype)?;
+    let ck = Checkpoint::open(vae)?;
+    let dec = h3_core::vae::VideoDecoder::load(dev, &ck, threads)?;
+    ctl.say(format!("vae    : {} loaded, {:.2} GiB in {:.1} s", vae.display(), gib(dec.load_bytes), dec.load_seconds));
+    ctl.say(format!("latents: video {t}x{h}x{w}"));
+    let t0 = Instant::now();
+    let mut tiles = 0usize;
+    let cancel = ctl.cancel;
+    let (px, frames) = dec.decode(&z, t, h, w, &mut || {
+        tiles += 1;
+        dev.wait()?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error("cancelled".into()));
+        }
+        Ok(())
+    })?;
+    let secs = t0.elapsed().as_secs_f64();
+    let (fh, fw) = (h * 16, w * 16);
+    ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} tiles)"));
+    let mut report = json!({"frames": frames, "width": fw, "height": fh, "seconds": secs, "tiles": tiles});
+    if let Some(c) = check {
+        let d = Checkpoint::open(c)?;
+        let want = h3_core::dtype::bytes_to_f32(&d.read("images")?, d.get("images")?.dtype)?; // [.., F, H, W, 3]
+        if want.len() != px.len() {
+            return Err(Error(format!("the reference decoded {} values ({:?}), this engine {}", want.len(), d.get("images")?.shape, px.len())));
+        }
+        let plane = fh * fw;
+        // ours planar [3, F, H, W] -> the reference's [F, H, W, 3]
+        let mut ours = vec![0f32; px.len()];
+        for c in 0..3 {
+            for fi in 0..frames {
+                for i in 0..plane {
+                    ours[(fi * plane + i) * 3 + c] = px[(c * frames + fi) * plane + i];
+                }
+            }
+        }
+        let (rel, cos) = reference::compare(&ours, &want);
+        let mse = ours.iter().zip(&want).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>() / ours.len() as f64;
+        let psnr = 10.0 * (1.0 / mse.max(1e-20)).log10();
+        ctl.say(format!("check  : against the reference's frames: rel err {rel:.2e}, cosine {cos:.6}, PSNR {psnr:.1} dB"));
+        report["psnr"] = json!(psnr);
+        report["cosine"] = json!(cos);
+    }
+    // the sound
+    let mut sound = None;
+    if let Some(ap) = vaes.audio {
+        let akey = ["samples.audio", "latents.audio"].into_iter().find(|k| lat.entries.contains_key(*k)).ok_or("the latents file has no samples.audio")?;
+        let at = lat.get(akey)?.shape[3]; // [1, 32, 2, T]
+        let za = h3_core::dtype::bytes_to_f32(&lat.read(akey)?, lat.get(akey)?.dtype)?;
+        let t0 = Instant::now();
+        let ad = h3_core::audio::AudioDecoder::load(dev, &Checkpoint::open(ap)?)?;
+        let ch = ad.decode(&za, at, &mut || ctl.check())?;
+        let secs = t0.elapsed().as_secs_f64();
+        ctl.say(format!("audio  : {at} latent frames -> {} samples x 2 in {secs:.1} s", ch[0].len()));
+        report["audio_seconds"] = json!(secs);
+        if let Some(c) = check {
+            let d = Checkpoint::open(c)?;
+            if d.entries.contains_key("waveform") {
+                let want = h3_core::dtype::bytes_to_f32(&d.read("waveform")?, d.get("waveform")?.dtype)?; // [1, L, 2]
+                let ours: Vec<f32> = (0..ch[0].len()).flat_map(|i| [ch[0][i], ch[1][i]]).collect();
+                if want.len() == ours.len() {
+                    let (rel, cos) = reference::compare(&ours, &want);
+                    ctl.say(format!("check  : against the reference's sound: rel err {rel:.2e}, cosine {cos:.6}"));
+                    report["audio_cosine"] = json!(cos);
+                } else {
+                    ctl.say(format!("check  : the reference's sound has {} values, ours {}", want.len(), ours.len()));
+                }
+            }
+        }
+        sound = Some(crate::media::Audio { channels: ch, sample_rate: h3_core::audio::SAMPLE_RATE });
+    }
+    if let Some(o) = out {
+        crate::media::write_mp4(o, &crate::media::Frames { px: &px, count: frames, height: fh, width: fw, fps: 24 }, sound.as_ref(), ctl.log)?;
+        ctl.say(format!("written: {}", o.display()));
+    }
+    ctl.say(format!("total  : {:.1} s", t_all.elapsed().as_secs_f64()));
+    Ok(report)
+}
+
 /// One job, as the daemon receives it: `{"kind": "bench-blocks", "tokens": 47173}` and so on.
 pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
     let kind = spec.get("kind").and_then(|k| k.as_str()).ok_or("a job needs a \"kind\"")?;
@@ -424,6 +519,12 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let out = spec.get("out").and_then(|d| d.as_str()).map(Path::new);
             denoise(e, Path::new(dump), out, ctl)
         }
-        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise)"))),
+        "decode" => {
+            let s = |k: &str| spec.get(k).and_then(|d| d.as_str()).map(Path::new);
+            let latents = s("latents").ok_or("decode needs \"latents\": a latents file the engine can read")?;
+            let video = s("vae").ok_or("decode needs \"vae\": the video decoder's checkpoint")?;
+            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae") }, s("out"), s("check"), ctl)
+        }
+        other => Err(Error(format!("unknown job kind {other:?} (known: bench-blocks, check-block, denoise, decode)"))),
     }
 }

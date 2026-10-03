@@ -651,6 +651,87 @@ int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, c
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+// ---- the audio decoder (BigVGAN): float32 1-D convolutions over [B, C, L] signals
+
+int h3s_conv1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+               const float* bias, int64_t stride, int64_t dil, int64_t pad, float* out, int64_t Lo) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (B <= 0 || Co <= 0 || Lo <= 0) return 0;
+    c.q.parallel_for(sycl::range<3>((size_t) B, (size_t) Co, (size_t) Lo), [=](sycl::id<3> id) {
+        const int64_t b = id[0], o = id[1], n = id[2];
+        float acc = bias ? bias[o] : 0.0f;
+        const int64_t base = n * stride - pad;
+        for (int64_t i = 0; i < Ci; ++i) {
+            const float* xr = x + (b * Ci + i) * L;
+            const float* wr = w + (o * Ci + i) * K;
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t p = base + k * dil;
+                if (p >= 0 && p < L) acc += wr[k] * xr[p];
+            }
+        }
+        out[(b * Co + o) * Lo + n] = acc;
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_conv_transpose1d(void* ctx, const float* x, int64_t B, int64_t Ci, int64_t L, const float* w, int64_t Co, int64_t K,
+                         const float* bias, int64_t stride, int64_t pad, float* out, int64_t Lo) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (B <= 0 || Co <= 0 || Lo <= 0) return 0;
+    c.q.parallel_for(sycl::range<3>((size_t) B, (size_t) Co, (size_t) Lo), [=](sycl::id<3> id) {
+        const int64_t b = id[0], o = id[1], m = id[2];
+        float acc = bias ? bias[o] : 0.0f;
+        // out[m] gathers x[n] w[k] over m = n * stride - pad + k
+        const int64_t mp = m + pad;
+        for (int64_t k = mp % stride; k < K; k += stride) {
+            const int64_t n = (mp - k) / stride;
+            if (n < 0 || n >= L) continue;
+            for (int64_t i = 0; i < Ci; ++i) acc += x[(b * Ci + i) * L + n] * w[(i * Co + o) * K + k];
+        }
+        out[(b * Co + o) * Lo + m] = acc;
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// BigVGAN's anti-aliased SnakeBeta in one pass: upsample x2 (12-tap transposed filter, replicate padding), x +
+// sin^2(alpha x) / beta, low-pass and downsample x2 (12-tap filter, replicate padding). Per output sample: 12
+// upsampled values, each from 6 input taps.
+int h3s_aa_snake(void* ctx, const float* x, int64_t B, int64_t C, int64_t L, const float* log_alpha, const float* log_beta,
+                 const float* up, const float* down, float* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (B <= 0 || C <= 0 || L <= 0) return 0;
+    c.q.parallel_for(sycl::range<3>((size_t) B, (size_t) C, (size_t) L), [=](sycl::id<3> id) {
+        const int64_t b = id[0], ch = id[1], n = id[2];
+        const float* xr = x + (b * C + ch) * L;
+        const float alpha = sycl::exp(log_alpha[ch]), inv_beta = 1.0f / (sycl::exp(log_beta[ch]) + 1e-9f);
+        float acc = 0.0f;
+        for (int k = 0; k < 12; ++k) {
+            // the upsampled signal (length 2L) at j, replicate-padded by 5 on the left
+            int64_t j = 2 * n + k - 5;
+            j = j < 0 ? 0 : (j > 2 * L - 1 ? 2 * L - 1 : j);
+            float u = 0.0f;
+            // up[j] = 2 sum_k' f[k'] xp[(j + 15 - k') / 2] over even j + 15 - k'; xp[p] = x[clamp(p - 5)]
+            for (int kk = (int) ((j + 15) & 1); kk < 12; kk += 2) {
+                int64_t p = (j + 15 - kk) / 2 - 5;
+                p = p < 0 ? 0 : (p > L - 1 ? L - 1 : p);
+                u += up[kk] * xr[p];
+            }
+            u *= 2.0f;
+            const float s = sycl::sin(alpha * u);
+            acc += down[k] * (u + inv_beta * s * s);
+        }
+        out[(b * C + ch) * L + n] = acc;
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_scale(void* ctx, float* x, int64_t n, float s) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (n <= 0) return 0;
+    c.q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] *= s; });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 int h3s_layer_norm(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, const float* weight, const float* bias, float eps,
                    void* out, int out_dt) try {
     auto& c = *static_cast<Ctx*>(ctx);
