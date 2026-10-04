@@ -23,7 +23,7 @@ those comparisons and is deleted when the port has parity. The plan and its stat
 
 ## Timings on a B70
 
-Measured on one Arc Pro B70 (Ryzen 7 1700X, 23 GiB RAM), 2026-10-02. "Reference" is the PyTorch pipeline
+Measured on one Arc Pro B70 (Ryzen 7 1700X, 23 GiB RAM), 2026-10-03, with the default attention (SageAttention). "Reference" is the PyTorch pipeline
 (ComfyUI's MiniMax H3 code) with the same int8 weights and our linear kernel plugged in - already faster than the
 production path it replaced (Q8 GGUF, `torch.compile`: 286 s for the clip below).
 
@@ -34,13 +34,13 @@ production path it replaced (Q8 GGUF, `torch.compile`: 286 s for the clip below)
 
 | | reference | this engine | |
 |---|---:|---:|---:|
-| text encoder (Qwen3-VL 32B, 50 layers) | ~54 s (cached for this run) | 16.0 s, streamed from disk | 3.4x |
-| denoiser weights to the GPU | 20.1 s | 12.0 s | 1.7x |
-| 8 denoiser steps (16.8k tokens) | 83.3 s | 70.6 s | 1.18x |
-| latent upscaler | 7.5 s | 4.6 s | 1.6x |
-| video decoder (124 frames, 1152x864) | 37.1 s | 47.0 s | 0.8x |
+| text encoder (Qwen3-VL 32B, 50 layers) | ~54 s (cached for this run) | 16.2 s, streamed from disk | 3.3x |
+| denoiser weights to the GPU | 20.1 s | 11.6 s | 1.7x |
+| 8 denoiser steps (16.8k tokens) | 83.3 s | 58.0 s | 1.44x |
+| latent upscaler | 7.5 s | 4.8 s | 1.6x |
+| video decoder (124 frames, 1152x864) | 37.1 s | 47.5 s | 0.8x |
 | audio decoder | 7.4 s | 2.7 s | 2.7x |
-| **the clip** | **202 s** with the text encoding cached, ~256 s without | **163 s** wall, text encoder included | **1.24x / ~1.6x** |
+| **the clip** | **202 s** with the text encoding cached, ~256 s without | **155 s** wall, text encoder included | **1.30x / ~1.65x** |
 
 The video decoder is the one piece still slower: it runs at about 54 TFLOPS of half-precision work per tile batch,
 roughly a third of what the card does on a bare matrix product - the next thing to tune.
@@ -54,18 +54,19 @@ Every piece was checked against the reference on the same inputs (`reference/` d
 | tokenizer | identical ids (2 prompts, 19 awkward strings) | | |
 | text encoder, 137 tokens | worst token cosine 0.999998 | ~54 s | 16.2 s |
 | starting noise (PyTorch's generator) | 83% bit-exact, the rest within 1 ulp | | |
-| one denoiser step, 2,159 tokens | first step cosine 0.9989 | 2.0 s | 0.69 s |
-| one denoiser step, 16.5k tokens (5 s) | 50 blocks cosine 0.9975 | 11.1 s (production) / 9.3 s | 8.0 s |
-| one denoiser step, 47k tokens (15 s) | | 58-63 s | 46.6 s |
-| 8 steps, 2 s at 384x288 | latents cosine 0.95-0.985 (8 steps amplify rounding) | 15.7 s | 6.7 s |
+| one denoiser step, 2,159 tokens | first step cosine 0.9988 | 2.0 s | 0.66 s |
+| one denoiser step, 16.5k tokens (5 s) | 50 blocks cosine 0.9975 (oneDNN attention) | 11.1 s (production) / 9.3 s | 6.6 s |
+| one denoiser step, 47k tokens (15 s) | | 58-63 s | 32.7 s |
+| 8 steps, 2 s at 384x288 | latents cosine 0.95-0.985 (8 steps amplify rounding) | 15.7 s | 6.5 s |
 | latent upscaler (2x) | cosine 0.99993 | 5.2 s | 2.4 s |
 | video decoder, 56 frames 384x288 | PSNR 72.6 dB | 12.0 s | 3.6-5.0 s |
 | audio decoder | rel err 3e-5 | 8.3 s | 2.0 s |
 
 What the card can do, measured with bare oneDNN (docs/PHASE0-RESULTS.md): int8 matrix multiply 317-357 T-ops/s
 against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention built from separate steps is bound by
-writing its score table; oneDNN's fused kernel avoids the table (165 G scores/s at production size), and beyond that
-it takes computing fewer scores.
+writing its score table; oneDNN's fused kernel avoids the table (165 G scores/s at production size). The default
+attention is SageAttention (Intel's ARK kernel, q and k in int8): 1.6x oneDNN's at 47k tokens, no visible change in
+a clip pair; `H3S_ATTN=onednn` switches back. Beyond that it takes computing fewer scores.
 
 ## Layout
 
