@@ -128,6 +128,8 @@ struct Ctx {
     bool poison = false;
     // attention through libh3sage.so (kernels/sage.cpp), loaded on first use; H3S_ATTN=onednn: oneDNN's fused kernel
     bool sage_want = true;
+    int64_t sage_min_s = 8192;                     // shorter sequences stay on oneDNN (H3S_SAGE_MIN_S): there the
+                                                   // quantize pass and the call cost more than int8 saves
     int sage_state = 0;                            // 0 not loaded yet, 1 ready, -1 unavailable (oneDNN is used)
     int (*sage_fn)(void*, const int8_t*, const int8_t*, const void*, void*, const float*, const float*, int, int64_t,
                    int64_t, int64_t, float) = nullptr;
@@ -220,6 +222,7 @@ void init(Ctx& c) {
     c.rotq_fused = std::getenv("H3S_ROTQ_SPLIT") == nullptr;
     c.poison = std::getenv("H3S_POISON") != nullptr;
     if (const char* e = std::getenv("H3S_ATTN")) c.sage_want = std::strcmp(e, "onednn") != 0;
+    if (const char* e = std::getenv("H3S_SAGE_MIN_S")) c.sage_min_s = std::max<int64_t>(0, std::atoll(e));
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
     if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
@@ -1420,7 +1423,7 @@ int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt
     auto& c = *static_cast<Ctx*>(ctx);
     if (S <= 0 || H <= 0 || D <= 0) return 0;
     if (stride < H * D) { g_err = "h3s_attention: the row stride is shorter than a row"; return -1; }
-    if (c.sage_want && sage_load(c)) {
+    if (c.sage_want && S >= c.sage_min_s && sage_load(c)) {
         try {
             if (attention_sage(c, q, k, v, dt, S, H, D, stride, out, out_dt)) return 0;
         } catch (const std::exception& e) {

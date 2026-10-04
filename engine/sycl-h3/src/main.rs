@@ -79,6 +79,7 @@ settings (environment, or NAME=value lines in sycl-h3.conf beside the repository
   H3_GPU_LOCK      a lock file shared with the GPU's other users
   H3_LLM_SWITCHER  a front end's model switcher URL: its model stops before loading, comes back after
   H3S_ATTN         onednn: attention by oneDNN's kernel instead of SageAttention (int8 q, k; dist/libh3sage.so)
+  H3S_SAGE_MIN_S   the shortest sequence SageAttention takes (default 8192; shorter ones run on oneDNN)
   H3_LISTEN, H3_PORT   where serve listens (default 127.0.0.1, 8095; 0.0.0.0 = the network, no password)
   H3_STUDIO_DIR    the studio's queue and state files (default ~/.local/share/sycl-h3)
   H3_LLM_MODES     a JSON file of the language models the studio switches (docs/LEGACY-API.md); point the
@@ -207,7 +208,7 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
         daemon_args.extend(["--llm-switcher".into(), sw]);
     }
     args.extend(["-e".into(), "H3SYCL_LIB=/app/libh3sycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
-    for k in ["H3S_MEM_FRACTION", "H3S_ATTN"] {
+    for k in ["H3S_MEM_FRACTION", "H3S_ATTN", "H3S_SAGE_MIN_S"] {
         if let Some(v) = cfg.get(k) {
             args.extend(["-e".into(), format!("{k}={v}")]);
         }

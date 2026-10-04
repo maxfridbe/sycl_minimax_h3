@@ -4,15 +4,18 @@
 
 ## The goal
 
-Today H3 runs on the B70 through PyTorch and ComfyUI's model code: it works, but a 15-second clip takes about 14
-minutes, every job reloads 20 GB of weights and recompiles, and none of the fast kernels the model's authors wrote
-exist for Intel (they are CUDA and AMD only).
+H3 ran on the B70 through PyTorch and ComfyUI's model code: it works, but a 15-second clip takes about 14 minutes,
+every job reloads 20 GB of weights and recompiles, and none of the fast kernels the model's authors wrote exist for
+Intel (they are CUDA and AMD only).
 
-This project replaces that stack, piece by piece, until nothing of it is left:
+This project replaces that stack, and every piece of a clip now runs in it - text encoder to .mp4, keyframes, audio
+anchors, voice references, masked regeneration, LoRAs, the studio and the film tools. A 15-second clip takes under
+9 minutes, and a five-clip film renders in half the time the old stack takes (below). It is built from:
 
-- **SYCL (C++)** for everything that runs on the GPU - `kernels/`, one library, `libh3sycl.so`, with a plain C
-  interface (`kernels/h3sycl.h`). It uses the card's matrix engine through oneDNN where oneDNN is at the card's
-  limit, and its own kernels where it is not.
+- **SYCL (C++)** for everything that runs on the GPU - `kernels/`: `libh3sycl.so`, with a plain C interface
+  (`kernels/h3sycl.h`). It uses the card's matrix engine through oneDNN where oneDNN is at the card's limit, and its
+  own kernels where it is not; attention goes through `libh3sage.so`, SageAttention as Intel's ARK kernel on
+  sycl-tla (loaded at run time; without it, oneDNN's fused attention).
 - **Rust** for everything else - `engine/`: device memory, checkpoint loading, the model graph, the sampler, the
   command line, and the server.
 - **TypeScript / TSX on snabbdom** for the web front end - `wfe/`, unchanged from the one in use.
@@ -34,16 +37,29 @@ production path it replaced (Q8 GGUF, `torch.compile`: 286 s for the clip below)
 
 | | reference | this engine | |
 |---|---:|---:|---:|
-| text encoder (Qwen3-VL 32B, 50 layers) | ~54 s (cached for this run) | 16.2 s, streamed from disk | 3.3x |
-| denoiser weights to the GPU | 20.1 s | 11.6 s | 1.7x |
-| 8 denoiser steps (16.8k tokens) | 83.3 s | 58.0 s | 1.44x |
-| latent upscaler | 7.5 s | 4.8 s | 1.6x |
-| video decoder (124 frames, 1152x864) | 37.1 s | 47.5 s | 0.8x |
-| audio decoder | 7.4 s | 2.7 s | 2.7x |
-| **the clip** | **202 s** with the text encoding cached, ~256 s without | **155 s** wall, text encoder included | **1.30x / ~1.65x** |
+| text encoder (Qwen3-VL 32B, 50 layers) | ~54 s (cached for this run) | 16.5 s, streamed from disk | 3.3x |
+| denoiser weights to the GPU | 20.1 s | 12.1 s | 1.7x |
+| 8 denoiser steps (16.8k tokens) | 83.3 s | 63.4 s; 58.0 s once the attention kernel is loaded (a ~5 s one-off per engine process) | 1.31x / 1.44x |
+| latent upscaler | 7.5 s | 4.5 s | 1.7x |
+| video decoder (124 frames, 1152x864) | 37.1 s | 45.4 s | 0.8x |
+| audio decoder | 7.4 s | 2.6 s | 2.8x |
+| **the clip** | **202 s** with the text encoding cached, ~256 s without | **156 s** wall, text encoder included | **1.29x / ~1.64x** |
 
 The video decoder is the one piece still slower: it runs at about 54 TFLOPS of half-precision work per tile batch,
 roughly a third of what the card does on a bare matrix product - the next thing to tune.
+
+### A film: five chained clips through the studio
+
+"Goodnight Borg" part 1, clips 1-5 (54.9 s of clips: 15.1, 14.4, 13.7, 7.3 and 4.5 s), each anchored on the first
+clip's last frame at both ends and on the previous clip's last second of sound; 768x576 -> 1.5x, 8 steps, the
+realism LoRA. Queued in the studio, joined by `sycl-h3 join` (anchor overlaps, -18 LUFS, sync checked); measured
+while Sage also ran the video decoder, which now stays on oneDNN (~1 s faster per second of video):
+
+| | the old stack (PyTorch, Q8 GGUF) | this engine |
+|---|---:|---:|
+| the five clips | 3343 s | 1699 s |
+| per second of video | 61 s | 31 s |
+| the joined film | 50.875 s, sync OK | 50.875 s, sync OK - the same shots |
 
 ### Each piece against the reference
 
@@ -52,25 +68,31 @@ Every piece was checked against the reference on the same inputs (`reference/` d
 | piece | agreement | reference | this engine |
 |---|---|---:|---:|
 | tokenizer | identical ids (2 prompts, 19 awkward strings) | | |
-| text encoder, 137 tokens | worst token cosine 0.999998 | ~54 s | 16.2 s |
+| text encoder, 137 tokens | worst token cosine 0.999997 | ~54 s | 16.3 s |
 | starting noise (PyTorch's generator) | 83% bit-exact, the rest within 1 ulp | | |
 | one denoiser step, 2,159 tokens | first step cosine 0.9988 | 2.0 s | 0.66 s |
 | one denoiser step, 16.5k tokens (5 s) | 50 blocks cosine 0.9975 (oneDNN attention) | 11.1 s (production) / 9.3 s | 6.6 s |
 | one denoiser step, 47k tokens (15 s) | | 58-63 s | 32.7 s |
 | 8 steps, 2 s at 384x288 | latents cosine 0.95-0.985 (8 steps amplify rounding) | 15.7 s | 6.5 s |
-| latent upscaler (2x) | cosine 0.99993 | 5.2 s | 2.4 s |
-| video decoder, 56 frames 384x288 | PSNR 72.6 dB | 12.0 s | 3.6-5.0 s |
-| audio decoder | rel err 3e-5 | 8.3 s | 2.0 s |
+| latent upscaler (2x) | cosine 0.99993 | 5.2 s | 3.0 s |
+| video decoder, 56 frames 384x288 | PSNR 72.5 dB | 12.0 s | 4.1 s |
+| audio decoder | rel err 3e-5 | 8.3 s | 2.2 s |
+| video encoder (keyframes): a picture / 22 frames, 384x288 | cosine 0.99999 / 0.99994 | | 3.0 s / 2.6 s |
+| audio encoder (audio keyframes), 1 s | rel err 1e-6 | | 0.3 s |
 
 What the card can do, measured with bare oneDNN (docs/PHASE0-RESULTS.md): int8 matrix multiply 317-357 T-ops/s
 against 178-183 for 16-bit floats, so int8 linears have a ceiling near 2x; attention built from separate steps is bound by
 writing its score table; oneDNN's fused kernel avoids the table (165 G scores/s at production size). The default
-attention is SageAttention (Intel's ARK kernel, q and k in int8): 1.6x oneDNN's at 47k tokens, no visible change in
-a clip pair; `H3S_ATTN=onednn` switches back. Beyond that it takes computing fewer scores.
+attention is SageAttention (Intel's ARK kernel, q and k in int8) for sequences of 8192 tokens and more - the
+denoiser: 1.6x oneDNN's at 47k tokens, 1.47x at 16.5k, no visible change in a clip pair. Shorter ones (the video
+decoder's tiles, the text refiner) stay on oneDNN, where Sage's quantize pass costs more than int8 saves (the
+decoder ran 2x slower with it). `H3S_ATTN=onednn` turns Sage off; `H3S_SAGE_MIN_S` moves the threshold. Beyond
+that it takes computing fewer scores.
 
 ## Layout
 
-    kernels/      SYCL C++: libh3sycl (h3sycl.h is the whole interface), and a oneDNN benchmark
+    kernels/      SYCL C++: libh3sycl (h3sycl.h is the whole interface), libh3sage (sage.cpp: SageAttention),
+                  and two oneDNN probes (gemm_bench, sdpa_probe)
     engine/       Rust workspace
       h3-sys/       bindings to libh3sycl, loaded at run time
       h3-core/      device memory, checkpoints (safetensors, GGUF), kernels with checked shapes, and the model:
@@ -91,8 +113,10 @@ a clip pair; `H3S_ATTN=onednn` switches back. Beyond that it takes computing few
 Everything builds inside one podman container; the host needs podman (with `crun`, so a rootless container can
 reach the GPU) and nothing else.
 
-    ./setup.sh                      # build the container image (SYCL compiler, oneDNN 3.12 from source, Rust, node)
-    ./build.sh                      # kernels + engine + front end -> dist/
+    ./setup.sh                      # build the container image (SYCL compiler, oneDNN 3.12 from source, sycl-tla and
+                                    # ARK's headers at pinned commits, Rust, node)
+    ./build.sh                      # kernels + SageAttention library + engine + front end -> dist/
+                                    # (./build.sh kernels|sage|engine|wfe for one part)
     ./build.sh test                 # the Rust tests and lints
     ./teardown.sh [--all]           # stop the services; --all also removes the build output and the image
 
@@ -166,15 +190,16 @@ For measuring and debugging the engine itself, `./run.sh` runs one-shot checks i
 ### Versions and releases
 
 The version is `yy.mmdd.###` - year, month and day, then that day's sequence number - and lives in the `VERSION`
-file (`h3 version` prints it; a test keeps Cargo's copy in step). `.github/workflows/build.yml` builds the image,
+file (`sycl-h3 version` prints it; a test keeps Cargo's copy in step). `.github/workflows/build.yml` builds the image,
 runs `./build.sh` and `./build.sh test` on every push and pull request and keeps the result as a workflow artifact;
 on `main` it also publishes the build image to the GitHub container registry, and on a tag `v<VERSION>` it publishes
-a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (sycl-h3, h3d, the kernel library with its oneDNN, the built
-front end).
+a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (sycl-h3, h3d, the kernel libraries with their oneDNN, the
+built front end).
 
 One model per GPU: Intel's `xe` driver has no out-of-memory error, an over-committed card stalls the whole machine.
 The engine counts its own allocations and refuses to pass 94% of the card; do not start it beside another program
-that holds the card, and stop it with `./teardown.sh`, never with a kill.
+that holds the card (or share it through `H3_GPU_LOCK`, above), and stop it with `sycl-h3 stop` or `./teardown.sh`,
+never with a kill.
 
 ## Documents
 

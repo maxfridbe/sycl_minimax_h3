@@ -101,7 +101,8 @@ takes computing fewer scores (the block-sparse form the model family was trained
   (k's sequence mean taken out first), v and the result in half. Attention 738 -> 455 ms per block at 47k tokens
   (1.6x), 94 -> 64 ms at 16.5k; Locutus clip 3 (13.7 s) sampled in 241 s vs 340. Blocks vs the reference: cosine
   0.99991 (oneDNN 0.99996); keyframed 8-step run: video 0.9982 / audio 0.9988 (oneDNN 0.9962 / 0.9997). Clip pair:
-  no visible difference.
+  no visible difference. Used from 8192 tokens up (`H3S_SAGE_MIN_S`): it wins from ~4k (7.1 vs 6.7 ms per block),
+  clearly from 8k (24 vs 19 ms); on the video decoder's 1,797-token tiles it was 2x slower and 4 dB less exact.
 - **Xe3 as an option** (Arc C-series / Panther Lake and later): a build for Xe3 beside the Xe2 one - the compiler's
   device target, sycl-tla's Xe3 tile shapes for attention, and the int8 linear's tile sizes re-tuned - picked at
   build time or by the device found, the B70 (Xe2) path unchanged.
