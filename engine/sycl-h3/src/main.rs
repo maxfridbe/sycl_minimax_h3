@@ -78,7 +78,7 @@ settings (environment, or NAME=value lines in sycl-h3.conf beside the repository
   H3_IDLE          seconds without a job before an engine unloads; 0 = never     (default 600)
   H3_GPU_LOCK      a lock file shared with the GPU's other users
   H3_LLM_SWITCHER  a front end's model switcher URL: its model stops before loading, comes back after
-  H3S_ATTN         sage: attention by SageAttention (int8 q, k; dist/libh3sage.so) instead of oneDNN's kernel
+  H3S_ATTN         onednn: attention by oneDNN's kernel instead of SageAttention (int8 q, k; dist/libh3sage.so)
   H3_LISTEN, H3_PORT   where serve listens (default 127.0.0.1, 8095; 0.0.0.0 = the network, no password)
   H3_STUDIO_DIR    the studio's queue and state files (default ~/.local/share/sycl-h3)
   H3_LLM_MODES     a JSON file of the language models the studio switches (docs/LEGACY-API.md); point the

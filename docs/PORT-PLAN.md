@@ -95,13 +95,13 @@ takes computing fewer scores (the block-sparse form the model family was trained
 
 ## To do
 
-- **SageAttention as an option** (`H3S_ATTN=sage`; oneDNN's fused kernel stays the default) - done, opt-in.
+- **SageAttention** - done, the default since 2026-10-03 (`H3S_ATTN=onednn`: oneDNN's fused kernel instead).
   Intel's ARK kernel (intel/auto-round, `auto_round_extension/ark`, Apache 2.0; SageAttention's XPU path calls it)
   on sycl-tla, in its own `dist/libh3sage.so` (`./build.sh sage`); q and k quantized to int8 in `libh3sycl`
   (k's sequence mean taken out first), v and the result in half. Attention 738 -> 455 ms per block at 47k tokens
   (1.6x), 94 -> 64 ms at 16.5k; Locutus clip 3 (13.7 s) sampled in 241 s vs 340. Blocks vs the reference: cosine
   0.99991 (oneDNN 0.99996); keyframed 8-step run: video 0.9982 / audio 0.9988 (oneDNN 0.9962 / 0.9997). Clip pair:
-  no visible difference. Open: making it the default after more clips.
+  no visible difference.
 - **Xe3 as an option** (Arc C-series / Panther Lake and later): a build for Xe3 beside the Xe2 one - the compiler's
   device target, sycl-tla's Xe3 tile shapes for attention, and the int8 linear's tile sizes re-tuned - picked at
   build time or by the device found, the B70 (Xe2) path unchanged.

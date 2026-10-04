@@ -126,8 +126,8 @@ struct Ctx {
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;
     bool poison = false;
-    // H3S_ATTN=sage: attention through libh3sage.so (kernels/sage.cpp), loaded on first use; oneDNN's otherwise
-    bool sage_want = false;
+    // attention through libh3sage.so (kernels/sage.cpp), loaded on first use; H3S_ATTN=onednn: oneDNN's fused kernel
+    bool sage_want = true;
     int sage_state = 0;                            // 0 not loaded yet, 1 ready, -1 unavailable (oneDNN is used)
     int (*sage_fn)(void*, const int8_t*, const int8_t*, const void*, void*, const float*, const float*, int, int64_t,
                    int64_t, int64_t, float) = nullptr;
@@ -219,7 +219,7 @@ void init(Ctx& c) {
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
     c.rotq_fused = std::getenv("H3S_ROTQ_SPLIT") == nullptr;
     c.poison = std::getenv("H3S_POISON") != nullptr;
-    if (const char* e = std::getenv("H3S_ATTN")) c.sage_want = std::strcmp(e, "sage") == 0;
+    if (const char* e = std::getenv("H3S_ATTN")) c.sage_want = std::strcmp(e, "onednn") != 0;
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
     if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
@@ -1312,7 +1312,7 @@ static bool attention_fused(Ctx& c, const void* q, const void* k, const void* v,
 static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                            int64_t stride, void* out, int out_dt);
 
-// Form 0 (H3S_ATTN=sage): SageAttention v1 - q and k quantized to int8 here, the attention by Intel's ARK kernel on
+// Form 0 (the default; H3S_ATTN=onednn skips it): SageAttention v1 - q and k quantized to int8 here, the attention by Intel's ARK kernel on
 // sycl-tla in libh3sage.so (kernels/sage.cpp), v and the result in half. k's mean over the sequence is taken out
 // before quantizing: it adds the same amount to every score of a row, which the softmax ignores, and what is left
 // quantizes far better. One scale per head per kSageBlock rows. Whole sequence in one call: the kernel keeps its
@@ -1330,7 +1330,7 @@ static bool sage_load(Ctx& c) {
         if (slash != std::string::npos) path = self.substr(0, slash + 1) + path;
     }
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!h) { std::fprintf(stderr, "h3sycl: H3S_ATTN=sage, but %s; attention stays on oneDNN\n", dlerror()); return false; }
+    if (!h) { std::fprintf(stderr, "h3sycl: no SageAttention (%s); attention on oneDNN's kernel\n", dlerror()); return false; }
     c.sage_fn = (decltype(c.sage_fn)) dlsym(h, "h3sage_attention");
     c.sage_err = (decltype(c.sage_err)) dlsym(h, "h3sage_error");
     if (!c.sage_fn || !c.sage_err) { std::fprintf(stderr, "h3sycl: %s lacks h3sage_attention; attention stays on oneDNN\n", path.c_str()); return false; }

@@ -13,7 +13,7 @@ kernels() {
        -L"$DNNL/lib" -ldnnl -Wl,-rpath,'$ORIGIN' -o dist/libh3sycl.so
   cp -L "$DNNL/lib/libdnnl.so.3" dist/        # shipped beside the library: hosts without a shared oneDNN load it too
 }
-# the optional SageAttention library (H3S_ATTN=sage): ARK's kernel on sycl-tla, with the flags sycl-tla wants. The
+# the SageAttention library (the default attention; H3S_ATTN=onednn turns it off): ARK's kernel on sycl-tla, with the flags sycl-tla wants. The
 # device it is compiled for: H3_SAGE_DEVICE (bmg-g31 = the B70; bmg-g21 = B580/B60).
 sage() {
   local TLA=${H3_SYCL_TLA:-/opt/sycl-tla} ARK=${H3_ARK:-/opt/ark/auto_round_kernel}
@@ -57,7 +57,7 @@ tests() {
   cargo clippy --release --locked --manifest-path engine/Cargo.toml -- -D warnings
 }
 
-[ $# -eq 0 ] && set -- kernels engine wfe
+[ $# -eq 0 ] && set -- kernels sage engine wfe
 for what in "$@"; do
   case $what in
     kernels) kernels ;;

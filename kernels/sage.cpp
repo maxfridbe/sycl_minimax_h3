@@ -1,10 +1,10 @@
 // libh3sage.so - SageAttention (v1) for libh3sycl: the attention kernel of Intel's ARK (intel/auto-round,
 // auto_round_extension/ark, Apache 2.0 - the kernel SageAttention's Intel GPU path calls), on sycl-tla.
 //
-// Optional: libh3sycl loads this library only when H3S_ATTN=sage asks for it, and attention stays on oneDNN's fused
-// kernel when the library is absent or refuses. It is its own library because sycl-tla wants its own compiler flags
-// (C++17, SPIR-V extensions for 2-D block loads and the matrix engine, the device named at link time) and a long
-// compile that the rest of the kernels should not pay.
+// The default attention: libh3sycl loads this library on first use (H3S_ATTN=onednn: never), and attention runs on
+// oneDNN's fused kernel when the library is absent or refuses. It is its own library because sycl-tla wants its own
+// compiler flags (C++17, SPIR-V extensions for 2-D block loads and the matrix engine, the device named at link time)
+// and a long compile that the rest of the kernels should not pay.
 //
 // What it computes, per head: softmax(q k^T * scale) v, with q and k already int8 (libh3sycl quantizes them, one
 // scale per head per `block` rows, k after subtracting its mean over the sequence - which leaves the softmax
