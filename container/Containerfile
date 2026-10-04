@@ -38,6 +38,17 @@ ENV RUSTUP_HOME=/opt/rust/rustup PATH=/opt/rust/cargo/bin:$PATH
 RUN curl -sSf https://sh.rustup.rs | CARGO_HOME=/opt/rust/cargo sh -s -- -y --profile minimal --default-toolchain ${RUST} -c clippy -t x86_64-unknown-linux-musl \
     && chmod -R a+rX /opt/rust
 
+# Optional SageAttention (H3S_ATTN=sage, kernels/sage.cpp -> dist/libh3sage.so): Intel's ARK attention kernels
+# (intel/auto-round, Apache 2.0) and sycl-tla, the CUTLASS-for-SYCL headers they are written in - both header-only
+# here, pinned to the commits ARK's own build uses.
+ARG SYCL_TLA=370062135a385117d34096109a7d3fd82eb49a4c
+ARG AUTO_ROUND=6afaecdbe4092dc803f3e91026fe81a65b64b372
+RUN mkdir -p /opt/sycl-tla /opt/ark \
+    && curl -sSfL https://codeload.github.com/luoyu-intel/sycl-tla/tar.gz/${SYCL_TLA} | tar -xz -C /opt/sycl-tla --strip-components=1 \
+    && curl -sSfL https://codeload.github.com/intel/auto-round/tar.gz/${AUTO_ROUND} \
+       | tar -xz -C /opt/ark --strip-components=3 --wildcards '*/auto_round_extension/ark/LICENSE' '*/auto_round_extension/ark/auto_round_kernel/*' \
+    && test -f /opt/ark/auto_round_kernel/wrapper/include/sycl_tla_sdpa.hpp
+
 ENV ONEAPI_DEVICE_SELECTOR=level_zero:0 ZES_ENABLE_SYSMAN=1
 WORKDIR /src
 ENTRYPOINT []

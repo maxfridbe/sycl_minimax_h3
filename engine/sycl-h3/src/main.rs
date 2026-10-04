@@ -78,6 +78,7 @@ settings (environment, or NAME=value lines in sycl-h3.conf beside the repository
   H3_IDLE          seconds without a job before an engine unloads; 0 = never     (default 600)
   H3_GPU_LOCK      a lock file shared with the GPU's other users
   H3_LLM_SWITCHER  a front end's model switcher URL: its model stops before loading, comes back after
+  H3S_ATTN         sage: attention by SageAttention (int8 q, k; dist/libh3sage.so) instead of oneDNN's kernel
   H3_LISTEN, H3_PORT   where serve listens (default 127.0.0.1, 8095; 0.0.0.0 = the network, no password)
   H3_STUDIO_DIR    the studio's queue and state files (default ~/.local/share/sycl-h3)
   H3_LLM_MODES     a JSON file of the language models the studio switches (docs/LEGACY-API.md); point the
@@ -206,8 +207,10 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
         daemon_args.extend(["--llm-switcher".into(), sw]);
     }
     args.extend(["-e".into(), "H3SYCL_LIB=/app/libh3sycl.so".into(), "-e".into(), "ONEAPI_DEVICE_SELECTOR=level_zero:*".into()]);
-    if let Some(f) = cfg.get("H3S_MEM_FRACTION") {
-        args.extend(["-e".into(), format!("H3S_MEM_FRACTION={f}")]);
+    for k in ["H3S_MEM_FRACTION", "H3S_ATTN"] {
+        if let Some(v) = cfg.get(k) {
+            args.extend(["-e".into(), format!("{k}={v}")]);
+        }
     }
     args.extend([ce.image.clone(), "bash".into(), "-c".into(),
                  "source /opt/intel/oneapi/setvars.sh >/dev/null 2>&1; exec /app/h3d daemon \"$@\"".into(), "h3d".into()]);

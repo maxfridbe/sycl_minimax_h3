@@ -93,6 +93,22 @@ fits since the int8 linear works in row chunks of 8192 (its scratch was 3.4 GiB,
 Next on attention: it is still ~75% of a production step. The fused kernel runs at ~165 G scores/s; beyond that it
 takes computing fewer scores (the block-sparse form the model family was trained to tolerate), with clips to judge.
 
+## To do
+
+- **SageAttention as an option** (`H3S_ATTN=sage`; oneDNN's fused kernel stays the default) - done, opt-in.
+  Intel's ARK kernel (intel/auto-round, `auto_round_extension/ark`, Apache 2.0; SageAttention's XPU path calls it)
+  on sycl-tla, in its own `dist/libh3sage.so` (`./build.sh sage`); q and k quantized to int8 in `libh3sycl`
+  (k's sequence mean taken out first), v and the result in half. Attention 738 -> 455 ms per block at 47k tokens
+  (1.6x), 94 -> 64 ms at 16.5k; Locutus clip 3 (13.7 s) sampled in 241 s vs 340. Blocks vs the reference: cosine
+  0.99991 (oneDNN 0.99996); keyframed 8-step run: video 0.9982 / audio 0.9988 (oneDNN 0.9962 / 0.9997). Clip pair:
+  no visible difference. Open: making it the default after more clips.
+- **Xe3 as an option** (Arc C-series / Panther Lake and later): a build for Xe3 beside the Xe2 one - the compiler's
+  device target, sycl-tla's Xe3 tile shapes for attention, and the int8 linear's tile sizes re-tuned - picked at
+  build time or by the device found, the B70 (Xe2) path unchanged.
+- Video decoder at 1152x864: 0.8x of the reference (GPU-bound; attention batching across tiles is open).
+- Reference pictures (`ref_images`): need the text encoder's vision tower, absent from the 32B GGUF.
+- The 4B student text encoder (`te: student` runs the teacher today).
+
 ## Checks that every piece must pass
 
 - against the CPU reference in `h3-core::reference` (exact arithmetic, small sizes);

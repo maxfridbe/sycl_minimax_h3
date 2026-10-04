@@ -20,6 +20,7 @@
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 
 #include <chrono>
+#include <dlfcn.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -124,7 +125,16 @@ struct Ctx {
     std::map<std::tuple<std::vector<int64_t>>, Conv3> conv3x;   // strided, unpadded (h3s_conv3d_ex)
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;
-    bool poison = false;                           // H3S_POISON=1: new buffers filled with NaN bytes (finds reads of unwritten memory)                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
+    bool poison = false;
+    // H3S_ATTN=sage: attention through libh3sage.so (kernels/sage.cpp), loaded on first use; oneDNN's otherwise
+    bool sage_want = false;
+    int sage_state = 0;                            // 0 not loaded yet, 1 ready, -1 unavailable (oneDNN is used)
+    int (*sage_fn)(void*, const int8_t*, const int8_t*, const void*, void*, const float*, const float*, int, int64_t,
+                   int64_t, int64_t, float) = nullptr;
+    const char* (*sage_err)() = nullptr;
+    int8_t* sq = nullptr; size_t sq_cap = 0;       // q and k as int8 [H, S, D]
+    int8_t* sk = nullptr; size_t sk_cap = 0;
+    float* ss = nullptr; size_t ss_cap = 0;        // their scales, then k's mean [H, D]                           // H3S_POISON=1: new buffers filled with NaN bytes (finds reads of unwritten memory)                        // rotation + row scale + quantize in one kernel (H3S_ROTQ_SPLIT=1: the passes)
     // h3s_alloc's book: the xe driver has no out-of-memory error (an over-commit stalls the whole machine), so the
     // library refuses an allocation that would pass the cap instead of asking the driver
     std::mutex mem_mu;
@@ -209,6 +219,7 @@ void init(Ctx& c) {
     c.profile = std::getenv("H3S_PROFILE") != nullptr;
     c.rotq_fused = std::getenv("H3S_ROTQ_SPLIT") == nullptr;
     c.poison = std::getenv("H3S_POISON") != nullptr;
+    if (const char* e = std::getenv("H3S_ATTN")) c.sage_want = std::strcmp(e, "sage") == 0;
     if (const char* e = std::getenv("H3S_ATTN_TABLE_MB")) c.attn_table_bytes = (size_t) std::max(64, std::atoi(e)) << 20;
     if (const char* e = std::getenv("H3S_ATTN_ROWS")) c.attn_rows = std::max(16, std::atoi(e));
 }
@@ -1301,11 +1312,123 @@ static bool attention_fused(Ctx& c, const void* q, const void* k, const void* v,
 static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                            int64_t stride, void* out, int out_dt);
 
+// Form 0 (H3S_ATTN=sage): SageAttention v1 - q and k quantized to int8 here, the attention by Intel's ARK kernel on
+// sycl-tla in libh3sage.so (kernels/sage.cpp), v and the result in half. k's mean over the sequence is taken out
+// before quantizing: it adds the same amount to every score of a row, which the softmax ignores, and what is left
+// quantizes far better. One scale per head per kSageBlock rows. Whole sequence in one call: the kernel keeps its
+// score tiles in registers, so memory does not grow with S^2.
+constexpr int kSageBlock = 64;
+
+static bool sage_load(Ctx& c) {
+    if (c.sage_state) return c.sage_state > 0;
+    c.sage_state = -1;
+    std::string path = "libh3sage.so";
+    Dl_info me;
+    if (dladdr((void*) &sage_load, &me) && me.dli_fname) {     // beside this library
+        std::string self = me.dli_fname;
+        const size_t slash = self.rfind('/');
+        if (slash != std::string::npos) path = self.substr(0, slash + 1) + path;
+    }
+    void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) { std::fprintf(stderr, "h3sycl: H3S_ATTN=sage, but %s; attention stays on oneDNN\n", dlerror()); return false; }
+    c.sage_fn = (decltype(c.sage_fn)) dlsym(h, "h3sage_attention");
+    c.sage_err = (decltype(c.sage_err)) dlsym(h, "h3sage_error");
+    if (!c.sage_fn || !c.sage_err) { std::fprintf(stderr, "h3sycl: %s lacks h3sage_attention; attention stays on oneDNN\n", path.c_str()); return false; }
+    std::fprintf(stderr, "h3sycl: attention: SageAttention v1 (int8 q, k) from %s\n", path.c_str());
+    c.sage_state = 1;
+    return true;
+}
+
+// Returns false (having queued nothing) when this shape is not one the kernel takes.
+static bool attention_sage(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
+                           int64_t stride, void* out, int out_dt) {
+    if ((D != 64 && D != 128) || S > INT32_MAX / D / H) return false;
+    sycl::queue& qu = c.q;
+    const size_t n = (size_t) S * H * D;
+    const int64_t nb = (S + kSageBlock - 1) / kSageBlock;
+    int8_t* iq = c.grow(c.sq, c.sq_cap, n);
+    int8_t* ik = c.grow(c.sk, c.sk_cap, n);
+    float* sc = c.grow(c.ss, c.ss_cap, (size_t) (2 * H * nb + H * D));
+    uint16_t* hv = c.grow(c.hv, c.hv_cap, n);
+    float* aof = c.grow(c.ao, c.ao_cap, (n + 1) / 2);                  // half [H, S, D]
+    if (!iq || !ik || !sc || !hv || !aof) throw std::runtime_error(g_err);
+    float* qs = sc;
+    float* ks = sc + H * nb;
+    float* kmean = sc + 2 * H * nb;
+    sycl::half* ao = (sycl::half*) aof;
+
+    const bool prof = c.profile;
+    double t_ph[3] = {0, 0, 0};
+    auto clock = std::chrono::steady_clock::now();
+    auto lap = [&](int i) {
+        if (!prof) return;
+        qu.wait();
+        const auto now = std::chrono::steady_clock::now();
+        t_ph[i] += std::chrono::duration<double, std::milli>(now - clock).count();
+        clock = now;
+    };
+    lap(0);
+    // k's mean over the sequence, per head and channel
+    qu.parallel_for(sycl::range<1>((size_t) (H * D)), [=](sycl::id<1> id) {
+        float sum = 0.0f;
+        for (int64_t t = 0; t < S; ++t) sum += load(k, dt, t * stride + id[0]);
+        kmean[id[0]] = sum / (float) S;
+    });
+    // q and k - mean to int8: a work-group per (head, block of rows), the block's largest magnitude -> its scale
+    constexpr int WG = 256;
+    auto quant = [&](const void* src, int8_t* dst, float* scales, const float* mean) {
+        qu.parallel_for(sycl::nd_range<1>((size_t) (H * nb * WG), WG), [=](sycl::nd_item<1> it) {
+            const int64_t g = it.get_group(0), h = g / nb, b = g % nb;
+            const int64_t r0 = b * kSageBlock, rows = sycl::min<int64_t>(kSageBlock, S - r0);
+            const int lid = it.get_local_id(0);
+            float m = 0.0f;
+            for (int64_t i = lid; i < rows * D; i += WG) {
+                const int64_t r = r0 + i / D, d = i % D;
+                m = sycl::fmax(m, sycl::fabs(load(src, dt, r * stride + h * D + d) - (mean ? mean[h * D + d] : 0.0f)));
+            }
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            const float inv = m > 0.0f ? 127.0f / m : 0.0f;
+            if (lid == 0) scales[h * nb + b] = m / 127.0f;
+            for (int64_t i = lid; i < rows * D; i += WG) {
+                const int64_t r = r0 + i / D, d = i % D;
+                const float x = (load(src, dt, r * stride + h * D + d) - (mean ? mean[h * D + d] : 0.0f)) * inv;
+                dst[(h * S + r) * D + d] = (int8_t) sycl::clamp(sycl::round(x), -127.0f, 127.0f);
+            }
+        });
+    };
+    quant(q, iq, qs, nullptr);
+    quant(k, ik, ks, kmean);
+    qu.parallel_for(sycl::range<3>((size_t) H, (size_t) S, (size_t) D), [=](sycl::id<3> id) {
+        ((sycl::half*) hv)[(id[0] * S + id[1]) * D + id[2]] = (sycl::half) load(v, dt, id[1] * stride + id[0] * D + id[2]);
+    });
+    lap(0);
+    if (c.sage_fn(&qu, iq, ik, hv, ao, qs, ks, kSageBlock, S, H, D, 1.0f / std::sqrt((float) D)) != 0)
+        throw std::runtime_error(c.sage_err());
+    lap(1);
+    qu.parallel_for(sycl::range<3>((size_t) S, (size_t) H, (size_t) D), [=](sycl::id<3> id) {
+        store(out, out_dt, (id[0] * H + id[1]) * D + id[2], (float) ao[(id[1] * S + id[0]) * D + id[2]]);
+    });
+    lap(2);
+    if (prof)
+        std::fprintf(stderr, "h3sycl: attention (sage) S=%lld: quantize+copies %.1f ms, attention %.1f, out %.1f\n",
+                     (long long) S, t_ph[0], t_ph[1], t_ph[2]);
+    return true;
+}
+
 int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                   int64_t stride, void* out, int out_dt) try {
     auto& c = *static_cast<Ctx*>(ctx);
     if (S <= 0 || H <= 0 || D <= 0) return 0;
     if (stride < H * D) { g_err = "h3s_attention: the row stride is shorter than a row"; return -1; }
+    if (c.sage_want && sage_load(c)) {
+        try {
+            if (attention_sage(c, q, k, v, dt, S, H, D, stride, out, out_dt)) return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "h3sycl: SageAttention failed (%s); attention stays on oneDNN\n", e.what());
+            c.q.wait();
+            c.sage_state = -1;
+        }
+    }
     if (c.sdpa_ok) {
         if (attention_fused(c, q, k, v, dt, S, H, D, stride, out, out_dt)) return 0;
         c.sdpa_ok = false;
