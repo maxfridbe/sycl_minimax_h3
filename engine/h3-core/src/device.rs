@@ -109,6 +109,26 @@ impl Device {
         self.check(unsafe { (self.api.wait)(self.ctx) })
     }
 
+    /// Pinned host memory, for `Buf::upload`.
+    pub fn alloc_pinned(self: &Arc<Self>, bytes: usize) -> Result<Pinned> {
+        // SAFETY: plain call; NULL is the failure.
+        let ptr = unsafe { (self.api.alloc_host)(self.ctx, bytes as u64) };
+        if ptr.is_null() {
+            return Err(Error(self.api.error()));
+        }
+        Ok(Pinned { dev: self.clone(), ptr: ptr.cast(), bytes })
+    }
+
+    /// Waits until every `Buf::upload` queued has landed.
+    pub fn upload_wait(&self) -> Result<()> {
+        self.check(unsafe { (self.api.upload_wait)(self.ctx) })
+    }
+
+    /// Whether `other` is this same context (a cache tied to one context checks it).
+    pub fn same(&self, other: &Device) -> bool {
+        std::ptr::eq(self.ctx, other.ctx)
+    }
+
     pub(crate) fn check(&self, rc: i32) -> Result<()> {
         if rc == 0 {
             Ok(())
@@ -179,6 +199,63 @@ impl Drop for Buf {
     fn drop(&mut self) {
         // SAFETY: allocated by this device; freed once.
         unsafe { (self.dev.api.free)(self.dev.ctx, self.ptr) }
+    }
+}
+
+impl Buf {
+    /// Queues a copy of `src[src_off .. src_off + n]` to `offset` on the copy queue, beside the kernels; it lands only
+    /// after `Device::upload_wait`, and `src` must not be written before that.
+    pub fn upload(&self, offset: usize, src: &Pinned, src_off: usize, n: usize) -> Result<()> {
+        if offset + n > self.bytes || src_off + n > src.bytes {
+            return Err(Error(format!("upload of {n} bytes ({src_off} in a {}-byte pinned buffer, {offset} in a {}-byte one) out of bounds", src.bytes, self.bytes)));
+        }
+        // SAFETY: bounds checked above; both belong to this device's context (the library checks the kinds).
+        let rc = unsafe {
+            (self.dev.api.upload)(self.dev.ctx, self.ptr.cast::<u8>().add(offset).cast(), src.ptr.add(src_off).cast_const().cast(), n as u64)
+        };
+        self.dev.check(rc)
+    }
+}
+
+/// Pinned host memory (`Device::alloc_pinned`): the GPU reads it by DMA at the link's full rate. Freed on drop (after
+/// the uploads queued from it).
+pub struct Pinned {
+    dev: Arc<Device>,
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+// SAFETY: plain host memory; the engine hands each region to one writer at a time and reads it only after
+// `Device::upload_wait`.
+unsafe impl Send for Pinned {}
+unsafe impl Sync for Pinned {}
+
+impl Pinned {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+    pub fn device(&self) -> &Arc<Device> {
+        &self.dev
+    }
+    /// A mutable view of `[off, off + n)`.
+    ///
+    /// # Safety
+    /// No other view of these bytes may be alive, and no upload from them may be in flight.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn region(&self, off: usize, n: usize) -> &mut [u8] {
+        assert!(off + n <= self.bytes, "pinned region out of bounds");
+        // SAFETY: in bounds; exclusivity is the caller's promise.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off), n) }
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        // SAFETY: allocated by this device; freed once (the library waits for the uploads first).
+        unsafe { (self.dev.api.free_host)(self.dev.ctx, self.ptr.cast()) }
     }
 }
 

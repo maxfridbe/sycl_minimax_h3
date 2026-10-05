@@ -13,16 +13,22 @@
 //! ```
 //!
 //! 16.5 GB of weights for a step that runs once per prompt, beside a denoiser that holds 18 GB of the card: the
-//! layers are streamed instead - read from the file by a thread one layer ahead, sent to the card, expanded to half
-//! precision there (one layer's matrices at a time), used and dropped.
+//! layers are streamed instead - read by a thread one layer ahead into pinned host memory, sent to the card by DMA on
+//! the copy queue while the layer before computes, expanded to half precision there (one matrix at a time), used,
+//! and overwritten by the layer after next.
+//!
+//! The pinned memory is the whole file's matrices when the host has the room (`H3_TE_PIN`, default on above
+//! 16.5 GB + 8 GiB free): kept by the process between clips, so after the first clip no layer is read again. Without
+//! the room, two pinned layer-sized slots. Either way the result is the same bytes as reading the file each time.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
-use crate::device::{Device, Tensor};
+use crate::device::{Buf, Device, Pinned, Tensor};
 use crate::dtype::{bf16_to_f32, f32_to_f16, DType};
 use crate::gguf::{GEntry, GType, Gguf};
 use crate::ops::{self, Rows};
@@ -41,38 +47,40 @@ pub struct TextEncoder {
     pub heads: usize,
     pub kv_heads: usize,
     pub ffn: usize,
+    /// where the last `encode` read its layers from (for the job's log)
+    pub source: Mutex<String>,
 }
 
-/// One layer as read from the file: the seven matrices' raw blocks and the four norms (float32).
-struct HostLayer {
-    mats: Vec<(GEntry, Vec<u8>)>,
-    norms: Vec<Vec<f32>>,
+/// The layers' matrices in pinned host memory, kept by the process between encodes: for one file (path, size, mtime)
+/// and one device context.
+struct Pin {
+    key: (PathBuf, u64, Option<SystemTime>),
+    host: Pinned,
+    /// which layers' bytes are in `host` (a layer is marked once its upload has landed)
+    filled: Vec<bool>,
+}
+static PIN: Mutex<Option<Pin>> = Mutex::new(None);
+
+/// The host's free memory (MemAvailable), bytes; 0 when it cannot tell.
+fn mem_available() -> u64 {
+    std::fs::read_to_string("/proc/meminfo").ok()
+        .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |kb| kb * 1024)
 }
 
-/// Reads byte ranges of a file with `threads` readers in 32 MiB pieces.
-fn read_ranges(path: &Path, ranges: &[(u64, usize)], threads: usize) -> Result<Vec<Vec<u8>>> {
+/// Reads byte ranges of a file into the given buffers with `threads` readers in 32 MiB pieces.
+fn read_into(path: &Path, dsts: Vec<(u64, &mut [u8])>, threads: usize) -> Result<()> {
     const PIECE: usize = 32 << 20;
-    let mut bufs: Vec<Vec<u8>> = ranges.iter().map(|(_, n)| vec![0u8; *n]).collect();
-    let mut jobs: Vec<(usize, usize, u64, usize)> = Vec::new(); // (buffer, offset in it, file offset, bytes)
-    for (i, (off, n)) in ranges.iter().enumerate() {
-        let mut o = 0;
-        while o < *n {
-            let k = PIECE.min(n - o);
-            jobs.push((i, o, off + o as u64, k));
-            o += k;
-        }
-    }
     // hand each reader disjoint pieces: split every buffer into its pieces up front
     let mut pieces: Vec<(&mut [u8], u64)> = Vec::new();
-    let mut by_buf: Vec<Vec<(usize, u64, usize)>> = vec![Vec::new(); bufs.len()];
-    for (b, o, fo, k) in jobs {
-        by_buf[b].push((o, fo, k));
-    }
-    for (buf, js) in bufs.iter_mut().zip(&by_buf) {
+    for (off, buf) in dsts {
         let mut rest: &mut [u8] = buf;
-        for (_, fo, k) in js {
-            let (head, tail) = rest.split_at_mut(*k);
-            pieces.push((head, *fo));
+        let mut fo = off;
+        while !rest.is_empty() {
+            let k = PIECE.min(rest.len());
+            let (head, tail) = rest.split_at_mut(k);
+            pieces.push((head, fo));
+            fo += k as u64;
             rest = tail;
         }
     }
@@ -103,8 +111,15 @@ fn read_ranges(path: &Path, ranges: &[(u64, usize)], threads: usize) -> Result<V
     });
     match failed {
         Some(e) => Err(e),
-        None => Ok(bufs),
+        None => Ok(()),
     }
+}
+
+/// Reads byte ranges of a file with `threads` readers.
+fn read_ranges(path: &Path, ranges: &[(u64, usize)], threads: usize) -> Result<Vec<Vec<u8>>> {
+    let mut bufs: Vec<Vec<u8>> = ranges.iter().map(|(_, n)| vec![0u8; *n]).collect();
+    read_into(path, ranges.iter().map(|r| r.0).zip(bufs.iter_mut().map(|b| b.as_mut_slice())).collect(), threads)?;
+    Ok(bufs)
 }
 
 fn f16_bytes(v: &[f32]) -> Vec<u8> {
@@ -122,25 +137,26 @@ impl TextEncoder {
         let q = file.get("model.layers.0.self_attn.q_proj.weight")?.shape.clone(); // [heads * 128, hidden]
         let k = file.get("model.layers.0.self_attn.k_proj.weight")?.shape.clone();
         let ffn = file.get("model.layers.0.mlp.gate_proj.weight")?.shape[0];
-        Ok(TextEncoder { layers, hidden: q[1], heads: q[0] / HEAD_DIM, kv_heads: k[0] / HEAD_DIM, ffn, file })
+        Ok(TextEncoder { layers, hidden: q[1], heads: q[0] / HEAD_DIM, kv_heads: k[0] / HEAD_DIM, ffn, file, source: Mutex::new(String::new()) })
     }
 
-    fn read_layer(&self, i: usize, threads: usize) -> Result<HostLayer> {
-        let mats: Vec<GEntry> = MATS.iter().map(|m| self.file.get(&format!("model.layers.{i}.{m}.weight")).cloned()).collect::<Result<_>>()?;
+    fn layer_mats(&self, i: usize) -> Result<Vec<GEntry>> {
+        MATS.iter().map(|m| self.file.get(&format!("model.layers.{i}.{m}.weight")).cloned()).collect()
+    }
+
+    /// A layer's four norms, as float32 (small: read from the file every time).
+    fn read_norms(&self, i: usize) -> Result<Vec<Vec<f32>>> {
         let norms: Vec<GEntry> = NORMS.iter().map(|m| self.file.get(&format!("model.layers.{i}.{m}.weight")).cloned()).collect::<Result<_>>()?;
-        let ranges: Vec<(u64, usize)> = mats.iter().chain(&norms).map(|e| (e.offset, e.bytes)).collect();
-        let mut bufs = read_ranges(&self.file.path, &ranges, threads)?;
-        let nb = bufs.split_off(mats.len());
-        let norms = nb
-            .iter()
+        let ranges: Vec<(u64, usize)> = norms.iter().map(|e| (e.offset, e.bytes)).collect();
+        let nb = read_ranges(&self.file.path, &ranges, 1)?;
+        nb.iter()
             .zip(&norms)
             .map(|(b, e)| match e.ty {
                 GType::BF16 => Ok(b.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()),
                 GType::F32 => Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()),
                 t => Err(Error(format!("{}: a norm of type {t:?}", e.name))),
             })
-            .collect::<Result<Vec<Vec<f32>>>>()?;
-        Ok(HostLayer { mats: mats.into_iter().zip(bufs).collect(), norms })
+            .collect::<Result<Vec<Vec<f32>>>>()
     }
 
     /// The conditioning for `tokens`: [tokens, hidden] float32. `tick(layer)` before each layer.
@@ -187,39 +203,123 @@ impl TextEncoder {
             let rc = unsafe { (d.api.linear)(d.ctx, input.buf.ptr(), dt.kernel_code()?, l as i64, kk as i64, w.buf.ptr(), n as i64, std::ptr::null(), out.buf.ptr(), dt.kernel_code()?) };
             d.check(rc)
         };
-        let expand = |blob: &Tensor, e: &GEntry, at: usize| -> Result<()> {
+        let expand = |blob: &Buf, off: usize, e: &GEntry, at: usize| -> Result<()> {
             let code = e.ty.quant_code().ok_or_else(|| Error(format!("{}: type {:?} is not a k-quant", e.name, e.ty)))?;
-            // SAFETY: blob holds e.bytes of k-quant blocks; w has room for `at + elements` half values.
+            // SAFETY: blob holds e.bytes of k-quant blocks at off; w has room for `at + elements` half values.
             let rc = unsafe {
-                (d.api.dequant)(d.ctx, blob.buf.ptr(), code, e.elements() as i64, w.buf.ptr().cast::<u8>().add(at * 2).cast(), dt.kernel_code()?)
+                (d.api.dequant)(d.ctx, blob.ptr().cast::<u8>().add(off).cast(), code, e.elements() as i64, w.buf.ptr().cast::<u8>().add(at * 2).cast(), dt.kernel_code()?)
             };
             d.check(rc)
         };
 
-        // the reader thread, one layer ahead
-        let (tx, rx) = mpsc::sync_channel::<Result<HostLayer>>(1);
-        std::thread::scope(|s| -> Result<Vec<f32>> {
-            s.spawn(|| {
+        // each layer's seven matrices, back to back: where each starts in the layer, the layer's bytes, where the
+        // layer starts in the whole file's pinned copy
+        let mats: Vec<Vec<GEntry>> = (0..self.layers).map(|i| self.layer_mats(i)).collect::<Result<_>>()?;
+        let offs: Vec<Vec<usize>> = mats.iter().map(|m| m.iter().scan(0, |o, e| { let a = *o; *o += e.bytes; Some(a) }).collect()).collect();
+        let lbytes: Vec<usize> = mats.iter().map(|m| m.iter().map(|e| e.bytes).sum()).collect();
+        let lstart: Vec<usize> = lbytes.iter().scan(0, |o, b| { let a = *o; *o += b; Some(a) }).collect();
+        let (total, max_l) = (lbytes.iter().sum::<usize>(), lbytes.iter().copied().max().unwrap_or(0));
+
+        // the pinned source: the whole file's matrices, kept between encodes, or two layer slots
+        let meta = std::fs::metadata(&self.file.path)?;
+        let key = (self.file.path.clone(), meta.len(), meta.modified().ok());
+        let mut pin = PIN.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = pin.as_ref().is_some_and(|p| p.key == key && p.host.device().same(dev) && p.host.len() >= total);
+        if !kept {
+            *pin = None; // another file or context: its memory goes back first
+            let want = std::env::var("H3_TE_PIN").map_or(true, |v| v != "0");
+            if want && mem_available() >= total as u64 + (8u64 << 30) {
+                match dev.alloc_pinned(total) {
+                    Ok(host) => *pin = Some(Pin { key, host, filled: vec![false; self.layers] }),
+                    Err(e) => eprintln!("te: no pinned copy of the text encoder ({e}); two pinned layer slots instead"),
+                }
+            }
+        }
+        let staging = if pin.is_none() { Some(dev.alloc_pinned(2 * max_l)?) } else { None };
+        let filled: Vec<bool> = pin.as_ref().map_or_else(|| vec![false; self.layers], |p| p.filled.clone());
+        let cached = filled.iter().filter(|f| **f).count();
+        *self.source.lock().unwrap_or_else(|e| e.into_inner()) = match (&staging, cached) {
+            (Some(_), _) => "the file, through two pinned layer slots".into(),
+            (None, n) if n == self.layers => "pinned host memory (kept from an earlier clip)".into(),
+            (None, 0) => format!("the file, into pinned host memory kept for the next clips ({:.1} GiB)", total as f64 / 1073741824.0),
+            (None, n) => format!("pinned host memory ({n} layers) and the file"),
+        };
+        let use_staging = staging.is_some();
+        let host: &Pinned = match (&staging, pin.as_ref()) {
+            (Some(st), _) => st,
+            (None, Some(p)) => &p.host,
+            (None, None) => unreachable!("staging is made when there is no pinned copy"),
+        };
+        let region = |i: usize| if use_staging { ((i % 2) * max_l, lbytes[i]) } else { (lstart[i], lbytes[i]) };
+        // the layers whose upload landed (their pinned bytes are complete): marked kept after the encode
+        let landed = std::cell::Cell::new(0usize);
+        // two device buffers: layer i computes from one while layer i + 1 lands in the other
+        let blobs = [dev.alloc(max_l.max(1))?, dev.alloc(max_l.max(1))?];
+
+        // the reader thread, one layer ahead: the layer's matrices into its pinned region (unless kept), its norms
+        let (tx, rx) = mpsc::sync_channel::<Result<Vec<Vec<f32>>>>(1);
+        // a staging slot comes back once its upload has landed (layer i's slot serves layer i + 2)
+        let (free_tx, free_rx) = mpsc::sync_channel::<()>(self.layers.max(1));
+        let out = std::thread::scope(|s| -> Result<Vec<f32>> {
+            // owned here, so a return (an error, a cancel) drops them before the scope waits for the reader, which
+            // then stops instead of blocking on a full channel
+            let (rx, free_tx) = (rx, free_tx);
+            let (mats, filled) = (&mats, &filled);
+            s.spawn(move || {
                 for i in 0..self.layers {
-                    if tx.send(self.read_layer(i, threads)).is_err() {
+                    if use_staging && i >= 2 && free_rx.recv().is_err() {
                         return; // the consumer stopped
+                    }
+                    let r = (|| -> Result<Vec<Vec<f32>>> {
+                        if !filled[i] {
+                            let (off, n) = region(i);
+                            // SAFETY: this region is written by this thread alone: a staging slot comes back only after
+                            // its upload landed, and a kept layer's region is written once, before its first upload.
+                            let mut rest: &mut [u8] = unsafe { host.region(off, n) };
+                            let mut dsts = Vec::new();
+                            for e in &mats[i] {
+                                let (head, tail) = rest.split_at_mut(e.bytes);
+                                dsts.push((e.offset, head));
+                                rest = tail;
+                            }
+                            read_into(&self.file.path, dsts, threads)?;
+                        }
+                        self.read_norms(i)
+                    })();
+                    if tx.send(r).is_err() {
+                        return;
                     }
                 }
             });
+            let upload = |i: usize| -> Result<()> {
+                let (off, n) = region(i);
+                blobs[i % 2].upload(0, host, off, n)
+            };
+            let mut norms = rx.recv().map_err(|_| Error("the text encoder's reader stopped".into()))??;
+            upload(0)?;
             for i in 0..self.layers {
                 tick(i)?;
-                let hl = rx.recv().map_err(|_| Error("the text encoder's reader stopped".into()))??;
-                let blobs: Vec<Tensor> = hl.mats.iter().map(|(e, b)| Tensor::from_bytes(dev, DType::U8, &[e.bytes], b)).collect::<Result<_>>()?;
-                let [ln1, ln2, qn, kn] = [0, 1, 2, 3].map(|j| f32_tensor(dev, &hl.norms[j]));
+                dev.upload_wait()?; // layer i's matrices are on the card
+                landed.set(i + 1);
+                if use_staging {
+                    let _ = free_tx.send(()); // its slot may take layer i + 2
+                }
+                let hl = std::mem::take(&mut norms);
+                if i + 1 < self.layers {
+                    norms = rx.recv().map_err(|_| Error("the text encoder's reader stopped".into()))??;
+                    upload(i + 1)?; // lands while this layer computes
+                }
+                let blob = &blobs[i % 2];
+                let [ln1, ln2, qn, kn] = [0, 1, 2, 3].map(|j| f32_tensor(dev, &hl[j]));
                 let (ln1, ln2, qn, kn) = (ln1?, ln2?, qn?, kn?);
-                let e = |j: usize| &hl.mats[j].0;
+                let e = |j: usize| (&mats[i][j], offs[i][j]);
                 // attention half
                 ops::rms_norm_mod(&x, &ln1, EPS, None, &h)?;
-                expand(&blobs[0], e(0), 0)?;
+                expand(blob, e(0).1, e(0).0, 0)?;
                 lin(&h, wq, c, &q)?;
-                expand(&blobs[1], e(1), 0)?;
+                expand(blob, e(1).1, e(1).0, 0)?;
                 lin(&h, wkv, c, &k)?;
-                expand(&blobs[2], e(2), 0)?;
+                expand(blob, e(2).1, e(2).0, 0)?;
                 lin(&h, wkv, c, &v)?;
                 ops::rms_rope(Rows { t: &q, offset: 0, stride: wq, tokens: l, heads: hq, dim: HEAD_DIM }, &qn, EPS, &cs, HEAD_DIM)?;
                 ops::rms_rope(Rows { t: &k, offset: 0, stride: wkv, tokens: l, heads: hkv, dim: HEAD_DIM }, &kn, EPS, &cs, HEAD_DIM)?;
@@ -229,22 +329,28 @@ impl TextEncoder {
                                              wq as i64, wkv as i64, att.buf.ptr())
                 };
                 d.check(rc)?;
-                expand(&blobs[3], e(3), 0)?;
+                expand(blob, e(3).1, e(3).0, 0)?;
                 lin(&att, c, wq, &o)?;
                 ops::add(&x, &o)?;
                 // MLP half: gate and up expanded one after the other, multiplied at once ([gate | up] per row)
                 ops::rms_norm_mod(&x, &ln2, EPS, None, &h)?;
-                expand(&blobs[4], e(4), 0)?;
-                expand(&blobs[5], e(5), ffn * c)?;
+                expand(blob, e(4).1, e(4).0, 0)?;
+                expand(blob, e(5).1, e(5).0, ffn * c)?;
                 lin(&h, 2 * ffn, c, &gu)?;
                 ops::swiglu(&gu, &act)?;
-                expand(&blobs[6], e(6), 0)?;
+                expand(blob, e(6).1, e(6).0, 0)?;
                 lin(&act, c, ffn, &o)?;
                 ops::add(&x, &o)?;
-                dev.wait()?; // the layer's blobs go next
+                dev.wait()?; // this layer's buffer takes layer i + 2
             }
             drop(rx);
             x.to_f32()
-        })
+        });
+        if let Some(p) = pin.as_mut() {
+            for f in p.filled.iter_mut().take(landed.get()) {
+                *f = true;
+            }
+        }
+        out
     }
 }

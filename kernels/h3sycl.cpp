@@ -76,6 +76,8 @@ inline float exp_neg(float x) {
 
 struct Ctx {
     sycl::queue q;
+    sycl::queue* cq = nullptr;                     // uploads beside the kernels (h3s_upload), made on first use
+    std::mutex cq_mu;
     dnnl::engine eng;
     dnnl::stream strm;
     int8_t* xq = nullptr; size_t xq_cap = 0;       // quantized activations [M, K]
@@ -304,6 +306,7 @@ void h3s_free(void* ctx, void* p) {
     auto& c = *static_cast<Ctx*>(ctx);
     if (!p) return;
     c.q.wait();                                    // nothing queued may still read or write it
+    if (c.cq) c.cq->wait();                        // nor an upload into it
     std::lock_guard<std::mutex> l(c.mem_mu);
     auto it = c.mem.find(p);
     if (it == c.mem.end()) return;
@@ -338,10 +341,46 @@ int h3s_wait(void* ctx) try {
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+void* h3s_alloc_host(void* ctx, uint64_t bytes) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    void* p = sycl::malloc_host(bytes ? bytes : 1, c.q);
+    if (!p) g_err = "h3s_alloc_host: the runtime refused " + std::to_string(bytes >> 20) + " MiB of pinned memory";
+    return p;
+} catch (const std::exception& e) { g_err = e.what(); return nullptr; }
+
+void h3s_free_host(void* ctx, void* p) {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (!p) return;
+    if (c.cq) c.cq->wait();
+    sycl::free(p, c.q);
+}
+
+int h3s_upload(void* ctx, void* dst, const void* src_pinned, uint64_t bytes) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    const auto ctx_ = c.q.get_context();
+    if (sycl::get_pointer_type(src_pinned, ctx_) != sycl::usm::alloc::host || sycl::get_pointer_type(dst, ctx_) != sycl::usm::alloc::device) {
+        g_err = "h3s_upload: the source must be h3s_alloc_host memory and the destination device memory";
+        return -1;
+    }
+    {
+        std::lock_guard<std::mutex> l(c.cq_mu);
+        if (!c.cq) c.cq = new sycl::queue(ctx_, c.q.get_device(), sycl::property::queue::in_order());
+    }
+    c.cq->memcpy(dst, src_pinned, bytes);
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_upload_wait(void* ctx) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (c.cq) c.cq->wait_and_throw();
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
 void h3s_destroy(void* ctx) {
     auto* c = static_cast<Ctx*>(ctx);
     if (!c) return;
     c->q.wait();
+    if (c->cq) { c->cq->wait(); delete c->cq; c->cq = nullptr; }
     if (c->profile && c->lin_calls)
         std::fprintf(stderr, "h3sycl: int8 linear, %lld row chunks: rotation %.1f ms, row scales %.1f, quantize %.1f, int8 GEMM %.1f\n",
                      (long long) c->lin_calls, c->lin_ms[0], c->lin_ms[1], c->lin_ms[2], c->lin_ms[3]);

@@ -59,6 +59,16 @@ int h3s_copy(void* ctx, void* dst, const void* src, uint64_t bytes);
 /* Waits until everything queued has run; reports an asynchronous error if there was one. */
 int h3s_wait(void* ctx);
 
+/* Pinned host memory, for uploads that overlap the kernels: the GPU copies from it by DMA at the link's full rate.
+ * Not counted against the device cap. h3s_free_host waits for the uploads first. */
+void* h3s_alloc_host(void* ctx, uint64_t bytes);
+void h3s_free_host(void* ctx, void* p);
+/* Pinned host -> device, queued on the context's copy queue beside the kernels (it does not wait): the kernels do not
+ * wait for it either, so call h3s_upload_wait before using dst. src must come from h3s_alloc_host (a queue copy with
+ * no device end can hang the B70's copy engine); anything else is refused. */
+int h3s_upload(void* ctx, void* dst, const void* src_pinned, uint64_t bytes);
+int h3s_upload_wait(void* ctx);
+
 /* ---- kernels -------------------------------------------------------------------------------------------------- */
 
 /* A linear layer with int8 weights and activations quantized on the fly (comfy-kitchen's int8_linear):

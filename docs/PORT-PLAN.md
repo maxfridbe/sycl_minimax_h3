@@ -31,7 +31,7 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | video decoder (a 36-block transformer over 16x16x4 patches, tiled) | ComfyUI `ldm/minimax/vae.py` | `h3-core::vae`, the denoiser's kernels + `h3s_layer_norm` | done: PSNR 72.6 dB; faster at small canvases, 0.8x at 1152x864 (tuning open) |
 | audio decoder (BigVGAN) | ComfyUI `ldm/minimax/audio_vae.py` | `h3-core::audio`: `h3s_conv1d`, `h3s_conv_transpose1d`, `h3s_aa_snake` | done: rel err 3e-5, 2.0 s vs 8.3 s |
 | video encoder (3-D causal CNN), audio encoder (DAC + attention head) | ComfyUI | `h3-core::venc`, `audio::AudioEncoder` | done: cosine 0.99999 (picture), 0.99994 (22 frames), audio rel err 1e-6 |
-| text encoder (Qwen3-VL 32B, 50 layers, Q4_K/Q6_K GGUF) | ComfyUI-GGUF | `h3-core::gguf` + `te`: streamed layer by layer, `h3s_dequant`, `h3s_attention_causal` | done: worst token cosine 0.999998, 16 s vs ~54 s |
+| text encoder (Qwen3-VL 32B, 50 layers, Q4_K/Q6_K GGUF) | ComfyUI-GGUF | `h3-core::gguf` + `te`: streamed layer by layer, `h3s_dequant`, `h3s_attention_causal` | done: worst token cosine 0.999998, 16 s vs ~54 s; 1.6 s from the pinned copy after a worker's first clip (2026-10-05) |
 | tokenizer (text-to-video presentation: the raw prompt) | transformers `Qwen2Tokenizer` | `h3-core::tokenizer` | done: identical ids (picture/video prompts with vision blocks: open) |
 | mp4 writing | PyAV | ffmpeg subprocess from Rust (`h3d/media.rs`) | done |
 | job queue, HTTP API, LLM mode switching | `server.py` | `sycl-h3 serve` = the studio (`engine/sycl-h3/src/studio`) on the daemon | done, checked end to end beside the legacy server (docs/LEGACY-API.md) |

@@ -723,7 +723,7 @@ pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String],
     }
     ctl.say(format!("prompt : {} tokens", ids.len()));
     let enc = h3_core::te::TextEncoder::open(te)?;
-    ctl.say(format!("te     : {} layers, hidden {}, {} query / {} key-value heads (streamed from {})", enc.layers, enc.hidden, enc.heads, enc.kv_heads, te.display()));
+    ctl.say(format!("te     : {} layers, hidden {}, {} query / {} key-value heads ({})", enc.layers, enc.hidden, enc.heads, enc.kv_heads, te.display()));
     let t0 = Instant::now();
     let cancel = ctl.cancel;
     let layers = enc.layers;
@@ -740,7 +740,7 @@ pub fn encode_presentation(dev: &Arc<Device>, threads: usize, labels: &[String],
     ctl.progress = progress;
     let ctx = r?;
     let secs = t0.elapsed().as_secs_f64();
-    ctl.say(format!("encoded: {} x {} in {secs:.1} s", ids.len(), enc.hidden));
+    ctl.say(format!("encoded: {} x {} in {secs:.1} s (layers from {})", ids.len(), enc.hidden, enc.source.lock().map(|s| s.clone()).unwrap_or_default()));
     Ok((ctx, ids, enc.hidden, secs))
 }
 

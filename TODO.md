@@ -12,14 +12,12 @@ Strata keeps its model's experts in pinned host memory and the GPU reads them ov
 box, host to device). Kept in pinned RAM by the worker after the first clip, the encoder's layers would reach the
 GPU in under a second; what remains is dequant + the 356-token GEMMs (well under a second).
 
-- [ ] Keep the encoder's layers in a pinned host buffer in the worker (allocated once, filled on the first encode),
-      streamed layer by layer as now but from RAM; `H3_TE_PIN=0` keeps today's path.
-- [ ] Only when the RAM is there: the box also runs a chat model (8-15 GB pinned); skip the pinning below a free-RAM
-      floor, as Strata's lend mirror does (it pins only beyond 8 GiB free).
-- [ ] Check: the same conditioning bytes (cosine 1.0 against the streamed path), the clip's TE time, two jobs in one
-      daemon (cross-job state, the 2026-10-03 lesson).
-
-Expected: ~16 s -> ~1-2 s per clip after the first (about 9% of a production clip, more of a short one).
+- [x] Done (2026-10-05): the worker keeps the encoder's matrices in pinned host memory (14.4 GiB) between clips, and
+      every layer goes up by DMA on a copy queue while the layer before computes (two device buffers). Without the
+      room (16.5 GB + 8 GiB free; a second worker on the other GPU usually lacks it) two pinned layer slots, same
+      overlap. `H3_TE_PIN=0`: no kept copy. On the B65: the first clip's encode 9.1 s (was 13.6 cold, 10.3 with
+      the file in the page cache), every later one **1.6 s**; latents byte-identical to the old build (two
+      prompts). The disk was not the limit on this box: the pageable, synchronous per-layer copies were.
 
 ## 2. Denoiser weights streamed from pinned RAM, for the cells that do not fit
 
