@@ -65,10 +65,20 @@ then upscale the frames in pixels with an ESRGAN-type network (RRDBNet / Real-ES
 set (oneDNN convolutions, the residual-in-residual dense blocks, pixel shuffle). No ESRGAN model is on the box yet
 (ComfyUI's upscale_models is empty).
 
-- [ ] Its cost: a candidate model's convolutions at 768x576 -> 1152x864 per frame through oneDNN, x124 frames, against
-      the ~27 s the high-resolution decode costs over the low one (estimate; measure both on the B70).
-- [ ] Its quality: per-frame upscaling can flicker where the latent upscaler stays coherent in time - a clip pair
-      (same seed, both paths) to judge, and a temporal check (frame-to-frame differences).
+- [x] **What it would save, measured** (2026-10-05, B65, one probe clip's latents, 124 frames): today's path - the
+      latent upscale 5.6 s, then the decoder at 1152x864 36.3 s - against the decoder at 768x576 15.0 s: **~27 s** a
+      clip on the B65 (~17 s on the B70 by the cards' ratio).
+- [x] **A clip pair, the network run on the CPU (PyTorch 2.14) for quality only**: Real-ESRGAN `realesr-animevideov3`
+      (16 convs, 1.0 s a frame on the CPU) and `realesr-general-x4v3` (32 convs, 1.8 s), x4 then an area resize to
+      1152x864, against today's path; a bicubic control. Mean frame-to-frame change (a flicker proxy): today 1.644,
+      animevideov3 1.627, general-x4v3 1.697, bicubic 1.504 (softer). PSNR against today's path: 34.4 / 33.1 / 35.3 dB.
+      By eye (centre crops): both as sharp as today's path or crisper on edges; today's path keeps a little more
+      natural fine texture (the decoder synthesizes it at full size); bicubic visibly softer. **Waiting on the
+      user's judgment** (`out/esr-sbs-*.mp4`, `out/esr-grid-crop.png` on the box). Weights in models/esrgan
+      (official Real-ESRGAN releases v0.2.1 / v0.2.5.0, sha256 recorded there).
+- [ ] If it passes: animevideov3 is ~0.6 TFLOP a frame (74 TFLOP a 5 s clip) - a few 3x3 64-channel convolutions,
+      PReLU, a pixel shuffle - oneDNN convolutions in libh3sycl, an estimated 1-4 s on the B70 against the ~17 s
+      saved; then measured.
 - [ ] If it wins: a `upscale: pixels` option beside the latent one, the studio's canvas table timing both.
 
 ## 3. Smaller
