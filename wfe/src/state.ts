@@ -12,6 +12,8 @@ export interface AppState {
   summary: Summary | null;
   gpu: Gpu | null;
   plan: Plan | null;
+  /** the GPU the canvas table is timed for (its switch); null: the fastest measured */
+  pickGpu: number | null;
   list: ListRow[];
   films: Film[];
   filter: string;
@@ -41,6 +43,7 @@ export const state: AppState = {
   summary: null,
   gpu: null,
   plan: null,
+  pickGpu: null,
   list: [],
   films: [],
   filter: "",

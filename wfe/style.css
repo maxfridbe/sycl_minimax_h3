@@ -213,3 +213,15 @@ table.pick td button.meas{font-weight:700}
 .llm .sel{max-width:100%;font-size:11px}
 .llm .dot{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 6px #22c55e;flex:0 0 auto}
 .llm .dot.off{background:#6b7280;box-shadow:none} .llm .dot.busy{background:#f59e0b;box-shadow:0 0 6px #f59e0b}
+/* the canvas table: columns are clip lengths; colour = render time per second of clip; a GPU switch above it */
+.gpusw{display:flex;gap:6px;align-items:center;margin:2px 0 6px;flex-wrap:wrap}
+.gpusw button{background:#181b22;border:1px solid #2a2f3a;border-radius:6px;color:#cbd5e1;font-size:12px;padding:3px 10px;cursor:pointer}
+.gpusw button.on{border-color:#3b82f6;background:#1d2635;color:#e6e6e6;box-shadow:inset 0 0 0 1px #3b82f6}
+table.pick th.cur{color:#93c5fd}
+table.pick td button.r-good{border-left:3px solid #22c55e}
+table.pick td button.r-mid{border-left:3px solid #f59e0b}
+table.pick td button.r-bad{border-left:3px solid #ef4444}
+table.pick td button.r-good small{color:#86efac}
+table.pick td button.r-mid small{color:#fcd34d}
+table.pick td button.r-bad small{color:#fca5a5}
+.r-good-t{color:#22c55e}.r-mid-t{color:#f59e0b}.r-bad-t{color:#ef4444}

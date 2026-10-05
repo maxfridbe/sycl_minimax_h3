@@ -157,10 +157,11 @@ export function Creation() {
           engine={form.engine}
           seconds={form.seconds}
           steps={form.steps}
-          onPick={(w, h, e) => {
+          onPick={(w, h, e, sec) => {
             form.width = w;
             form.height = h;
             form.engine = e as Engine;
+            form.seconds = sec;
             render();
           }}
         />
