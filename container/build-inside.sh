@@ -35,9 +35,14 @@ engine() {
   cargo build --release --locked --manifest-path engine/Cargo.toml -p h3d
   cargo build --release --locked --manifest-path engine/Cargo.toml -p sycl-h3 --target x86_64-unknown-linux-musl
   # beside, then renamed over: a running daemon or studio keeps its old file (a plain cp fails "Text file busy")
-  cp engine/target/release/h3d dist/h3d.new && mv -f dist/h3d.new dist/h3d
-  echo "    (a running engine daemon keeps the old h3d and cannot start workers from it: sycl-h3 stop, then sycl-h3 start)"
-  cp engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/sycl-h3.new && mv -f dist/sycl-h3.new dist/sycl-h3
+  # only when it changed: a replaced h3d leaves a running daemon without its own executable (its workers fail with
+  # "cannot start the engine process") until it is restarted
+  if ! cmp -s engine/target/release/h3d dist/h3d; then
+    cp engine/target/release/h3d dist/h3d.new && mv -f dist/h3d.new dist/h3d
+    echo "    h3d changed: restart a running engine daemon (sycl-h3 stop, then sycl-h3 start)"
+  fi
+  cmp -s engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/sycl-h3 || \
+    { cp engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/sycl-h3.new && mv -f dist/sycl-h3.new dist/sycl-h3; }
   rm -f dist/h3                                  # the name before the split
   rm -rf dist/tokenizer && cp -r tokenizer dist/tokenizer   # the text encoder's tokenizer files (/app/tokenizer)
 }
