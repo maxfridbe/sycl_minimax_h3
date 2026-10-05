@@ -49,10 +49,27 @@ TFLOP/s on 1,797-token tiles), the gated activation 10%, norms + rotation 10%.
 - [ ] **Opt-in, output changes:** the int8 decoder checkpoint (models/kitchen) is only 5% faster whole (its
       rotations cost what the int8 GEMMs save, except in w1: 1.67x there), at PSNR 44.8 dB / SSIM 0.989 against
       fp16. int8 for w1 alone would save ~1.7 s of 15.6 - a clip pair to judge first.
-- [ ] The two norms per block (0.84 s) and the q/k norm + rotation (0.66 s) run below the memory's rate, as the
-      gated activation did: the same treatment, ~0.5-0.8 s.
+- [x] The norms the same way (16-byte loads, the same arithmetic and summing order): the per-block norms 0.84 ->
+      0.39 s, the q/k norm + rotation 0.66 -> 0.32 s. Decode 15.6 -> **15.0 s (17.6 at the start: -15%)**, still
+      identical; a whole clip's latents (text encoder, denoiser) byte-identical too. `H3S_NORM_SCALAR=1`: the old
+      kernels.
 - [ ] Attention itself: oneDNN's kernel at ~33 TFLOP/s for 64-feature heads on 1.8k tokens (SageAttention was 2x
       slower at this length). A kernel of our own would have to beat oneDNN's; open.
+
+## 2c. An ESRGAN upscaler in pixels (investigate)
+
+Today a clip is sampled at 768x576, its latents upscaled 1.5x by the latent upscaler (3D convolutions, 4.8 s), and
+the video decoder runs at 1152x864 - 2.25x the pixels of the sampled size, so ~2.25x the decoder's time (47.5 s at
+1152x864 on the B70 before the 2026-10-05 kernels; ~20 s at 768x576). The other way: decode at the sampled size,
+then upscale the frames in pixels with an ESRGAN-type network (RRDBNet / Real-ESRGAN, x2 or x1.5) as a SYCL kernel
+set (oneDNN convolutions, the residual-in-residual dense blocks, pixel shuffle). No ESRGAN model is on the box yet
+(ComfyUI's upscale_models is empty).
+
+- [ ] Its cost: a candidate model's convolutions at 768x576 -> 1152x864 per frame through oneDNN, x124 frames, against
+      the ~27 s the high-resolution decode costs over the low one (estimate; measure both on the B70).
+- [ ] Its quality: per-frame upscaling can flicker where the latent upscaler stays coherent in time - a clip pair
+      (same seed, both paths) to judge, and a temporal check (frame-to-frame differences).
+- [ ] If it wins: a `upscale: pixels` option beside the latent one, the studio's canvas table timing both.
 
 ## 3. Smaller
 

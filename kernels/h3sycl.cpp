@@ -731,6 +731,31 @@ int h3s_scale_rows(void* ctx, void* x, int dt, int64_t M, int64_t C, const float
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+extern "C++" {
+// rms_norm_mod's per-element pass for 16-bit x and out, 8 features per work-item (see h3s_rms_norm_mod)
+template <int DT>
+static void norm16(sycl::queue& q, const uint16_t* x, int64_t M, int64_t C, const float* inv, const float* weight,
+                   const int32_t* rows, const float* scale, const float* shift, uint16_t* out) {
+    q.parallel_for(sycl::range<2>((size_t) M, (size_t) C / 8), [=](sycl::id<2> id) {
+        const size_t r = id[0], j = id[1] * 8;
+        using V = sycl::vec<uint16_t, 8>;
+        const V xv = *reinterpret_cast<const V*>(x + r * C + j);
+        V ov;
+        for (int e = 0; e < 8; ++e) {
+            const size_t i = j + e;
+            const uint16_t b = xv[e];
+            float v = (DT == F16 ? (float) sycl::bit_cast<sycl::half>(b) : bf16_to_f32(b)) * inv[r] * weight[i];
+            if (rows) {
+                const size_t m = (size_t) rows[r] * C + i;
+                v = v * (1.0f + scale[m]) + shift[m];
+            }
+            ov[e] = DT == F16 ? sycl::bit_cast<uint16_t>((sycl::half) v) : f32_to_bf16(v);
+        }
+        *reinterpret_cast<V*>(out + r * C + j) = ov;
+    });
+}
+}  // extern "C++"
+
 // 1 / sqrt(mean(x[r]^2) + eps) per row of x [M, C] into c.inv: a work-group of 256 per row, summed in float32
 static float* row_inv_rms(Ctx& c, const void* x, int x_dt, int64_t M, int64_t C, float eps) {
     float* inv = c.grow(c.inv, c.inv_cap, (size_t) M);
@@ -756,6 +781,15 @@ int h3s_rms_norm_mod(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, c
     const float* inv = row_inv_rms(c, x, x_dt, M, C, eps);
     if (!inv) return -1;
     const bool mod = rows && scale && shift;
+    // 16-bit in and out: 8 features per work-item through 16-byte loads, the same arithmetic per element (identical
+    // results); the element-per-work-item form below ran well under the memory's rate
+    const bool vec = x_dt == out_dt && (x_dt == F16 || x_dt == BF16) && C % 8 == 0 && (uintptr_t) x % 16 == 0 &&
+                     (uintptr_t) out % 16 == 0 && !std::getenv("H3S_NORM_SCALAR");
+    if (vec) {
+        if (x_dt == F16) norm16<F16>(c.q, (const uint16_t*) x, M, C, inv, weight, mod ? rows : nullptr, scale, shift, (uint16_t*) out);
+        else norm16<BF16>(c.q, (const uint16_t*) x, M, C, inv, weight, mod ? rows : nullptr, scale, shift, (uint16_t*) out);
+        return 0;
+    }
     c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
         const size_t r = id[0], i = id[1];
         float v = load(x, x_dt, r * C + i) * inv[r] * weight[i];
@@ -1158,17 +1192,78 @@ int h3s_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, 
     if (stride < H * D) { g_err = "h3s_rms_rope: the row stride is shorter than a row"; return -1; }
     float* inv = c.grow(c.inv, c.inv_cap, (size_t) (M * H));
     if (!inv) return -1;
-    c.q.parallel_for(sycl::range<1>((size_t) (M * H)), [=](sycl::id<1> mh) {
-        const size_t base = (mh[0] / H) * stride + (mh[0] % H) * D;
-        float s = 0.0f;
-        for (int64_t i = 0; i < D; ++i) {
-            const float v = load(x, x_dt, base + i);
-            s += v * v;
-        }
-        inv[mh[0]] = sycl::rsqrt(s / (float) D + eps);
-    });
+    // 16-bit rows 16-byte aligned: each head's features read 8 at a time, summed in the same order (identical results)
+    const bool vec = (x_dt == F16 || x_dt == BF16) && D % 8 == 0 && stride % 8 == 0 && (uintptr_t) x % 16 == 0 &&
+                     !std::getenv("H3S_NORM_SCALAR");
+    if (vec) {
+        const bool f16 = x_dt == F16;
+        c.q.parallel_for(sycl::range<1>((size_t) (M * H)), [=](sycl::id<1> mh) {
+            const size_t base = (mh[0] / H) * stride + (mh[0] % H) * D;
+            using V = sycl::vec<uint16_t, 8>;
+            float s = 0.0f;
+            for (int64_t i = 0; i < D; i += 8) {
+                const V xv = *reinterpret_cast<const V*>((const uint16_t*) x + base + i);
+                for (int e = 0; e < 8; ++e) {
+                    const float v = f16 ? (float) sycl::bit_cast<sycl::half>((uint16_t) xv[e]) : bf16_to_f32(xv[e]);
+                    s += v * v;
+                }
+            }
+            inv[mh[0]] = sycl::rsqrt(s / (float) D + eps);
+        });
+    } else {
+        c.q.parallel_for(sycl::range<1>((size_t) (M * H)), [=](sycl::id<1> mh) {
+            const size_t base = (mh[0] / H) * stride + (mh[0] % H) * D;
+            float s = 0.0f;
+            for (int64_t i = 0; i < D; ++i) {
+                const float v = load(x, x_dt, base + i);
+                s += v * v;
+            }
+            inv[mh[0]] = sycl::rsqrt(s / (float) D + eps);
+        });
+    }
     const int64_t half = rot_dim / 2;                  // rotated pairs: (i, half + i)
     const int64_t slots = half + (D - rot_dim) / 2;    // then pairs of the features passed through
+    // 16-bit, aligned: a work-item takes 8 rotated pairs or 16 features passed through, through 16-byte loads; the
+    // same arithmetic per element (identical results)
+    if (vec && half % 8 == 0 && (D - rot_dim) % 16 == 0) {
+        const bool f16 = x_dt == F16;
+        const int64_t g_rot = half / 8, g_pass = (D - rot_dim) / 16;
+        c.q.parallel_for(sycl::range<2>((size_t) (M * H), (size_t) (g_rot + g_pass)), [=](sycl::id<2> id) {
+            using V = sycl::vec<uint16_t, 8>;
+            const size_t mh = id[0], g = id[1], base = (mh / H) * stride + (mh % H) * D;
+            const float s = inv[mh];
+            uint16_t* p = (uint16_t*) x;
+            auto f = [=](uint16_t b) { return f16 ? (float) sycl::bit_cast<sycl::half>(b) : bf16_to_f32(b); };
+            auto h = [=](float v) { return f16 ? sycl::bit_cast<uint16_t>((sycl::half) v) : f32_to_bf16(v); };
+            if ((int64_t) g < g_rot) {
+                const size_t j0 = g * 8;
+                V* pa = reinterpret_cast<V*>(p + base + j0);
+                V* pb = reinterpret_cast<V*>(p + base + half + j0);
+                const V va = *pa, vb = *pb;
+                V oa, ob;
+                for (int e = 0; e < 8; ++e) {
+                    const size_t j = j0 + e;
+                    const float a = f(va[e]) * s * weight[j], b = f(vb[e]) * s * weight[half + j];
+                    const size_t tt = (mh / H) * half + j;
+                    const float co = cs[2 * tt], si = cs[2 * tt + 1];
+                    oa[e] = h(a * co - b * si);
+                    ob[e] = h(b * co + a * si);
+                }
+                *pa = oa;
+                *pb = ob;
+            } else {
+                const size_t i0 = rot_dim + (g - g_rot) * 16;
+                for (int k = 0; k < 2; ++k) {
+                    V* pv = reinterpret_cast<V*>(p + base + i0 + 8 * k);
+                    const V v = *pv;
+                    V o;
+                    for (int e = 0; e < 8; ++e) o[e] = h(f(v[e]) * s * weight[i0 + 8 * k + e]);
+                    *pv = o;
+                }
+            }
+        });
+        return 0;
+    }
     // one work-item per pair: it owns its two values, so the update is in place
     c.q.parallel_for(sycl::range<2>((size_t) (M * H), (size_t) slots), [=](sycl::id<2> id) {
         const size_t mh = id[0], j = id[1], base = (mh / H) * stride + (mh % H) * D;
