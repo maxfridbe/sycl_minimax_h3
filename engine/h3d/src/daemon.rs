@@ -330,9 +330,6 @@ impl Daemon {
 
     /// After a worker ended (asked or not): the slot forgets it, the hooks get their share back.
     fn worker_gone(&self, k: usize, p: Proc) {
-        if p.shared {
-            self.release_hooks();
-        }
         {
             let mut s = self.s.lock().unwrap();
             let sl = &mut s.slots[k];
@@ -341,6 +338,11 @@ impl Daemon {
             sl.worker_pid = None;
         }
         self.set_engine(k, "unloaded");
+        // the hooks last: the model switcher starts its model only once our status shows the card free (2026-10-05:
+        // released first, the studio still saw this worker and left the chat model off until its idle watchdog)
+        if p.shared {
+            self.release_hooks();
+        }
     }
 
     /// Ends a worker: asks it to exit (it finishes the kernel it is in, unloads, ends) and waits for it. Never a kill:

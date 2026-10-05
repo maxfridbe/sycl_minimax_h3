@@ -89,6 +89,46 @@ decoder's tiles, the text refiner) stay on oneDNN, where Sage's quantize pass co
 decoder ran 2x slower with it). `H3S_ATTN=onednn` turns Sage off; `H3S_SAGE_MIN_S` moves the threshold. Beyond
 that it takes computing fewer scores.
 
+### The canvas table on each GPU
+
+What the studio's canvas table shows, per GPU, measured by `sycl-h3 plan measure` (2026-10-05, Ryzen 9 9950X,
+61 GiB RAM, both cards at PCIe Gen5 x8): the denoiser's 8 steps of the production recipe for each canvas and clip
+length. The text encoder, the weights' load, the upscaler and the decoders come on top (97 s of the 155 s clip
+above). Each GPU's step time is its `bench-blocks` curve (2,048-47,104 tokens) times a factor from one real
+clip on that GPU (a clip's step is the 50 blocks plus its embeddings, final layer and sampler). The B70's 768x576,
+5 s cell (0:58) matches the clip measured above (58.0 s); the B65 takes about 1.55x the B70's time throughout.
+"Does not fit" is the studio's memory estimate against the 30.3 GiB cap.
+
+**Arc Pro B70** (GPU 0, shared with the chat model; a clip's step = 1.12 x the 50 blocks):
+
+| canvas | 5 s clip | 10 s clip | 15 s clip |
+|---|---:|---:|---:|
+| 640x480 (4:3) | 0:36 (4.5 s/step) | 1:30 (11.2 s/step) | 2:44 (20.4 s/step) |
+| 768x576 (4:3) | 0:58 (7.2 s/step) | 2:35 (19.3 s/step) | 4:48 (36.0 s/step) |
+| 576x1024 (9:16) | 1:27 (10.8 s/step) | 4:02 (30.2 s/step) | does not fit (29.8 GiB) |
+| 768x768 (1:1) | 1:27 (10.8 s/step) | 4:02 (30.2 s/step) | does not fit (29.8 GiB) |
+| 1024x576 (16:9) | 1:27 (10.8 s/step) | 4:02 (30.2 s/step) | does not fit (29.8 GiB) |
+| 896x672 (4:3) | 1:29 (11.2 s/step) | 4:10 (31.2 s/step) | does not fit (30.0 GiB) |
+| 768x1024 (3:4) | 2:14 (16.8 s/step) | 6:10 (46.2 s/step) | does not fit (33.2 GiB) |
+| 1024x768 (4:3) | 2:14 (16.8 s/step) | 6:10 (46.2 s/step) | does not fit (33.2 GiB) |
+| 768x1344 (9:16) | 3:24 (25.5 s/step) | does not fit (31.6 GiB) | does not fit (37.4 GiB) |
+| 1344x768 (16:9) | 3:24 (25.5 s/step) | does not fit (31.6 GiB) | does not fit (37.4 GiB) |
+
+**Arc Pro B65** (GPU 1; a clip's step = 1.10 x the 50 blocks):
+
+| canvas | 5 s clip | 10 s clip | 15 s clip |
+|---|---:|---:|---:|
+| 640x480 (4:3) | 0:57 (7.1 s/step) | 2:18 (17.3 s/step) | 4:11 (31.4 s/step) |
+| 768x576 (4:3) | 1:30 (11.2 s/step) | 3:57 (29.7 s/step) | 7:24 (55.5 s/step) |
+| 576x1024 (9:16) | 2:14 (16.7 s/step) | 6:12 (46.5 s/step) | does not fit (29.8 GiB) |
+| 768x768 (1:1) | 2:14 (16.7 s/step) | 6:12 (46.5 s/step) | does not fit (29.8 GiB) |
+| 1024x576 (16:9) | 2:14 (16.7 s/step) | 6:12 (46.5 s/step) | does not fit (29.8 GiB) |
+| 896x672 (4:3) | 2:18 (17.2 s/step) | 6:24 (48.0 s/step) | does not fit (30.0 GiB) |
+| 768x1024 (3:4) | 3:26 (25.8 s/step) | 9:34 (71.7 s/step) | does not fit (33.2 GiB) |
+| 1024x768 (4:3) | 3:26 (25.8 s/step) | 9:34 (71.7 s/step) | does not fit (33.2 GiB) |
+| 768x1344 (9:16) | 5:13 (39.1 s/step) | does not fit (31.6 GiB) | does not fit (37.4 GiB) |
+| 1344x768 (16:9) | 5:13 (39.1 s/step) | does not fit (31.6 GiB) | does not fit (37.4 GiB) |
+
 ## Layout
 
     kernels/      SYCL C++: libh3sycl (h3sycl.h is the whole interface), libh3sage (sage.cpp: SageAttention),

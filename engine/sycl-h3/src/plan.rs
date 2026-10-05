@@ -112,10 +112,12 @@ pub fn run(cfg: &Config, raw: &[String]) -> Result<()> {
             let v: Value = serde_json::from_slice(&std::fs::read(&p).map_err(|e| Error(format!("{}: {e} (sycl-h3 plan measure)", p.display())))?)
                 .map_err(|e| Error(format!("{}: {e}", p.display())))?;
             for g in v["gpus"].as_array().into_iter().flatten() {
-                println!("GPU {} {} - step factor {:.3} (from a {}-token clip)", g["gpu"], g["name"].as_str().unwrap_or("?"),
-                         g["step_scale"].as_f64().unwrap_or(1.0), g["clip_tokens"]);
+                let scale = g["step_scale"].as_f64().unwrap_or(1.0);
+                println!("GPU {} {} - a clip's step is {scale:.3} x the blocks (from a {:.0}-token clip)", g["gpu"],
+                         g["name"].as_str().unwrap_or("?"), g["clip_tokens"].as_f64().unwrap_or(0.0));
                 for p in g["points"].as_array().into_iter().flatten() {
-                    println!("  {:>6} tokens  {:6.2} s/step (blocks)", p[0], p[1].as_f64().unwrap_or(0.0));
+                    let (t, s) = (p[0].as_f64().unwrap_or(0.0), p[1].as_f64().unwrap_or(0.0));
+                    println!("  {t:>6.0} tokens  {s:6.2} s (blocks)  {:6.2} s per clip step", s * scale);
                 }
             }
             Ok(())
