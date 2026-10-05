@@ -88,6 +88,17 @@ set (oneDNN convolutions, the residual-in-residual dense blocks, pixel shuffle).
       PyTorch run: 42.0 / 41.0 dB (half precision, and the CPU run's input was the mp4).
 - [ ] The canvas table times only the sampling; the decode-side choice (latent vs pixels) could show there too.
 
+## 2d. A step-time cliff at 21,865 tokens
+
+`sycl-h3 plan measure` (2026-10-05) benched every cell of the canvas table on both cards. One token count sits well
+above both cards' curves: 21,865 (576x1024 / 768x768 / 1024x576 at 5 s) - 12.85 s a step on the B70 against 9.92 on
+its curve (+30%), 20.12 against 14.96 on the B65 (+34%), while 22,309 tokens (896x672 at 5 s) sits on it (+2%) and
+every other cell checked within 1%. The same on two cards: a shape effect in a kernel at that sequence length
+(tiling, padding, or an attention path choice), not noise.
+
+- [ ] bench-blocks at 21,865 with H3S_PROFILE: which stage takes the extra 3 s (attention first: SageAttention's tile
+      sizes against 21,865), and the lengths around it.
+
 ## 3. Smaller
 
 - [ ] The denoiser's weight load (11.6 s per worker start) through a pipelined staging ring like Strata's expert
