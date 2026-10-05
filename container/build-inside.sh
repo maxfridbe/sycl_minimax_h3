@@ -45,6 +45,7 @@ wfe() {
   echo "==> wfe: TypeScript -> dist/wfe"
   NODE=$(command -v node) wfe/build.sh
   rm -rf dist/wfe && cp -r wfe/build dist/wfe
+  cp -r wfe/static dist/wfe/static   # the icon font (style.css: /static/nf.woff2; the studio serves dist/wfe/static)
 }
 tools() {
   echo "==> tools: oneDNN probes (gemm_bench, sdpa_probe)"
