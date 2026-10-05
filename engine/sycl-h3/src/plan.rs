@@ -1,14 +1,16 @@
 //! `sycl-h3 plan`: what a denoiser step costs on each of this box's GPUs, measured, for the studio's canvas table
 //! (`/api/plan`, the front end's CanvasPicker).
 //!
-//!     sycl-h3 plan measure [--gpu N ...] [--tokens 2048,4096,...] [--no-clip]
+//!     sycl-h3 plan measure [--gpu N ...] [--tokens 2048,4096,...] [--no-clip] [--no-cells]
 //!     sycl-h3 plan show
 //!
 //! For every GPU the engine serves, `measure` queues `bench-blocks` over a range of token counts (the 50 blocks of
 //! one step, pinned to that GPU), then one short real clip: a clip's step is the 50 blocks plus its own small extras
 //! (embeddings, the final layer, the sampler), so the clip's median step over the bench at the clip's token count is
 //! the GPU's step factor. The result goes to `plan.json` in the studio's directory, which the studio reads on every
-//! `/api/plan` - a new measurement shows without a restart. GPUs run their jobs side by side; one the engine shares
+//! `/api/plan` - a new measurement shows without a restart. It also benches every cell of the canvas table (each
+//! canvas at each of LENGTHS, at the cell's exact token count): the cell's own step time and peak memory, or "over"
+//! when the engine refuses it (it counts its allocations and refuses past its cap - no stall). GPUs run their jobs side by side; one the engine shares
 //! with another program is handed over the usual way (lock file, model switch).
 
 use std::path::PathBuf;
@@ -23,6 +25,19 @@ use crate::config::Config;
 /// The token counts measured by default: every canvas the studio offers falls in this range from 1 s up to the
 /// longest clip that fits.
 pub const TOKENS: [u64; 11] = [2048, 4096, 6144, 8192, 12288, 16384, 20480, 24576, 32768, 40960, 47104];
+
+/// The canvas table's clip lengths (wfe CanvasPicker's LENGTHS): every canvas at each is a measured cell.
+pub const LENGTHS: [f64; 5] = [5.0, 8.0, 10.0, 12.0, 15.0];
+
+/// Latent tokens of a canvas at a clip length - the front end's tokensFor, the legacy server's tokens_for.
+pub fn tokens_for(w: i64, h: i64, seconds: f64) -> u64 {
+    let mut n = ((seconds * 24.0).round() as i64).max(5);
+    while n % 17 != 5 {
+        n += 1;
+    }
+    let ltf = if n <= 5 { 2 } else { (n - 5) / 17 * 5 + 2 };
+    (ltf * (w * h / 1024) + ((n as f64 / 24.0 * 40.0).round() as i64) + 10 + 336) as u64
+}
 
 /// The calibration clip: the production canvas, short, no upscale (only its sampling is used).
 const CLIP: (u64, u64, u64, u64) = (768, 576, 3, 4); // width, height, seconds, steps
@@ -97,6 +112,8 @@ struct Queued {
     gpu: u64,
     bench: Vec<(u64, u64)>,
     clip: Option<u64>,
+    /// the canvas table's cells: (key "WxH|S", tokens, job) - one job per distinct token count
+    cells: Vec<(String, u64, u64)>,
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -127,7 +144,7 @@ pub fn run(cfg: &Config, raw: &[String]) -> Result<()> {
 }
 
 fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
-    let (mut gpus, mut tokens, mut clip) = (Vec::<u64>::new(), TOKENS.to_vec(), true);
+    let (mut gpus, mut tokens, mut clip, mut cells) = (Vec::<u64>::new(), TOKENS.to_vec(), true, true);
     let mut it = raw.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -136,6 +153,7 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
                 tokens = it.next().ok_or("--tokens 2048,4096,...")?.split(',').map(|v| v.trim().parse().map_err(|_| Error(format!("{v}: not a token count")))).collect::<Result<_>>()?
             }
             "--no-clip" => clip = false,
+            "--no-cells" => cells = false,
             other => return Err(Error(format!("sycl-h3 plan measure: unknown option {other}"))),
         }
     }
@@ -156,11 +174,30 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
         } else {
             None
         };
-        eprintln!("GPU {g}: {} bench jobs{} queued", bench.len(), if c.is_some() { " and a calibration clip" } else { "" });
-        queued.push(Queued { gpu: g, bench, clip: c });
+        let mut cell_jobs: Vec<(String, u64, u64)> = Vec::new();
+        if cells {
+            let mut by_tokens: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
+            for (w, h, _, _) in crate::studio::library::CANVASES {
+                for sec in LENGTHS {
+                    let t = tokens_for(w, h, sec);
+                    let id = match by_tokens.get(&t) {
+                        Some(id) => *id,
+                        None => {
+                            let id = add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g}))?;
+                            by_tokens.insert(t, id);
+                            id
+                        }
+                    };
+                    cell_jobs.push((format!("{w}x{h}|{sec}"), t, id));
+                }
+            }
+        }
+        eprintln!("GPU {g}: {} bench jobs{}{} queued", bench.len(), if c.is_some() { ", a calibration clip" } else { "" },
+                  if cells { ", the canvas table's cells" } else { "" });
+        queued.push(Queued { gpu: g, bench, clip: c, cells: cell_jobs });
     }
     let mut out = Vec::new();
-    for Queued { gpu: g, bench, clip: c } in queued {
+    for Queued { gpu: g, bench, clip: c, cells: cell_jobs } in queued {
         let mut points = Vec::new();
         for (t, id) in bench {
             let j = wait(id)?;
@@ -179,11 +216,37 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
             ctok = json!(t);
             eprintln!("GPU {g}: a {t}-token clip steps in {steady:.2} s: {scale:.3} x the blocks");
         }
+        // the cells: the bench of each distinct token count once, read for every cell that has it
+        let mut cell_out = serde_json::Map::new();
+        let mut seen: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+        for (key, t, id) in cell_jobs {
+            let v = match seen.get(&t) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = match wait(id) {
+                        Ok(j) => {
+                            let s = j["result"]["seconds"].as_f64().unwrap_or(0.0) * scale;
+                            let gib = j["result"]["gib_in_use"].as_f64().unwrap_or(0.0);
+                            eprintln!("GPU {g}: cell tokens {t:>6}: {s:6.2} s per clip step, {gib:.1} GiB");
+                            json!({"tokens": t, "s_per_step": (s * 100.0).round() / 100.0, "gib": (gib * 10.0).round() / 10.0})
+                        }
+                        Err(e) => {
+                            eprintln!("GPU {g}: cell tokens {t:>6}: does not fit ({e})");
+                            json!({"tokens": t, "over": true})
+                        }
+                    };
+                    seen.insert(t, v.clone());
+                    v
+                }
+            };
+            cell_out.insert(key, v);
+        }
         let name = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).and_then(|s| s["name"].as_str()).unwrap_or("?").to_string();
         let shared = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).map(|s| s["shared"] == true).unwrap_or(false);
         let (a, b) = fit(&points.iter().map(|&(t, s)| (t, s * scale)).collect::<Vec<_>>());
         out.push(json!({"gpu": g, "name": name, "shared": shared, "step_scale": scale, "clip_tokens": ctok,
-                        "points": points.iter().map(|&(t, s)| json!([t, s])).collect::<Vec<_>>(), "step_a": a, "step_b": b}));
+                        "points": points.iter().map(|&(t, s)| json!([t, s])).collect::<Vec<_>>(), "step_a": a, "step_b": b,
+                        "cells": Value::Object(cell_out)}));
     }
     let p = file(cfg);
     if let Some(d) = p.parent() {
@@ -219,6 +282,13 @@ mod tests {
         let p: Vec<(f64, f64)> = [2048.0, 8192.0, 16384.0, 47104.0].iter().map(|&t| (t, 2e-8 * t * t + 3e-4 * t)).collect();
         let (a, b) = fit(&p);
         assert!((a - 2e-8).abs() < 1e-12 && (b - 3e-4).abs() < 1e-8, "{a} {b}");
+    }
+
+    #[test]
+    fn tokens_match_the_front_end() {
+        // the front end's tokensFor and the legacy server's tokens_for give these
+        assert_eq!(tokens_for(768, 576, 5.0), 16537);
+        assert_eq!(tokens_for(768, 576, 15.0), 47173);
     }
 
     #[test]

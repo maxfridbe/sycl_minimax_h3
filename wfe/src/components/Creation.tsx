@@ -148,8 +148,8 @@ export function Creation() {
       <Panel
         id="canvas"
         icon="&#xf0b2;"
-        title="Canvas and engine"
-        hint={`${form.width}×${form.height} · ${form.engine}`}
+        title="Canvas and length"
+        hint={`${form.width}×${form.height} · ${form.seconds}s · ${form.steps} steps`}
       >
         <CanvasPicker
           width={form.width}

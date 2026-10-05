@@ -49,6 +49,20 @@ export function estimate(
   const tokens = tokensFor(canvas.width, canvas.height, seconds);
   const key = `${engine.quant}|${canvas.width}x${canvas.height}|${Math.round(seconds)}`;
   const hit = gpu ? undefined : plan.measured[key];
+  // a cell measured on this GPU (sycl-h3 plan measure) beats the GPU's curve
+  const cell = gpu?.cells?.[`${canvas.width}x${canvas.height}|${seconds}`];
+  if (cell) {
+    const gibc = cell.over ? engine.gib + tokens * plan.gib_per_token : cell.gib ?? 0;
+    const sps = cell.s_per_step ?? gpuStep(gpu!, tokens);
+    return {
+      tokens,
+      gib: Math.round(gibc * 10) / 10,
+      fits: !cell.over && gibc + plan.margin_gib <= plan.cap_gib,
+      secondsPerStep: sps,
+      total: sps * steps,
+      measured: true,
+    };
+  }
   const gib = hit ? hit.peak : engine.gib + tokens * plan.gib_per_token;
   const secondsPerStep = gpu ? gpuStep(gpu, tokens)
     : hit?.s_per_step ?? plan.step_a * tokens * tokens + plan.step_b * tokens;
@@ -58,7 +72,7 @@ export function estimate(
     fits: gib + plan.margin_gib <= plan.cap_gib,
     secondsPerStep,
     total: secondsPerStep * steps,
-    measured: !!hit || !!gpu,
+    measured: !!hit,
   };
 }
 
@@ -72,10 +86,7 @@ export interface CanvasPickerProps {
 }
 
 /** The clip lengths the table's columns show, in seconds of video generated. */
-const LENGTHS = [2, 4, 6, 8, 10, 12, 15];
-
-/** render time over clip length: green under 15:1, amber to 30:1, red above */
-const ratioClass = (r: number) => (r < 15 ? "r-good" : r < 30 ? "r-mid" : "r-bad");
+const LENGTHS = [5, 8, 10, 12, 15];
 
 export function CanvasPicker(props: CanvasPickerProps) {
   const plan = state.plan;
@@ -89,58 +100,72 @@ export function CanvasPicker(props: CanvasPickerProps) {
   const fastest = gpus.reduce<GpuPlan | undefined>((a, g) => (!a || g.step_a < a.step_a ? g : a), undefined);
   const gpu = gpus.find((g) => g.gpu === state.pickGpu) ?? fastest;
   const short = (n: string) => n.replace(/^Intel\(R\) Arc\(TM\) /, "").replace(/ Graphics$/, "");
-  const sw = gpus.length > 1 ? (
+  const sw = (
     <div class="gpusw">
-      <span class="hint">timed for</span>
-      {gpus.map((g) => (
-        <button
-          type="button"
-          class={{ on: g === gpu }}
-          attrs={{ title: `GPU ${g.gpu}${g.shared ? ", shared with the chat model" : ""} · a clip's step = ${g.step_scale.toFixed(2)} x the measured blocks` }}
-          on={{ click: () => { state.pickGpu = g.gpu; render(); } }}
-        >{`${short(g.name)}${g.shared ? " (shared)" : ""}`}</button>
-      ))}
+      <span class="k"><span class="i dim" props={{ innerHTML: "&#xf2db;" }} /> gpu</span>
+      {gpus.length
+        ? gpus.map((g) => (
+          <button
+            type="button"
+            class={{ on: g === gpu }}
+            attrs={{ title: `GPU ${g.gpu}${g.shared ? ", shared with the chat model" : ""} · a clip's step = ${g.step_scale.toFixed(2)} x the measured blocks` }}
+            on={{ click: () => { state.pickGpu = g.gpu; render(); } }}
+          >{`${short(g.name)}${g.shared ? " (shared)" : ""}`}</button>
+        ))
+        : <span class="hint">not measured yet (sycl-h3 plan measure)</span>}
+      <span class="hint">{`engine ${engine.quant}`}</span>
     </div>
-  ) : null;
+  );
 
-  const cur = Math.round(props.seconds);
+  // every cell first: the colours run from the cheapest ratio in the table to the dearest
+  const cells = plan.canvases.map((c) => LENGTHS.map((sec) => {
+    const est = estimate(plan, c, engine, sec, props.steps, gpu);
+    return { c, sec, est, ratio: est.total / sec };
+  }));
+  const fit = cells.flat().filter((x) => x.est.fits).map((x) => x.ratio);
+  // the scale runs from this table's cheapest cell to its dearest
+  const lo = Math.log(fit.length ? Math.min(...fit) : 1), hi = Math.log(fit.length ? Math.max(...fit) : 2);
+  const heat = (r: number) => {
+    const t = hi > lo ? Math.min(1, Math.max(0, (Math.log(r) - lo) / (hi - lo))) : 0;
+    const hue = 120 * (1 - t);                    // green (cheap) -> red (dear)
+    return { background: `hsl(${hue}, 45%, 21%)`, borderColor: `hsl(${hue}, 50%, 33%)` };
+  };
+
   const header = (
     <tr>
       <th class="rh">canvas</th>
-      {LENGTHS.map((sec) => <th class={{ cur: sec === cur }}>{`${sec} s`}</th>)}
+      {LENGTHS.map((sec) => <th>{`${sec}s`}</th>)}
     </tr>
   );
-
-  const rows = plan.canvases.map((c) => {
-    const chosenRow = c.width === props.width && c.height === props.height;
+  const rows = cells.map((row) => {
+    const c = row[0]!.c;
+    const fits = row.filter((x) => x.est.fits);
+    const best = fits.length ? Math.min(...fits.map((x) => x.ratio)) : -1;
     return (
       <tr>
         <th class="rh">
-          <span class={{ dim: !chosenRow }}>{`${c.width}×${c.height}`}</span>
-          <small>
-            {`${c.aspect} · ${c.mpx} MP${c.note ? ` · ${c.note}` : ""}`}
-          </small>
+          <b>{`${c.width}x${c.height}`}</b>
+          <span class="dim">{` ${c.mpx} Mp · ${c.aspect}`}</span>
         </th>
-        {LENGTHS.map((sec) => {
-          const est = estimate(plan, c, engine, sec, props.steps, gpu);
-          const ratio = est.total / sec;
-          const chosen = chosenRow && sec === cur;
+        {row.map(({ sec, est, ratio }) => {
+          const chosen = c.width === props.width && c.height === props.height && sec === Math.round(props.seconds);
           return (
             <td>
               <button
                 type="button"
-                class={{ sel: chosen, meas: est.measured, [ratioClass(ratio)]: est.fits }}
+                class={{ sel: chosen, best: est.fits && ratio === best, over: !est.fits }}
+                style={est.fits ? heat(ratio) : {}}
                 attrs={{
                   disabled: !est.fits,
                   title: est.fits
                     ? `${est.tokens.toLocaleString()} tokens · ~${est.gib} GiB peak · ${est.secondsPerStep.toFixed(1)} s/step` +
-                      (gpu ? ` on ${short(gpu.name)}` : "") + ` · ${ratio.toFixed(1)} s of sampling per second of clip`
+                      (gpu ? ` on ${short(gpu.name)}` : "") + ` · est. ${fmtT(est.total)} of sampling`
                     : `needs ~${est.gib} GiB, over the ${plan.cap_gib} GiB cap`,
                 }}
                 on={{ click: () => props.onPick(c.width, c.height, engine.quant, sec) }}
               >
-                {est.fits ? fmtT(est.total) : "—"}
-                <small>{est.fits ? `${ratio.toFixed(0)}:1 · ${est.gib} GiB` : "will not fit"}</small>
+                {est.fits ? `${Math.round(ratio)}×${est.measured ? "*" : ""}` : "—"}
+                <small>{est.fits ? `${est.gib}G` : "over"}</small>
               </button>
             </td>
           );
@@ -149,21 +174,38 @@ export function CanvasPicker(props: CanvasPickerProps) {
     );
   });
 
+  // the chosen cell, in words: tokens, VRAM against the cap, s/step, the total
+  const cur = estimate(plan, { width: props.width, height: props.height } as Canvas, engine, props.seconds, props.steps, gpu);
+  const pct = Math.min(100, (cur.gib / plan.cap_gib) * 100);
+  const summary = (
+    <div class={{ picksum: true, bad: !cur.fits }}>
+      <span class="i" props={{ innerHTML: cur.fits ? "&#xf00c;" : "&#xf00d;" }} />
+      <b>{`${props.width}x${props.height}`}</b>
+      {` · ${props.seconds}s · ${props.steps} steps · ${engine.quant}${gpu ? ` · ${short(gpu.name)}` : ""} · `}
+      <b>{cur.tokens.toLocaleString()}</b>{" tokens · VRAM "}<b>{`${cur.gib}`}</b>{`/${plan.cap_gib} GiB`}
+      <span class="vbar"><span style={{ width: `${pct}%` }} /></span>
+      <b>{`${cur.secondsPerStep.toFixed(1)}s`}</b>{"/step · est. total "}<b>{fmtT(cur.total)}</b>
+    </div>
+  );
+
   return (
     <div class="pickwrap">
       {sw}
-      <table class="pick">
+      <table class="pick heat">
         <thead>{header}</thead>
         <tbody>{rows}</tbody>
       </table>
       <div class="hint">
-        {`Sampling time for ${props.steps} steps by clip length${gpu ? ` on the ${short(gpu.name)} (measured curve)` : " (fitted)"}; `}
-        {"the colour is render time per second of clip - "}
-        <span class="r-good-t">under 15:1</span>{", "}
-        <span class="r-mid-t">to 30:1</span>{", "}
-        <span class="r-bad-t">above</span>
-        {`. The text encoder, decode and upscale come on top. Disabled cells exceed ${plan.cap_gib} GiB of VRAM.`}
+        {"cell = "}<b>seconds of GPU per second of video</b>
+        {` at ${props.steps} steps, and peak VRAM. Green is cheaper, red dearer; `}
+        <span class="best-key">dashed</span>
+        {" = best ratio in that row. "}
+        {gpu
+          ? `* = measured on the ${short(gpu.name)} (sycl-h3 plan measure), everything else from its measured step curve. Sampling only - the text encoder, decode and upscale come on top. `
+          : "* = measured, everything else extrapolated from those. "}
+        {`Greyed = past the ${plan.cap_gib} GiB cap.`}
       </div>
+      {summary}
     </div>
   );
 }

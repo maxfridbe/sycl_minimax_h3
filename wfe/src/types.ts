@@ -176,6 +176,9 @@ export interface GpuPlan {
   points: [number, number][];
   step_a: number;
   step_b: number;
+  /** the canvas table's cells measured on this GPU, keyed "WxH|seconds": a clip step's time and peak VRAM, or
+   *  `over` when the engine refused the size */
+  cells?: Record<string, { tokens: number; s_per_step?: number; gib?: number; over?: boolean } | undefined>;
 }
 
 export interface Plan {
