@@ -152,7 +152,7 @@ impl Studio {
         it.insert("width".into(), width);
         it.insert("height".into(), height);
         it.insert("chain_mode".into(), json!(chain_mode));
-        for k in ["cond_noise_aug", "camera", "exposure_ref", "last_frame", "first_audio", "first_audio_s", "upscale", "guide_clip", "shift_video",
+        for k in ["cond_noise_aug", "camera", "exposure_ref", "last_frame", "first_audio", "first_audio_s", "upscale", "upscaler", "guide_clip", "shift_video",
                   "shift_audio", "source", "regen", "regen_box"] {
             it.insert(k.into(), p.get(k).cloned().unwrap_or(Value::Null));
         }

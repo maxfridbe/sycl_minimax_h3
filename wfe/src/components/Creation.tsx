@@ -18,6 +18,8 @@ interface Form {
   height: number;
   engine: Engine;
   upscale: number;
+  /** "latent" (default), or an ESRGAN-type network on the decoded frames */
+  upscaler: string;
   chain: boolean;
 }
 
@@ -37,6 +39,7 @@ export const form: Form = {
   height: 576,
   engine: "Q6_K",
   upscale: 1.5,
+  upscaler: "latent",
   chain: false,
 };
 
@@ -51,6 +54,7 @@ export function useSettings(j: GenerateRequest): void {
   if (j.height) form.height = j.height;
   if (j.engine) form.engine = j.engine;
   if (j.upscale) form.upscale = j.upscale;
+  form.upscaler = j.upscaler ?? "latent";
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
   navigate({ tab: "create" });
@@ -68,6 +72,7 @@ async function generate(queue: boolean): Promise<void> {
     height: form.height,
     engine: form.engine,
     upscale: form.upscale,
+    upscaler: form.upscaler,
     chain_mode: "png",
     queue,
   };
@@ -110,6 +115,14 @@ export function Creation() {
         {num("steps", "steps", 1, 40, 1)}
         {num("seed", "seed", 0, 2147483647, 1)}
         {num("upscale", "upscale", 1, 4, 0.5)}
+        <label attrs={{ title: "latent: the latents enlarged, then decoded at the larger size (the default: the decoder's own fine texture). ESRGAN: decoded at the sampled size, the frames enlarged by a network - ~24 s faster for a 5 s clip at 1152x864 on a B65" }}>
+          upscaler
+          <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; render(); } }}>
+            <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (default)</option>
+            <option attrs={{ value: "esrgan-anime", selected: form.upscaler === "esrgan-anime" }}>ESRGAN animevideov3 (fast)</option>
+            <option attrs={{ value: "esrgan-general", selected: form.upscaler === "esrgan-general" }}>ESRGAN general-x4v3</option>
+          </select>
+        </label>
         <label>
           encoder
           <select on={{ change: (e: Event) => { form.te = (e.target as HTMLSelectElement).value as "teacher" | "student"; render(); } }}>

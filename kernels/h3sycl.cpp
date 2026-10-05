@@ -127,6 +127,8 @@ struct Ctx {
     struct Conv3 { dnnl::convolution_forward prim; dnnl::convolution_forward::primitive_desc pd; };
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>, Conv3> conv3;
     std::map<const void*, dnnl::memory> conv3_w;
+    // h3s_conv2d: (N, H, W, Ci, Co, k, dt) -> its primitive (the weights' reorders share conv3_w, keyed by pointer)
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int>, Conv3> conv2;
     std::map<std::tuple<std::vector<int64_t>>, Conv3> conv3x;   // strided, unpadded (h3s_conv3d_ex)
     float* gn = nullptr; size_t gn_cap = 0;        // group norm: partial sums, then (mean, 1 / std) per group
     bool rotq_fused = true;
@@ -914,6 +916,83 @@ int h3s_conv3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W
     std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, x)}, {DNNL_ARG_WEIGHTS, wit->second}, {DNNL_ARG_DST, usm(dmd, c.eng, out)}};
     if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, c.eng, bias)});
     it->second.prim.execute(c.strm, args);
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+// ---- the pixel upscaler (ESRGAN-type): frames channels-last [N, H, W, C], 16-bit
+int h3s_conv2d(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
+               const float* bias, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (N <= 0 || H <= 0 || W <= 0) return 0;
+    using dnnl::memory;
+    const int64_t p = k / 2;
+    memory::desc smd({N, Ci, H, W}, ddt(dt), memory::format_tag::nhwc);
+    memory::desc dmd({N, Co, H, W}, ddt(dt), memory::format_tag::nhwc);
+    memory::desc wany({Co, Ci, k, k}, ddt(dt), memory::format_tag::any);
+    memory::desc bmd({Co}, memory::data_type::f32, memory::format_tag::a);
+    auto key = std::make_tuple(N, H, W, Ci, Co, k, dt);
+    auto it = c.conv2.find(key);
+    if (it == c.conv2.end()) {
+        auto pd = dnnl::convolution_forward::primitive_desc(c.eng, dnnl::prop_kind::forward_inference, dnnl::algorithm::convolution_direct,
+                                                            smd, wany, bias ? bmd : memory::desc(), dmd, {1, 1}, {p, p}, {p, p});
+        it = c.conv2.emplace(key, Ctx::Conv3{dnnl::convolution_forward(pd), pd}).first;
+    }
+    auto wit = c.conv3_w.find(w);
+    if (wit == c.conv3_w.end() || wit->second.get_desc() != it->second.pd.weights_desc()) {
+        memory::desc wmd({Co, Ci, k, k}, ddt(dt), memory::format_tag::oihw);
+        memory wm(it->second.pd.weights_desc(), c.eng);
+        memory src = usm(wmd, c.eng, w);
+        dnnl::reorder(src, wm).execute(c.strm, src, wm);
+        c.conv3_w[w] = wm;
+        wit = c.conv3_w.find(w);
+    }
+    std::unordered_map<int, memory> args{{DNNL_ARG_SRC, usm(smd, c.eng, x)}, {DNNL_ARG_WEIGHTS, wit->second}, {DNNL_ARG_DST, usm(dmd, c.eng, out)}};
+    if (bias) args.insert({DNNL_ARG_BIAS, usm(bmd, c.eng, bias)});
+    it->second.prim.execute(c.strm, args);
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_prelu(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* alpha) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (M <= 0 || C <= 0) return 0;
+    c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
+        const size_t i = id[0] * C + id[1];
+        const float v = load(x, dt, i);
+        store(x, dt, i, v > 0.0f ? v : alpha[id[1]] * v);
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_pixel_shuffle_add(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W, int64_t C, int64_t r,
+                          const void* base, void* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (N <= 0 || H <= 0 || W <= 0) return 0;
+    const int64_t Ho = H * r, Wo = W * r;
+    c.q.parallel_for(sycl::range<3>((size_t) (N * Ho), (size_t) Wo, (size_t) C), [=](sycl::id<3> id) {
+        const int64_t n = id[0] / Ho, yo = id[0] % Ho, xo = id[1], ch = id[2];
+        const int64_t y = yo / r, i = yo % r, xx = xo / r, j = xo % r;
+        const size_t src = ((size_t) ((n * H + y) * W + xx)) * (C * r * r) + (size_t) (ch * r * r + i * r + j);
+        const size_t b = ((size_t) ((n * H + y) * W + xx)) * C + ch;
+        store(out, dt, ((size_t) ((n * Ho + yo) * Wo + xo)) * C + ch, load(x, dt, src) + load(base, dt, b));
+    });
+    return 0;
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_resize_area(void* ctx, const void* x, int dt, int64_t N, int64_t Hi, int64_t Wi, int64_t C, int64_t Ho, int64_t Wo,
+                    float* out) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (N <= 0 || Ho <= 0 || Wo <= 0) return 0;
+    c.q.parallel_for(sycl::range<3>((size_t) (C * N), (size_t) Ho, (size_t) Wo), [=](sycl::id<3> id) {
+        const int64_t ch = id[0] / N, n = id[0] % N, yo = id[1], xo = id[2];
+        // adaptive average pooling: [floor(o * In / Out), ceil((o + 1) * In / Out))
+        const int64_t y0 = (yo * Hi) / Ho, y1 = ((yo + 1) * Hi + Ho - 1) / Ho;
+        const int64_t x0 = (xo * Wi) / Wo, x1 = ((xo + 1) * Wi + Wo - 1) / Wo;
+        float s = 0.0f;
+        for (int64_t y = y0; y < y1; ++y)
+            for (int64_t xx = x0; xx < x1; ++xx) s += load(x, dt, ((size_t) ((n * Hi + y) * Wi + xx)) * C + ch);
+        const float v = s / (float) ((y1 - y0) * (x1 - x0));
+        out[((size_t) (ch * N + n) * Ho + yo) * Wo + xo] = sycl::clamp(v, 0.0f, 1.0f);
+    });
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 

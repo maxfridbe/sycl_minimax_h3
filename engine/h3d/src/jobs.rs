@@ -454,6 +454,9 @@ pub struct Vaes<'a> {
     pub audio: Option<&'a Path>,
     /// the latent upscaler and its factor (the video latents are upscaled before the video decoder)
     pub upscale: Option<(&'a Path, f32)>,
+    /// instead: the pixel upscaler (an ESRGAN-type network, esrgan.rs) and the factor - the clip is decoded at its
+    /// sampled size and the frames enlarged to the size the latent upscaler would give
+    pub pixel: Option<(&'a Path, f32)>,
 }
 
 /// Latents -> a clip: the video decoder (and the audio decoder) on the latents in `latents` (a `.safetensors` with
@@ -494,7 +497,8 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     let (t, mut h, mut w) = (lat.t, lat.h, lat.w);
     let mut z = lat.video;
     let mut report = json!({});
-    if let Some((up, s)) = vaes.upscale {
+    let latent_up = if vaes.pixel.is_some() { None } else { vaes.upscale };
+    if let Some((up, s)) = latent_up {
         let t0 = Instant::now();
         let u = h3_core::upscale::Upscaler::load(dev, &Checkpoint::open(up)?)?;
         let cancel = ctl.cancel;
@@ -537,8 +541,20 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
         Ok(())
     })?;
     let secs = t0.elapsed().as_secs_f64();
-    let (fh, fw) = (h * 16, w * 16);
+    let (mut fh, mut fw) = (h * 16, w * 16);
     ctl.say(format!("decoded: {frames} frames of {fw}x{fh} in {secs:.1} s ({tiles} batches of tiles)"));
+    let mut px = px;
+    if let Some((pp, s)) = vaes.pixel {
+        // the size the latent upscaler would have given: its latent size, in pixels
+        let (ho, wo) = (((h as f32 * s).round() as usize) * 16, ((w as f32 * s).round() as usize) * 16);
+        let t0 = Instant::now();
+        let u = h3_core::esrgan::PixelUpscaler::load(dev, &Checkpoint::open(pp)?)?;
+        px = u.upscale(&px, frames, fh, fw, ho, wo, &mut || ctl.check())?;
+        let secs = t0.elapsed().as_secs_f64();
+        ctl.say(format!("pixels : {fw}x{fh} -> {wo}x{ho} (x{s}, network x{} then area) by {} in {secs:.1} s", u.scale, pp.display()));
+        report["pixel_upscale_seconds"] = json!(secs);
+        (fh, fw) = (ho, wo);
+    }
     for (k, v) in [("frames", json!(frames)), ("width", json!(fw)), ("height", json!(fh)), ("seconds", json!(secs)), ("tiles", json!(tiles))] {
         report[k] = v;
     }
@@ -1085,7 +1101,9 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
             let latents = s("latents").ok_or("decode needs \"latents\": a latents file the engine can read")?;
             let video = s("vae").ok_or("decode needs \"vae\": the video decoder's checkpoint")?;
             let upscale = s("upscaler").map(|p| (p, spec.get("upscale").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32));
-            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale }, s("out"), s("check"), ctl)
+            let factor = spec.get("upscale").and_then(|v| v.as_f64()).unwrap_or(2.0) as f32;
+            let pixel = s("pixel_upscaler").map(|p| (p, factor));
+            decode(&e.dev, e.threads, latents, &Vaes { video, audio: s("audio_vae"), upscale, pixel }, s("out"), s("check"), ctl)
         }
         "generate" => {
             let s = |k: &str| spec.get(k).and_then(|d| d.as_str());
@@ -1112,6 +1130,8 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     video: Path::new(s("vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_video_vae_fp16.safetensors")),
                     audio: Some(Path::new(s("audio_vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors"))),
                     upscale: upscale.map(|u| (Path::new(s("upscaler").unwrap_or("/models/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")), u as f32)),
+                    // "pixel_upscaler": an ESRGAN-type network's checkpoint - the frames enlarged instead of the latents
+                    pixel: upscale.and_then(|u| s("pixel_upscaler").map(|p| (Path::new(p), u as f32))),
                 },
                 lora: Vec::new(),
                 inputs: ClipInputs {

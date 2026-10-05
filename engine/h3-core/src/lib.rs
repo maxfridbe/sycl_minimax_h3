@@ -7,6 +7,7 @@ pub mod denoiser;
 pub mod device;
 pub mod dit;
 pub mod dtype;
+pub mod esrgan;
 pub mod gguf;
 pub mod layout;
 pub mod noise;

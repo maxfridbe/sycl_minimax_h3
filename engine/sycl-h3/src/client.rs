@@ -230,7 +230,9 @@ fn add(raw: &[String]) -> Result<()> {
     while let Some(k) = it.next() {
         let name = k.strip_prefix("--").ok_or_else(|| Error(format!("{k}: job options are --name value")))?;
         let v = it.next().ok_or_else(|| Error(format!("--{name} needs a value")))?;
-        spec.insert(name.to_string(), v.parse::<u64>().map(Value::from).unwrap_or_else(|_| json!(v)));
+        // numbers as numbers (a job reads "upscale": 1.5 as a number; "1.5" as a string was silently ignored)
+        let val = v.parse::<u64>().map(Value::from).or_else(|_| v.parse::<f64>().map(Value::from)).unwrap_or_else(|_| json!(v));
+        spec.insert(name.to_string(), val);
     }
     let id = post("/engine/jobs", Some(&Value::Object(spec)))?["id"].as_u64().ok_or("no job id in the answer")?;
     println!("{id}");

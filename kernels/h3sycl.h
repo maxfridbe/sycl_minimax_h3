@@ -121,6 +121,21 @@ int h3s_group_norm_silu(void* ctx, const void* x, int dt, int64_t F, int64_t N, 
  * group_norm_silu takes F frames of N voxels: statistics per frame and group (F = 1: over the whole volume). */
 int h3s_pad3d(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t C, int64_t front, int64_t top, int64_t bottom,
               int64_t left, int64_t right, void* out);
+/* The pixel upscaler (ESRGAN-type, frames channels-last [N, H, W, C] in 16-bit dt):
+ * conv2d: a k x k convolution of N frames (k odd, zero padding k / 2), w [Co, Ci, k, k] in dt (reordered once per
+ *   buffer), bias float32 [Co] or NULL; out [N, H, W, Co].
+ * prelu: x = x > 0 ? x : alpha[c] x, in place; alpha float32 [C].
+ * pixel_shuffle_add: out [N, H r, W r, C] = PixelShuffle(r) of x [N, H, W, C r r] + base [N, H, W, C] repeated r x r
+ *   (nearest), as PyTorch's NCHW PixelShuffle orders the channels (c r r + i r + j).
+ * resize_area: x [N, Hi, Wi, C] -> out float32 PLANAR [C, N, Ho, Wo], each output pixel the mean of its input area
+ *   (PyTorch's mode="area", adaptive average pooling), clamped to [0, 1]. */
+int h3s_conv2d(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co, int64_t k,
+               const float* bias, void* out);
+int h3s_prelu(void* ctx, void* x, int dt, int64_t M, int64_t C, const float* alpha);
+int h3s_pixel_shuffle_add(void* ctx, const void* x, int dt, int64_t N, int64_t H, int64_t W, int64_t C, int64_t r,
+                          const void* base, void* out);
+int h3s_resize_area(void* ctx, const void* x, int dt, int64_t N, int64_t Hi, int64_t Wi, int64_t C, int64_t Ho, int64_t Wo,
+                    float* out);
 int h3s_conv3d_ex(void* ctx, const void* x, int dt, int64_t T, int64_t H, int64_t W, int64_t Ci, const void* w, int64_t Co,
                   int64_t kt, int64_t kh, int64_t kw, int64_t st, int64_t sh, int64_t sw, const float* bias, void* out);
 int h3s_temporal_dwconv(void* ctx, const void* x, int dt, int64_t T, int64_t P, int64_t C, const float* w, int64_t K,

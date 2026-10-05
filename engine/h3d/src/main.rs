@@ -18,7 +18,7 @@
 //!                  --seed 0 --upscale 1] [--te .. --vae .. --audio-vae .. --upscaler .. --tokenizer ..]
 //!     h3d check-encoders <video vae> <audio vae> <encoder dump>
 //!     h3d encode <te.gguf> --prompt-file <file> [--tokenizer dir] [--out cond.safetensors] [--check run dump]
-//!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
+//!     h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> | --pixel-upscaler <esrgan.safetensors>] [--upscale 2]
 //!                [--out clip.mp4] [--check decode dump]
 
 mod daemon;
@@ -60,7 +60,7 @@ const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
                [--seed 0] [--upscale 1] [--te <gguf>] [--vae <ckpt>] [--audio-vae <ckpt>] [--upscaler <ckpt>] [--tokenizer <dir>]
   h3d check-encoders <video vae> <audio vae> <encdump.safetensors>
   h3d encode <te.gguf> --prompt-file <file> [--tokenizer /app/tokenizer] [--out cond.safetensors] [--check rundump.safetensors]
-  h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> [--upscale 2]]
+  h3d decode <vae checkpoint> <latents.safetensors> [--audio-vae <checkpoint>] [--upscaler <checkpoint> | --pixel-upscaler <esrgan.safetensors>] [--upscale 2]
              [--out clip.mp4] [--check decodedump.safetensors]";
 
 /// `--name value` options after the positional arguments.
@@ -302,7 +302,8 @@ fn cmd_decode(args: &Args) -> Result<()> {
     let opt = |k: &str| args.options.get(k).map(Path::new);
     let scale: f32 = args.options.get("upscale").map(|s| s.parse().map_err(|_| Error(format!("--upscale {s}: not a number")))).transpose()?.unwrap_or(2.0);
     let upscale = opt("upscaler").map(|p| (p, scale));
-    jobs::decode(&dev, args.number("threads", 8)?, args.path(1)?, &jobs::Vaes { video: args.path(0)?, audio: opt("audio-vae"), upscale }, opt("out"), opt("check"), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
+    let pixel = opt("pixel-upscaler").map(|p| (p, scale));
+    jobs::decode(&dev, args.number("threads", 8)?, args.path(1)?, &jobs::Vaes { video: args.path(0)?, audio: opt("audio-vae"), upscale, pixel }, opt("out"), opt("check"), &mut jobs::Ctl { log: &mut log, cancel: &cancel, progress: None }).map(|_| ())
 }
 
 /// `h3d gpus [--json]`: the GPUs the runtime sees, numbered as `--gpu` takes them.

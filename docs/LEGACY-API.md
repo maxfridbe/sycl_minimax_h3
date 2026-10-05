@@ -26,7 +26,7 @@ Methods: `status`, `wait {version?, timeout_s?}`, `generate`, `cancel`, `queue.l
 
 `prompt` (required), `seconds` 1-15.1 (10), `steps` 1-40 (10), `seed`, `width` / `height` (multiples of 32,
 256-1344, at most 768x1344 pixels; 768x576), `label` ("Name NN/MM: ..." - NN is the edit order, the prefix the
-series), `project`, `batch`, `camera`, `upscale` (latent upscale at decode), `loras` (["PATH:STRENGTH", ...]; they
+series), `project`, `batch`, `camera`, `upscale` (the factor), `upscaler` ("latent", the default; "esrgan-anime" / "esrgan-general": decode at the sampled size, then the frames enlarged by an ESRGAN-type network), `loras` (["PATH:STRENGTH", ...]; they
 stack), `queue` (true: queue when busy instead of answering 409).
 
 Anchors - an anchor is `prev` (the series' previous clip), `prev_cam` (same camera), `first` (the series' first clip),

@@ -146,6 +146,16 @@ impl Studio {
         }
         if let Some(u) = item["upscale"].as_f64().or_else(|| item["upscale"].as_str().and_then(|v| v.parse().ok())).filter(|u| *u > 1.0) {
             spec["upscale"] = json!(u);
+            // "upscaler": the latent upscaler (default), or an ESRGAN-type network on the decoded frames
+            // (h3-core esrgan.rs; the weights converted by reference/esrgan_to_safetensors.py into models/esrgan)
+            let pixel = match item["upscaler"].as_str().unwrap_or("latent") {
+                "esrgan-anime" => Some("/models/esrgan/realesr-animevideov3.safetensors"),
+                "esrgan-general" => Some("/models/esrgan/realesr-general-x4v3.safetensors"),
+                _ => None,
+            };
+            if let Some(p) = pixel {
+                spec["pixel_upscaler"] = json!(p);
+            }
         }
         if let Some(ls) = item["loras"].as_array().filter(|a| !a.is_empty()) {
             spec["lora"] = json!(ls.iter().filter_map(|l| l.as_str()).collect::<Vec<_>>().join(","));

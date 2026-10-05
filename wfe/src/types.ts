@@ -33,6 +33,7 @@ export interface GenerateRequest {
   cond_noise_aug?: number | null;
   camera?: string | null;
   upscale?: number;
+  upscaler?: string;
   loras?: string[];
   project?: string;
   batch?: string;
