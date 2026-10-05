@@ -34,8 +34,9 @@ engine() {
   echo "==> engine: h3d (in the container) and sycl-h3 (the host's command line, static) (cargo, release)"
   cargo build --release --locked --manifest-path engine/Cargo.toml -p h3d
   cargo build --release --locked --manifest-path engine/Cargo.toml -p sycl-h3 --target x86_64-unknown-linux-musl
-  cp engine/target/release/h3d dist/
-  cp engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/
+  # beside, then renamed over: a running daemon or studio keeps its old file (a plain cp fails "Text file busy")
+  cp engine/target/release/h3d dist/h3d.new && mv -f dist/h3d.new dist/h3d
+  cp engine/target/x86_64-unknown-linux-musl/release/sycl-h3 dist/sycl-h3.new && mv -f dist/sycl-h3.new dist/sycl-h3
   rm -f dist/h3                                  # the name before the split
   rm -rf dist/tokenizer && cp -r tokenizer dist/tokenizer   # the text encoder's tokenizer files (/app/tokenizer)
 }

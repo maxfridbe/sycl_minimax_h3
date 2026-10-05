@@ -14,8 +14,8 @@
 //!   sycl-h3 web service (its own container) --'                                               (JSON lines)
 //! ```
 //!
-//! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came; a job that names a GPU
-//! (`"gpu": 1`) waits for that one. A job can be cancelled; it stops at the next block boundary, never inside a kernel
+//! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came - an unshared GPU before a
+//! shared one (below); a job that names a GPU (`"gpu": 1`) waits for that one. A job can be cancelled; it stops at the next block boundary, never inside a kernel
 //! (a GPU process stopped mid-kernel can leave the xe driver stuck).
 //!
 //! The API (JSON over HTTP on the socket):
@@ -444,7 +444,13 @@ impl Daemon {
                         break Next::Unload;
                     }
                     let gpu = s.slots[k].gpu;
-                    let mine = s.queue.iter().position(|id| s.jobs[id].wants_gpu().is_none_or(|g| g == gpu));
+                    // a shared GPU takes a job that names no GPU only while every unshared one is busy: loading there
+                    // stops the other program's model, which a free unshared GPU would not
+                    let unshared_free = s.slots[k].shared && s.slots.iter().any(|o| !o.shared && o.running.is_none());
+                    let mine = s.queue.iter().position(|id| match s.jobs[id].wants_gpu() {
+                        Some(g) => g == gpu,
+                        None => !unshared_free,
+                    });
                     if let Some(pos) = mine {
                         let id = s.queue.remove(pos).unwrap();
                         let j = s.jobs.get_mut(&id).unwrap();

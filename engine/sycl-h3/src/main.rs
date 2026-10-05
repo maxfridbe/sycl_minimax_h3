@@ -17,6 +17,7 @@
 mod client;
 mod config;
 mod container;
+mod plan;
 mod studio;
 mod tools;
 
@@ -66,6 +67,9 @@ tools (talk to the studio, like the front end):
   sycl-h3 scene <scene.json> [options]   queue a scene file (from the front end's export)
   sycl-h3 join <prefix> [options]        join a series of finished clips into one film, frame-exact
   sycl-h3 speechpct <clip.mp4>...        how much of each clip is speech
+  sycl-h3 plan measure [--gpu N ...] [--tokens 2048,...] [--no-clip]
+                                         what a step costs on each GPU, for the studio's canvas table (plan.json);
+                                         sycl-h3 plan show prints it
   sycl-h3 logs [--web]          a service's log, followed
   sycl-h3 version
 
@@ -410,6 +414,7 @@ fn run() -> Result<()> {
         "scene" => tools::scene(&cfg, rest),
         "join" => tools::join(&cfg, rest),
         "speechpct" => tools::speechpct(rest),
+        "plan" => plan::run(&cfg, rest),
         // the studio's process (sycl-h3 serve starts it)
         "studio" => {
             let (listen, r) = take_value(rest, "--listen")?;

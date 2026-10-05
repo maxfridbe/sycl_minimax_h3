@@ -4,11 +4,12 @@
  *  shows what that combination costs to render at the current clip length, and cells that
  *  will not fit in VRAM are disabled rather than hidden, so the shape of the wall is visible.
  *  Cells we have actually run are served from measured timings and marked; the rest come
- *  from the fitted model the server publishes at /api/plan.
+ *  from the model the server publishes at /api/plan. When the box's GPUs have been measured
+ *  (`sycl-h3 plan measure`), each engine gets a column per GPU, timed from that GPU's curve.
  */
 import { jsx } from "../jsx.js";
 import { state } from "../state.js";
-import type { Canvas, EngineInfo, Plan } from "../types.js";
+import type { Canvas, EngineInfo, GpuPlan, Plan } from "../types.js";
 import { fmtT } from "../util.js";
 
 /** Latent tokens for a canvas at a clip length. Mirrors tokens_for() in wfe/server.py. */
@@ -28,21 +29,36 @@ export interface Estimate {
   measured: boolean;
 }
 
+/** Seconds per step at `t` tokens on one GPU: linear between its measured points, the end segments' slope
+ *  beyond them (mirrors plan::interp in the engine), times its clip factor. */
+export function gpuStep(g: GpuPlan, t: number): number {
+  const p = g.points;
+  if (!p.length) return g.step_a * t * t + g.step_b * t;
+  const p0 = p[0];
+  if (p.length === 1 && p0) return (p0[1] * t / p0[0]) * g.step_scale;
+  let k = p.findIndex((q) => q[0] >= t);
+  k = Math.min(Math.max(k < 0 ? p.length - 1 : k, 1), p.length - 1);
+  const a = p[k - 1], b = p[k];
+  if (!a || !b) return 0;
+  return (a[1] + ((b[1] - a[1]) * (t - a[0])) / (b[0] - a[0])) * g.step_scale;
+}
+
 export function estimate(
-  plan: Plan, canvas: Canvas, engine: EngineInfo, seconds: number, steps: number,
+  plan: Plan, canvas: Canvas, engine: EngineInfo, seconds: number, steps: number, gpu?: GpuPlan,
 ): Estimate {
   const tokens = tokensFor(canvas.width, canvas.height, seconds);
   const key = `${engine.quant}|${canvas.width}x${canvas.height}|${Math.round(seconds)}`;
-  const hit = plan.measured[key];
+  const hit = gpu ? undefined : plan.measured[key];
   const gib = hit ? hit.peak : engine.gib + tokens * plan.gib_per_token;
-  const secondsPerStep = hit?.s_per_step ?? plan.step_a * tokens * tokens + plan.step_b * tokens;
+  const secondsPerStep = gpu ? gpuStep(gpu, tokens)
+    : hit?.s_per_step ?? plan.step_a * tokens * tokens + plan.step_b * tokens;
   return {
     tokens,
     gib: Math.round(gib * 10) / 10,
     fits: gib + plan.margin_gib <= plan.cap_gib,
     secondsPerStep,
     total: secondsPerStep * steps,
-    measured: !!hit,
+    measured: !!hit || !!gpu,
   };
 }
 
@@ -61,10 +77,18 @@ export function CanvasPicker(props: CanvasPickerProps) {
   const engines = plan.engines.filter((e) => e.ready);
   if (!engines.length) return <div class="hint">no denoiser weights found on the box</div>;
 
+  // a column per engine, or per engine and GPU once the GPUs are measured
+  const gpus = plan.gpus ?? [];
+  const short = (n: string) => n.replace(/^Intel\(R\) Arc\(TM\) /, "").replace(/ Graphics$/, "");
+  const cols: { e: EngineInfo; g?: GpuPlan }[] = engines.flatMap((e) => gpus.length ? gpus.map((g) => ({ e, g })) : [{ e }]);
   const header = (
     <tr>
       <th class="rh">canvas</th>
-      {engines.map((e) => <th>{e.quant}</th>)}
+      {cols.map(({ e, g }) => (
+        <th attrs={{ title: g ? `GPU ${g.gpu}${g.shared ? " (shared with the chat model)" : ""}` : "" }}>
+          {g ? `${e.quant} · ${short(g.name)}` : e.quant}
+        </th>
+      ))}
     </tr>
   );
 
@@ -78,8 +102,8 @@ export function CanvasPicker(props: CanvasPickerProps) {
             {`${c.aspect} · ${c.mpx} MP${c.note ? ` · ${c.note}` : ""}`}
           </small>
         </th>
-        {engines.map((e) => {
-          const est = estimate(plan, c, e, props.seconds, props.steps);
+        {cols.map(({ e, g }) => {
+          const est = estimate(plan, c, e, props.seconds, props.steps, g);
           const chosen = chosenRow && e.quant === props.engine;
           return (
             <td>
@@ -90,7 +114,8 @@ export function CanvasPicker(props: CanvasPickerProps) {
                   disabled: !est.fits,
                   title: est.fits
                     ? `${est.tokens.toLocaleString()} tokens · ~${est.gib} GiB peak · `
-                      + `${est.secondsPerStep.toFixed(1)} s/step${est.measured ? " (measured)" : " (estimated)"}`
+                      + `${est.secondsPerStep.toFixed(1)} s/step`
+                      + (g ? ` on GPU ${g.gpu} (measured curve)` : est.measured ? " (measured)" : " (estimated)")
                     : `needs ~${est.gib} GiB, over the ${plan.cap_gib} GiB cap`,
                 }}
                 on={{ click: () => props.onPick(c.width, c.height, e.quant) }}
@@ -114,7 +139,9 @@ export function CanvasPicker(props: CanvasPickerProps) {
       <div class="hint">
         {`Time is for ${props.steps} steps at ${props.seconds}s. `}
         <b class="meas-key">Bold</b>
-        {" cells were measured on this box; the rest are fitted. Disabled cells exceed "}
+        {gpus.length
+          ? " cells come from each GPU's measured step times (sycl-h3 plan measure). Disabled cells exceed "
+          : " cells were measured on this box; the rest are fitted. Disabled cells exceed "}
         {`${plan.cap_gib} GiB of VRAM.`}
       </div>
     </div>

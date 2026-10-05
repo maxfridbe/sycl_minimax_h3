@@ -140,9 +140,15 @@ pub struct Options {
 
 impl Studio {
     /// The engine has a model loaded (or is loading one) on some GPU: no language model may start.
+    /// Whether the engine holds the card the language models use: a GPU marked shared (`--shared-gpu`) has an engine
+    /// loaded or a job running. With no GPU marked shared, any GPU counts (one card for both). An engine on a GPU of
+    /// its own does not keep the model off its card (2026-10-05: a job on the second GPU held the restore back).
     pub fn engine_holds_card(&self) -> bool {
         match http::call(&Target::Unix(self.socket.clone()), "GET", "/engine/status", None) {
-            Ok(v) => v["gpus"].as_array().is_some_and(|g| g.iter().any(|x| !x["worker"].is_null() || !x["running"].is_null())),
+            Ok(v) => v["gpus"].as_array().is_some_and(|g| {
+                let any_shared = g.iter().any(|x| x["shared"] == true);
+                g.iter().filter(|x| !any_shared || x["shared"] == true).any(|x| !x["worker"].is_null() || !x["running"].is_null())
+            }),
             Err(_) => false,
         }
     }

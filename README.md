@@ -143,6 +143,8 @@ the engine over a Unix socket, like `docker` and `dockerd`.
     ./sycl-h3 scene film.scene.json # queue a scene file (the front end's export)
     ./sycl-h3 join "Speech"         # the series' finished clips as one film, frame-exact
     ./sycl-h3 speechpct out/h3_*.mp4
+    ./sycl-h3 plan measure          # what a step costs on each GPU (bench-blocks over 2k-47k tokens and a short
+                                    # clip per GPU), for the studio's canvas table: one column per GPU
 
 How it fits together:
 
@@ -174,7 +176,8 @@ How it fits together:
   on a shared GPU is loaded; `H3_LLM_SWITCHER` names a model switcher (the studio's `/rpc/llm.mode`) whose model is
   stopped before loading and restored after the last such engine has ended (`--shared-gpu` / `H3_SHARED_GPUS` say
   which GPUs these are about; all served ones by default). Either way an engine waits until its card really has the
-  memory free.
+  memory free. With a GPU of its own beside a shared one, a job that names no GPU goes to the unshared one while it is
+  free, and an engine on it does not keep the model off the shared card.
 
 Settings go in `sycl-h3.conf` beside the repository or `~/.config/sycl-h3.conf` (`sycl-h3 help` lists them).
 

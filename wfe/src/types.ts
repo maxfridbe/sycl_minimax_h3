@@ -164,6 +164,19 @@ export interface MeasuredCell {
   name: string;
 }
 
+/** One GPU's measured step cost (`sycl-h3 plan measure`): the 50 blocks at each token count, and the factor a
+ *  real clip's step is of them. */
+export interface GpuPlan {
+  gpu: number;
+  name: string;
+  shared: boolean;
+  step_scale: number;
+  clip_tokens: number | null;
+  points: [number, number][];
+  step_a: number;
+  step_b: number;
+}
+
 export interface Plan {
   engines: EngineInfo[];
   canvases: Canvas[];
@@ -176,6 +189,8 @@ export interface Plan {
   chain_modes: Record<string, string>;
   /** keyed "<engine>|<W>x<H>|<seconds>" - cells this box has actually run */
   measured: Record<string, MeasuredCell | undefined>;
+  /** measured per GPU; empty until `sycl-h3 plan measure` has run on the box */
+  gpus?: GpuPlan[];
 }
 
 export interface Disk { path: string; total_gb: number; used_gb: number; free_gb: number; pct: number }

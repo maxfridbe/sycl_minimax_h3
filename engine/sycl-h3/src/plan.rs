@@ -1,0 +1,227 @@
+//! `sycl-h3 plan`: what a denoiser step costs on each of this box's GPUs, measured, for the studio's canvas table
+//! (`/api/plan`, the front end's CanvasPicker).
+//!
+//!     sycl-h3 plan measure [--gpu N ...] [--tokens 2048,4096,...] [--no-clip]
+//!     sycl-h3 plan show
+//!
+//! For every GPU the engine serves, `measure` queues `bench-blocks` over a range of token counts (the 50 blocks of
+//! one step, pinned to that GPU), then one short real clip: a clip's step is the 50 blocks plus its own small extras
+//! (embeddings, the final layer, the sampler), so the clip's median step over the bench at the clip's token count is
+//! the GPU's step factor. The result goes to `plan.json` in the studio's directory, which the studio reads on every
+//! `/api/plan` - a new measurement shows without a restart. GPUs run their jobs side by side; one the engine shares
+//! with another program is handed over the usual way (lock file, model switch).
+
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use h3_http::{Error, Result};
+use serde_json::{json, Value};
+
+use crate::client;
+use crate::config::Config;
+
+/// The token counts measured by default: every canvas the studio offers falls in this range from 1 s up to the
+/// longest clip that fits.
+pub const TOKENS: [u64; 11] = [2048, 4096, 6144, 8192, 12288, 16384, 20480, 24576, 32768, 40960, 47104];
+
+/// The calibration clip: the production canvas, short, no upscale (only its sampling is used).
+const CLIP: (u64, u64, u64, u64) = (768, 576, 3, 4); // width, height, seconds, steps
+
+pub fn file(cfg: &Config) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(cfg.get("H3_STUDIO_DIR").unwrap_or_else(|| format!("{home}/.local/share/sycl-h3"))).join("plan.json")
+}
+
+fn now() -> f64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+fn add(spec: Value) -> Result<u64> {
+    client::post("/engine/jobs", Some(&spec))?["id"].as_u64().ok_or_else(|| Error("no job id in the answer".into()))
+}
+
+/// Wait for a job to end; its record, or the reason it did not finish.
+fn wait(id: u64) -> Result<Value> {
+    loop {
+        let j = client::get(&format!("/engine/jobs/{id}"))?;
+        match j["state"].as_str().unwrap_or("") {
+            "done" => return Ok(j),
+            s @ ("failed" | "cancelled") => return Err(Error(format!("job {id} {s}: {}", j["error"].as_str().unwrap_or("")))),
+            _ => std::thread::sleep(Duration::from_secs(2)),
+        }
+    }
+}
+
+/// Seconds per step at `t` tokens: linear between the measured points, the end segments' slope beyond them.
+pub fn interp(points: &[(f64, f64)], t: f64) -> f64 {
+    match points.len() {
+        0 => 0.0,
+        1 => points[0].1 * t / points[0].0,
+        n => {
+            let k = points.iter().position(|p| p.0 >= t).unwrap_or(n - 1).clamp(1, n - 1);
+            let (a, b) = (points[k - 1], points[k]);
+            a.1 + (b.1 - a.1) * (t - a.0) / (b.0 - a.0)
+        }
+    }
+}
+
+/// The least-squares fit of s = a t^2 + b t (the shape attention and the linears give), for clients that want a
+/// curve rather than the points.
+fn fit(points: &[(f64, f64)]) -> (f64, f64) {
+    let (mut s4, mut s3, mut s2, mut y2, mut y1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &(t, s) in points {
+        s4 += t.powi(4);
+        s3 += t.powi(3);
+        s2 += t * t;
+        y2 += s * t * t;
+        y1 += s * t;
+    }
+    let det = s4 * s2 - s3 * s3;
+    if det.abs() < 1e-30 {
+        return (0.0, 0.0);
+    }
+    ((y2 * s2 - y1 * s3) / det, (s4 * y1 - s3 * y2) / det)
+}
+
+/// The steps' times of a clip's log: `tokens : N in the denoiser` and `sampled: k steps in X s (t1 t2 ...)`.
+fn clip_steps(job: &Value) -> Option<(f64, Vec<f64>)> {
+    let log: Vec<&str> = job["log"].as_array()?.iter().filter_map(Value::as_str).collect();
+    let tokens = log.iter().find_map(|l| l.strip_prefix("tokens : ")?.split_whitespace().next()?.parse().ok())?;
+    let s = log.iter().find(|l| l.starts_with("sampled:"))?;
+    let times = s[s.find('(')? + 1..s.rfind(')')?].split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    Some((tokens, times))
+}
+
+/// One GPU's queued jobs: (tokens, job id) for each bench, and the calibration clip's job.
+struct Queued {
+    gpu: u64,
+    bench: Vec<(u64, u64)>,
+    clip: Option<u64>,
+}
+
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[v.len() / 2]
+}
+
+pub fn run(cfg: &Config, raw: &[String]) -> Result<()> {
+    match raw.first().map(String::as_str) {
+        Some("measure") => measure(cfg, &raw[1..]),
+        Some("show") | None => {
+            let p = file(cfg);
+            let v: Value = serde_json::from_slice(&std::fs::read(&p).map_err(|e| Error(format!("{}: {e} (sycl-h3 plan measure)", p.display())))?)
+                .map_err(|e| Error(format!("{}: {e}", p.display())))?;
+            for g in v["gpus"].as_array().into_iter().flatten() {
+                println!("GPU {} {} - step factor {:.3} (from a {}-token clip)", g["gpu"], g["name"].as_str().unwrap_or("?"),
+                         g["step_scale"].as_f64().unwrap_or(1.0), g["clip_tokens"]);
+                for p in g["points"].as_array().into_iter().flatten() {
+                    println!("  {:>6} tokens  {:6.2} s/step (blocks)", p[0], p[1].as_f64().unwrap_or(0.0));
+                }
+            }
+            Ok(())
+        }
+        Some(other) => Err(Error(format!("sycl-h3 plan: measure or show, not {other:?}"))),
+    }
+}
+
+fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
+    let (mut gpus, mut tokens, mut clip) = (Vec::<u64>::new(), TOKENS.to_vec(), true);
+    let mut it = raw.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--gpu" => gpus.push(it.next().and_then(|v| v.parse().ok()).ok_or("--gpu N")?),
+            "--tokens" => {
+                tokens = it.next().ok_or("--tokens 2048,4096,...")?.split(',').map(|v| v.trim().parse().map_err(|_| Error(format!("{v}: not a token count")))).collect::<Result<_>>()?
+            }
+            "--no-clip" => clip = false,
+            other => return Err(Error(format!("sycl-h3 plan measure: unknown option {other}"))),
+        }
+    }
+    let status = client::get("/engine/status")?;
+    let served: Vec<Value> = status["gpus"].as_array().cloned().unwrap_or_default();
+    if gpus.is_empty() {
+        gpus = served.iter().filter_map(|g| g["gpu"].as_u64()).collect();
+    }
+    // every job first, so the GPUs measure side by side
+    let mut queued: Vec<Queued> = Vec::new();
+    for &g in &gpus {
+        let bench = tokens.iter().map(|&t| Ok((t, add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g}))?))).collect::<Result<Vec<_>>>()?;
+        let c = if clip {
+            let (w, h, s, steps) = CLIP;
+            Some(add(json!({"kind": "generate", "gpu": g, "prompt": "a lighthouse on a cliff at dusk, waves breaking below, a slow push in",
+                            "width": w, "height": h, "seconds": s, "steps": steps, "seed": 0, "upscale": 1,
+                            "out": format!("/out/plan-measure-gpu{g}.mp4")}))?)
+        } else {
+            None
+        };
+        eprintln!("GPU {g}: {} bench jobs{} queued", bench.len(), if c.is_some() { " and a calibration clip" } else { "" });
+        queued.push(Queued { gpu: g, bench, clip: c });
+    }
+    let mut out = Vec::new();
+    for Queued { gpu: g, bench, clip: c } in queued {
+        let mut points = Vec::new();
+        for (t, id) in bench {
+            let j = wait(id)?;
+            let s = j["result"]["seconds"].as_f64().ok_or_else(|| Error(format!("job {id}: no seconds in its result")))?;
+            eprintln!("GPU {g}: {t:>6} tokens  {s:6.2} s/step (blocks), {:.1} GiB", j["result"]["gib_in_use"].as_f64().unwrap_or(0.0));
+            points.push((t as f64, s));
+        }
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (mut scale, mut ctok) = (1.0, Value::Null);
+        if let Some(id) = c {
+            let j = wait(id)?;
+            let (t, times) = clip_steps(&j).ok_or_else(|| Error(format!("job {id}: no step times in its log")))?;
+            // the first step carries one-time work (kernels' first use); the rest are the steady state
+            let steady = median(if times.len() > 1 { times[1..].to_vec() } else { times });
+            scale = steady / interp(&points, t);
+            ctok = json!(t);
+            eprintln!("GPU {g}: a {t}-token clip steps in {steady:.2} s: {scale:.3} x the blocks");
+        }
+        let name = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).and_then(|s| s["name"].as_str()).unwrap_or("?").to_string();
+        let shared = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).map(|s| s["shared"] == true).unwrap_or(false);
+        let (a, b) = fit(&points.iter().map(|&(t, s)| (t, s * scale)).collect::<Vec<_>>());
+        out.push(json!({"gpu": g, "name": name, "shared": shared, "step_scale": scale, "clip_tokens": ctok,
+                        "points": points.iter().map(|&(t, s)| json!([t, s])).collect::<Vec<_>>(), "step_a": a, "step_b": b}));
+    }
+    let p = file(cfg);
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    // keep the GPUs measured before that this run did not cover
+    let mut all: Vec<Value> = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["gpus"].as_array().cloned()).unwrap_or_default()
+        .into_iter().filter(|o| !gpus.contains(&o["gpu"].as_u64().unwrap_or(u64::MAX))).collect();
+    all.extend(out);
+    all.sort_by_key(|g| g["gpu"].as_u64().unwrap_or(0));
+    let text = serde_json::to_string_pretty(&json!({"measured": now(), "gpus": all})).map_err(|e| Error(e.to_string()))?;
+    std::fs::write(&p, text + "\n")?;
+    println!("written to {}", p.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interp_is_linear_between_points_and_extends_the_ends() {
+        let p = [(1000.0, 1.0), (2000.0, 3.0), (4000.0, 7.0)];
+        assert!((interp(&p, 1500.0) - 2.0).abs() < 1e-9);
+        assert!((interp(&p, 4000.0) - 7.0).abs() < 1e-9);
+        assert!((interp(&p, 5000.0) - 9.0).abs() < 1e-9); // the last segment's slope
+        assert!((interp(&p, 500.0) - 0.0).abs() < 1e-9); // the first segment's slope
+    }
+
+    #[test]
+    fn fit_recovers_a_quadratic() {
+        let p: Vec<(f64, f64)> = [2048.0, 8192.0, 16384.0, 47104.0].iter().map(|&t| (t, 2e-8 * t * t + 3e-4 * t)).collect();
+        let (a, b) = fit(&p);
+        assert!((a - 2e-8).abs() < 1e-12 && (b - 3e-4).abs() < 1e-8, "{a} {b}");
+    }
+
+    #[test]
+    fn clip_steps_reads_the_log() {
+        let j = json!({"log": ["tokens : 9178 in the denoiser", "sampled: 3 steps in 9.0 s (4.10 2.45 2.47)"]});
+        assert_eq!(clip_steps(&j), Some((9178.0, vec![4.10, 2.45, 2.47])));
+    }
+}
