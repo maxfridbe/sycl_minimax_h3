@@ -58,6 +58,18 @@ struct Pin {
     host: Pinned,
     /// which layers' bytes are in `host` (a layer is marked once its upload has landed)
     filled: Vec<bool>,
+    /// held (an exclusive lock) for as long as the copy lives: one pinned copy per host, whatever the workers
+    _lock: File,
+}
+
+/// One worker at a time keeps the pinned copy: the lock file (`H3_TE_PIN_LOCK`, default /tmp/h3-te-pin.lock - the
+/// daemon's workers share the container's /tmp). 2026-10-05: two workers starting their encodes together each saw
+/// the room free and pinned 14.4 GiB, and the host ran out of memory (the kernel's OOM killer took the user's
+/// session processes). Free RAM alone is checked too late to be a guard between processes.
+fn pin_lock() -> Option<File> {
+    let path = std::env::var("H3_TE_PIN_LOCK").unwrap_or_else(|_| "/tmp/h3-te-pin.lock".into());
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).ok()?;
+    f.try_lock().ok().map(|_| f)
 }
 static PIN: Mutex<Option<Pin>> = Mutex::new(None);
 
@@ -228,10 +240,14 @@ impl TextEncoder {
         if !kept {
             *pin = None; // another file or context: its memory goes back first
             let want = std::env::var("H3_TE_PIN").map_or(true, |v| v != "0");
-            if want && mem_available() >= total as u64 + (8u64 << 30) {
-                match dev.alloc_pinned(total) {
-                    Ok(host) => *pin = Some(Pin { key, host, filled: vec![false; self.layers] }),
-                    Err(e) => eprintln!("te: no pinned copy of the text encoder ({e}); two pinned layer slots instead"),
+            // the lock first (another worker may be allocating its copy right now), then the room: 12 GiB left over
+            let lock = if want { pin_lock() } else { None };
+            if let Some(lock) = lock {
+                if mem_available() >= total as u64 + (12u64 << 30) {
+                    match dev.alloc_pinned(total) {
+                        Ok(host) => *pin = Some(Pin { key, host, filled: vec![false; self.layers], _lock: lock }),
+                        Err(e) => eprintln!("te: no pinned copy of the text encoder ({e}); two pinned layer slots instead"),
+                    }
                 }
             }
         }
@@ -239,7 +255,7 @@ impl TextEncoder {
         let filled: Vec<bool> = pin.as_ref().map_or_else(|| vec![false; self.layers], |p| p.filled.clone());
         let cached = filled.iter().filter(|f| **f).count();
         *self.source.lock().unwrap_or_else(|e| e.into_inner()) = match (&staging, cached) {
-            (Some(_), _) => "the file, through two pinned layer slots".into(),
+            (Some(_), _) => "the file, through two pinned layer slots (another worker keeps the pinned copy, or no room)".into(),
             (None, n) if n == self.layers => "pinned host memory (kept from an earlier clip)".into(),
             (None, 0) => format!("the file, into pinned host memory kept for the next clips ({:.1} GiB)", total as f64 / 1073741824.0),
             (None, n) => format!("pinned host memory ({n} layers) and the file"),

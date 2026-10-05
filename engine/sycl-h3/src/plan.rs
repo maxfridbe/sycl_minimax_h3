@@ -230,10 +230,13 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
                             eprintln!("GPU {g}: cell tokens {t:>6}: {s:6.2} s per clip step, {gib:.1} GiB");
                             json!({"tokens": t, "s_per_step": (s * 100.0).round() / 100.0, "gib": (gib * 10.0).round() / 10.0})
                         }
-                        Err(e) => {
+                        // only the engine's refusal of the size is "over"; anything else (a stopped daemon) ends the run
+                        // rather than writing a table of false overs
+                        Err(e) if e.0.contains("cap") || e.0.contains("memory") || e.0.contains("refused") => {
                             eprintln!("GPU {g}: cell tokens {t:>6}: does not fit ({e})");
                             json!({"tokens": t, "over": true})
                         }
+                        Err(e) => return Err(Error(format!("GPU {g}, a cell of {t} tokens: {e} - nothing written"))),
                     };
                     seen.insert(t, v.clone());
                     v

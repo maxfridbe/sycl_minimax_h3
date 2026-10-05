@@ -273,7 +273,12 @@ int h3s_gpu_info(int index, char* name, int name_len, uint64_t* mem_bytes, char*
 void* h3s_open_gpu(int index) try {
     auto all = gpus();
     if (index < 0 || index >= (int) all.size()) { g_err = "no GPU " + std::to_string(index) + " (" + std::to_string(all.size()) + " found)"; return nullptr; }
-    auto* c = new Ctx{sycl::queue(all[index], sycl::property::queue::in_order())};
+    // a context of this device alone: in the platform's default context (every GPU) Level Zero makes each device
+    // allocation reachable from the other cards too, through system-RAM-backed GTT mappings - 2026-10-05 a B65
+    // worker held its 19.9 GB model in its VRAM AND 19.8 GB of host RAM mapped to the B70, and two workers with the
+    // text encoder's pinned copies ran the host out of memory (the OOM killer took the user's session processes)
+    sycl::context own(all[index]);
+    auto* c = new Ctx{sycl::queue(own, all[index], sycl::property::queue::in_order())};
     init(*c);
     return c;
 } catch (const std::exception& e) { g_err = e.what(); return nullptr; }
