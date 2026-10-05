@@ -210,14 +210,18 @@ impl Llm {
             return;
         }
         let since = *g.0.get_or_insert(now());
-        if now() - since < 1800.0 || now() - g.1 < 300.0 {
+        // the first tick after the studio starts (a boot, a restart) brings the selected model back at once: waiting
+        // the half hour left the box without its chat model after every boot
+        let first = g.1 == 0.0;
+        if !first && (now() - since < 1800.0 || now() - g.1 < 300.0) {
             return;
         }
         g.1 = now();
         drop(g);
         let mode = self.selected();
         if mode != "none" && self.mode(&mode).is_some_and(|m| !self.up(m)) {
-            self.start(mode.clone(), &format!("GPU idle {} min and {mode} is down", ((now() - since) / 60.0) as u64));
+            let why = if first { format!("the studio started and {mode} is down") } else { format!("GPU idle {} min and {mode} is down", ((now() - since) / 60.0) as u64) };
+            self.start(mode.clone(), &why);
         }
     }
 }
