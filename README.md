@@ -185,7 +185,8 @@ the engine over a Unix socket, like `docker` and `dockerd`.
     ./sycl-h3 speechpct out/h3_*.mp4
     ./sycl-h3 jobs add generate ... --upscale 1.5 --pixel_upscaler /models/esrgan/realesr-animevideov3.safetensors
                                     # enlarge the decoded frames with an ESRGAN-type network instead of the latents
-                                    # (the studio: "upscaler" per clip; the latent upscaler stays the default)
+                                    # (the studio: "upscaler" per clip, esrgan-general by default; "latent" for the
+                                    # latent upscaler)
     ./sycl-h3 plan measure          # what a step costs on each GPU (bench-blocks over 2k-47k tokens and a short
                                     # clip per GPU), for the studio's canvas table: one column per GPU
 

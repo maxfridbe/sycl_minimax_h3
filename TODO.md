@@ -76,7 +76,8 @@ set (oneDNN convolutions, the residual-in-residual dense blocks, pixel shuffle).
       natural fine texture (the decoder synthesizes it at full size); bicubic visibly softer. **Waiting on the
       user's judgment** (`out/esr-sbs-*.mp4`, `out/esr-grid-crop.png` on the box). Weights in models/esrgan
       (official Real-ESRGAN releases v0.2.1 / v0.2.5.0, sha256 recorded there).
-- [x] **Built as an option** (2026-10-05; the user prefers the latent path's look, so it stays the default):
+- [x] **Built, and the studio's default** (2026-10-05: after a detail test at 1024x768 -> 1536x1152 the user picked
+      general-x4v3 as the default; "latent" stays selectable, and a box without the weights falls back to it):
       `h3s_conv2d` (oneDNN, frames channels-last, zero padding), `h3s_prelu`, `h3s_pixel_shuffle_add`,
       `h3s_resize_area` (adaptive-average area resize to the latent path's exact output size, clamped, planar);
       `h3-core::esrgan::PixelUpscaler` (SRVGGNetCompact, 4 frames a pass, half); jobs take `pixel_upscaler`, `h3d

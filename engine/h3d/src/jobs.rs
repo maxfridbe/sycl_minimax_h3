@@ -1131,7 +1131,14 @@ pub fn run(e: &Engine, spec: &Value, ctl: &mut Ctl) -> Result<Value> {
                     audio: Some(Path::new(s("audio_vae").unwrap_or("/models/Comfy-Org-MiniMax-H3/vae/minimax_h3_audio_vae_fp32.safetensors"))),
                     upscale: upscale.map(|u| (Path::new(s("upscaler").unwrap_or("/models/upscaler/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors")), u as f32)),
                     // "pixel_upscaler": an ESRGAN-type network's checkpoint - the frames enlarged instead of the latents
-                    pixel: upscale.and_then(|u| s("pixel_upscaler").map(|p| (Path::new(p), u as f32))),
+                    // (missing weights: a note in the log and the latent upscaler instead of a failed clip)
+                    pixel: upscale.and_then(|u| s("pixel_upscaler").map(|p| (Path::new(p), u as f32))).filter(|(p, _)| {
+                        let there = p.exists();
+                        if !there {
+                            ctl.say(format!("pixels : {} is not there - the latent upscaler instead", p.display()));
+                        }
+                        there
+                    }),
                 },
                 lora: Vec::new(),
                 inputs: ClipInputs {

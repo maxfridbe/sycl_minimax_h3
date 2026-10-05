@@ -39,7 +39,7 @@ export const form: Form = {
   height: 576,
   engine: "Q6_K",
   upscale: 1.5,
-  upscaler: "latent",
+  upscaler: "esrgan-general",
   chain: false,
 };
 
@@ -54,7 +54,7 @@ export function useSettings(j: GenerateRequest): void {
   if (j.height) form.height = j.height;
   if (j.engine) form.engine = j.engine;
   if (j.upscale) form.upscale = j.upscale;
-  form.upscaler = j.upscaler ?? "latent";
+  form.upscaler = j.upscaler ?? "esrgan-general";
   form.label = j.label ?? "";
   form.chain = !!j.first_frame;
   navigate({ tab: "create" });
@@ -115,12 +115,12 @@ export function Creation() {
         {num("steps", "steps", 1, 40, 1)}
         {num("seed", "seed", 0, 2147483647, 1)}
         {num("upscale", "upscale", 1, 4, 0.5)}
-        <label attrs={{ title: "latent: the latents enlarged, then decoded at the larger size (the default: the decoder's own fine texture). ESRGAN: decoded at the sampled size, the frames enlarged by a network - ~24 s faster for a 5 s clip at 1152x864 on a B65" }}>
+        <label attrs={{ title: "ESRGAN: decoded at the sampled size, the frames enlarged by a network on the GPU - about half the decode stage's time (a 5 s clip at 1152x864 on a B65: 19.6 s against 41.9). latent: the latents enlarged, then decoded at the larger size - the decoder's own fine texture." }}>
           upscaler
           <select on={{ change: (e: Event) => { form.upscaler = (e.target as HTMLSelectElement).value; render(); } }}>
-            <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (default)</option>
-            <option attrs={{ value: "esrgan-anime", selected: form.upscaler === "esrgan-anime" }}>ESRGAN animevideov3 (fast)</option>
-            <option attrs={{ value: "esrgan-general", selected: form.upscaler === "esrgan-general" }}>ESRGAN general-x4v3</option>
+            <option attrs={{ value: "esrgan-general", selected: form.upscaler === "esrgan-general" }}>ESRGAN general-x4v3 (default)</option>
+            <option attrs={{ value: "esrgan-anime", selected: form.upscaler === "esrgan-anime" }}>ESRGAN animevideov3 (sharper, drawn look)</option>
+            <option attrs={{ value: "latent", selected: form.upscaler === "latent" }}>latent (slowest, most natural texture)</option>
           </select>
         </label>
         <label>
