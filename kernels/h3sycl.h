@@ -174,6 +174,12 @@ int h3s_gate_add(void* ctx, void* x, int x_dt, int64_t M, int64_t C, const void*
  * the bound is what is at stake if oneDNN silently falls back - see h3sycl.cpp). */
 int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                   int64_t stride, void* out, int out_dt);
+/* B independent sequences of S tokens each in one call (the video decoder's tiles): sequence b's rows start at row
+ * b * S of q, k and v (stride as above) and of out [B * S, H * D]. One oneDNN fused call for the whole batch; with
+ * 16-bit half in and out it reads q, k, v and writes out in place through strides (no copies). Otherwise, and when
+ * oneDNN refuses, the sequences one at a time through h3s_attention. */
+int h3s_attention_batch(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t B, int64_t S, int64_t H,
+                        int64_t D, int64_t stride, void* out, int out_dt);
 
 #ifdef __cplusplus
 }

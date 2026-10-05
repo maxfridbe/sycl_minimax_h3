@@ -266,6 +266,7 @@ impl VideoDecoder {
         let f1 = Tensor::new(dev, self.act, &[rows_all, 2 * 4 * DIM])?;
         let act = Tensor::new(dev, self.act, &[rows_all, 4 * DIM])?;
         let prof = std::env::var_os("H3S_PROFILE").is_some();
+        let per_tile = std::env::var("H3_VAE_ATTN_PER_TILE").is_ok_and(|v| v == "1");
         let tb = std::time::Instant::now();
         if prof {
             dev.wait()?;
@@ -294,14 +295,21 @@ impl VideoDecoder {
             ops::rms_rope(all_rows(0), &self.ones, EPS, &cs, ROT_DIM)?;
             ops::rms_rope(all_rows(1), &self.ones, EPS, &cs, ROT_DIM)?;
             lap("norm + rotation q k")?;
-            for k in 0..nb {
-                let part = |i: usize| Rows { t: &qkv, offset: k * s * 3 * DIM + i * DIM, stride: 3 * DIM, tokens: s, heads: HEADS, dim: HEAD_DIM };
-                if nb == 1 {
-                    ops::attention(part(0), part(1), part(2), &att)?;
-                } else {
-                    ops::attention(part(0), part(1), part(2), &att1)?;
-                    att.copy_rows(k * s, &att1, 0, s)?;
+            // every tile's attention in one call (each tile attends to its own tokens only); H3_VAE_ATTN_PER_TILE=1: one
+            // call per tile, as before
+            if per_tile {
+                for k in 0..nb {
+                    let part = |i: usize| Rows { t: &qkv, offset: k * s * 3 * DIM + i * DIM, stride: 3 * DIM, tokens: s, heads: HEADS, dim: HEAD_DIM };
+                    if nb == 1 {
+                        ops::attention(part(0), part(1), part(2), &att)?;
+                    } else {
+                        ops::attention(part(0), part(1), part(2), &att1)?;
+                        att.copy_rows(k * s, &att1, 0, s)?;
+                    }
                 }
+            } else {
+                let part = |i: usize| Rows { t: &qkv, offset: i * DIM, stride: 3 * DIM, tokens: nb * s, heads: HEADS, dim: HEAD_DIM };
+                ops::attention_batch(part(0), part(1), part(2), nb, &att)?;
             }
             lap("attention")?;
             match (&b.out, b.folded) {

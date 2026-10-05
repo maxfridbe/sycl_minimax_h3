@@ -351,6 +351,39 @@ pub fn add(x: &Tensor, other: &Tensor) -> Result<()> {
 }
 
 /// `out = softmax(q . k^T / sqrt(dim)) . v` per head; out [tokens, heads * dim].
+/// Attention over `seqs` independent sequences of `q.tokens / seqs` tokens each, in one call: sequence b is the rows
+/// `b * S ..` of q, k, v and of out (the video decoder's tiles). Same result as one `attention` per sequence.
+pub fn attention_batch(q: Rows, k: Rows, v: Rows, seqs: usize, out: &Tensor) -> Result<()> {
+    if q.layout() != k.layout() || q.layout() != v.layout() {
+        return Err(Error("attention_batch: q, k and v must have the same layout".into()));
+    }
+    if seqs == 0 || !q.tokens.is_multiple_of(seqs) {
+        return Err(Error(format!("attention_batch: {} tokens are not {seqs} equal sequences", q.tokens)));
+    }
+    if out.elements() != q.tokens * q.heads * q.dim {
+        return Err(Error(format!("attention_batch: out {:?} for {} tokens of {} x {}", out.shape, q.tokens, q.heads, q.dim)));
+    }
+    let dev = out.buf.device();
+    // SAFETY: device pointers of this device; `Rows::ptr` checks the sizes (all sequences' rows).
+    let rc = unsafe {
+        (dev.api.attention_batch)(
+            dev.ctx,
+            q.ptr()?,
+            k.ptr()?,
+            v.ptr()?,
+            q.t.dtype.kernel_code()?,
+            seqs as i64,
+            (q.tokens / seqs) as i64,
+            q.heads as i64,
+            q.dim as i64,
+            q.stride as i64,
+            out.buf.ptr(),
+            out.dtype.kernel_code()?,
+        )
+    };
+    dev.check(rc)
+}
+
 pub fn attention(q: Rows, k: Rows, v: Rows, out: &Tensor) -> Result<()> {
     if q.layout() != k.layout() || q.layout() != v.layout() {
         return Err(Error("attention: q, k and v must have the same layout".into()));

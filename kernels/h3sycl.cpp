@@ -105,6 +105,9 @@ struct Ctx {
         dnnl::graph::logical_tensor out;
     };
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, Sdpa> sdpa;
+    // h3s_attention_batch: (B, S, H, D, stride, in place) -> its compiled partition
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool>, Sdpa> sdpa_b;
+    bool sdpa_direct_ok = true;                    // false once oneDNN has refused the strided (copy-free) form
     float sdpa_scale = 0.0f;                       // 1 / sqrt(D): a host scalar oneDNN reads when the kernel runs
     bool sdpa_ok = true;                           // false once oneDNN has refused the fused form
     size_t attn_table_bytes = 1536ull << 20;       // the most score-table memory a chunk of attention may take
@@ -1186,9 +1189,41 @@ int h3s_rms_rope(void* ctx, void* x, int x_dt, int64_t M, int64_t H, int64_t D, 
     return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
+// 16-bit in and out, 8 features per work-item through 16-byte loads and stores: the same arithmetic and rounding per
+// element as the general kernel below (bit-identical results), at about the memory's rate - the general one, an
+// element per work-item through a type switch, ran at a third of it (10% of the video decoder's time).
+extern "C++" {
+template <int DT>
+static void swiglu16(sycl::queue& q, const uint16_t* x, int64_t M, int64_t C, uint16_t* out) {
+    const size_t C8 = (size_t) C / 8;
+    q.parallel_for(sycl::range<2>((size_t) M, C8), [=](sycl::id<2> id) {
+        const size_t r = id[0], j = id[1] * 8;
+        using V = sycl::vec<uint16_t, 8>;
+        const V gv = *reinterpret_cast<const V*>(x + r * 2 * C + j);
+        const V uv = *reinterpret_cast<const V*>(x + r * 2 * C + C + j);
+        V ov;
+        for (int e = 0; e < 8; ++e) {
+            const uint16_t gb = gv[e], ub = uv[e];
+            const float g = DT == F16 ? (float) sycl::bit_cast<sycl::half>(gb) : bf16_to_f32(gb);
+            const float u = DT == F16 ? (float) sycl::bit_cast<sycl::half>(ub) : bf16_to_f32(ub);
+            const float o = g / (1.0f + sycl::exp(-g)) * u;
+            ov[e] = DT == F16 ? sycl::bit_cast<uint16_t>((sycl::half) o) : f32_to_bf16(o);
+        }
+        *reinterpret_cast<V*>(out + r * C + j) = ov;
+    });
+}
+}  // extern "C++"
+
 int h3s_swiglu(void* ctx, const void* x, int x_dt, int64_t M, int64_t C, void* out, int out_dt) try {
     auto& c = *static_cast<Ctx*>(ctx);
     if (M <= 0 || C <= 0) return 0;
+    // the fast form needs 16-byte aligned rows: C a multiple of 8, the buffers 16-byte aligned (USM allocations are)
+    const bool aligned = ((uintptr_t) x % 16 == 0) && ((uintptr_t) out % 16 == 0) && C % 8 == 0;
+    if (aligned && x_dt == out_dt && (x_dt == F16 || x_dt == BF16) && !std::getenv("H3S_SWIGLU_SCALAR")) {
+        if (x_dt == F16) swiglu16<F16>(c.q, (const uint16_t*) x, M, C, (uint16_t*) out);
+        else swiglu16<BF16>(c.q, (const uint16_t*) x, M, C, (uint16_t*) out);
+        return 0;
+    }
     c.q.parallel_for(sycl::range<2>((size_t) M, (size_t) C), [=](sycl::id<2> id) {
         const size_t r = id[0], i = id[1];
         const float g = load(x, x_dt, r * 2 * C + i), u = load(x, x_dt, r * 2 * C + C + i);
@@ -1354,6 +1389,104 @@ static bool attention_fused(Ctx& c, const void* q, const void* k, const void* v,
 static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,
                            int64_t stride, void* out, int out_dt);
 
+// The fused graph for B sequences at once: q, k, v [B, H, S, D] and out [B, H, S, D] f16. In place (`direct`): the
+// tensors are the callers' own token-order buffers seen through strides - row s of sequence b, head h at
+// b * S * stride + s * stride + h * D (q, k, v) and (b * S + s) * H * D + h * D (out). Otherwise dense by head.
+static Ctx::Sdpa& sdpa_batch_for(Ctx& c, int64_t B, int64_t S, int64_t H, int64_t D, int64_t stride, bool direct) {
+    auto key = std::make_tuple(B, S, H, D, direct ? stride : 0, direct);
+    auto it = c.sdpa_b.find(key);
+    if (it != c.sdpa_b.end()) return it->second;
+    using namespace dnnl::graph;
+    using lt = logical_tensor;
+    const auto f16 = lt::data_type::f16, f32 = lt::data_type::f32;
+    const lt::dims d4 {B, H, S, D}, sc4 {B, H, S, S};
+    const lt::dims in_st = direct ? lt::dims {S * stride, D, stride, 1} : lt::dims {H * S * D, S * D, D, 1};
+    const lt::dims out_st = direct ? lt::dims {S * H * D, D, H * D, 1} : lt::dims {H * S * D, S * D, D, 1};
+    size_t id = 0;
+    lt q(id++, f16, d4, in_st), k(id++, f16, d4, in_st);
+    lt scale(id++, f32, lt::dims {}, lt::layout_type::strided, lt::property_type::host_scalar);
+    lt v(id++, f16, d4, in_st);
+    lt score(id++, f32, sc4, lt::layout_type::strided), scaled(id++, f32, sc4, lt::layout_type::strided);
+    lt probs(id++, f16, sc4, lt::layout_type::strided), out(id++, f16, d4, out_st);
+    op bmm1(id++, op::kind::MatMul, {q, k}, {score}, "scores");
+    bmm1.set_attr<bool>(op::attr::transpose_b, true);
+    op mul(id++, op::kind::Multiply, {score, scale}, {scaled}, "scale");
+    op sm(id++, op::kind::SoftMax, {scaled}, {probs}, "softmax");
+    sm.set_attr<int64_t>(op::attr::axis, -1);
+    sm.set_attr<std::string>(op::attr::mode, "inf_as_zero");
+    op bmm2(id++, op::kind::MatMul, {probs, v}, {out}, "values");
+    graph g(dnnl::engine::kind::gpu);
+    g.add_op(bmm1); g.add_op(mul); g.add_op(sm); g.add_op(bmm2);
+    g.finalize();
+    auto parts = g.get_partitions();
+    if (parts.size() != 1 || !parts[0].is_supported())
+        throw std::runtime_error("oneDNN did not take the batched attention as one partition");
+    const lt mine[4] = {q, k, scale, v};
+    Ctx::Sdpa sd;
+    for (const auto& port : parts[0].get_input_ports())
+        for (int i = 0; i < 4; ++i)
+            if (mine[i].get_id() == port.get_id()) { sd.in.push_back(mine[i]); sd.slot.push_back(i); }
+    if (sd.in.size() != 4) throw std::runtime_error("oneDNN's batched attention partition has unexpected inputs");
+    sd.cp = parts[0].compile(sd.in, {out}, c.eng);
+    sd.out = sd.cp.query_logical_tensor(out.get_id());
+    return c.sdpa_b.emplace(key, std::move(sd)).first->second;
+}
+
+// Returns false (having queued nothing) when this form does not apply or oneDNN refuses it.
+static bool attention_fused_batch(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t B, int64_t S,
+                                  int64_t H, int64_t D, int64_t stride, void* out, int out_dt) {
+    // one chunk per sequence, as attention_fused would take it (a longer one keeps its chunking there)
+    if (S > c.attn_rows) return false;
+    sycl::queue& qu = c.q;
+    c.sdpa_scale = 1.0f / std::sqrt((float) D);
+    auto run = [&](Ctx::Sdpa& sd, const void* hq, const void* hk, const void* hv, void* ao) {
+        const void* const handles[4] = {hq, hk, nullptr, hv};
+        std::vector<dnnl::graph::tensor> in;
+        for (size_t i = 0; i < sd.in.size(); ++i) {
+            if (sd.slot[i] == 2) in.push_back(dnnl::graph::tensor::make_scalar_tensor(sd.in[i], &c.sdpa_scale));
+            else in.emplace_back(sd.in[i], c.eng, const_cast<void*>(handles[sd.slot[i]]));
+        }
+        sd.cp.execute(c.strm, in, {dnnl::graph::tensor(sd.out, c.eng, ao)});
+    };
+    if (dt == H3S_F16 && out_dt == H3S_F16 && c.sdpa_direct_ok) {
+        try {
+            Ctx::Sdpa& sd = sdpa_batch_for(c, B, S, H, D, stride, true);
+            run(sd, q, k, v, out);
+            return true;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "h3sycl: batched attention in place refused (%s); copying by head instead\n", e.what());
+            c.sdpa_direct_ok = false;
+        }
+    }
+    Ctx::Sdpa* sd = nullptr;
+    try {
+        sd = &sdpa_batch_for(c, B, S, H, D, stride, false);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "h3sycl: batched attention refused (%s); one sequence at a time\n", e.what());
+        return false;
+    }
+    const size_t n = (size_t) B * S * H * D;
+    uint16_t* hq = c.grow(c.hq, c.hq_cap, n);
+    uint16_t* hk = c.grow(c.hk, c.hk_cap, n);
+    uint16_t* hv = c.grow(c.hv, c.hv_cap, n);
+    float* aof = c.grow(c.ao, c.ao_cap, (n + 1) / 2);   // used as half [B, H, S, D]
+    if (!hq || !hk || !hv || !aof) throw std::runtime_error(g_err);
+    sycl::half* ao = (sycl::half*) aof;
+    qu.parallel_for(sycl::range<3>((size_t) (B * H), (size_t) S, (size_t) D), [=](sycl::id<3> id) {
+        const size_t b = id[0] / H, h = id[0] % H;
+        const size_t src = (b * S + id[1]) * stride + h * D + id[2], dst = (id[0] * S + id[1]) * D + id[2];
+        ((sycl::half*) hq)[dst] = (sycl::half) load(q, dt, src);
+        ((sycl::half*) hk)[dst] = (sycl::half) load(k, dt, src);
+        ((sycl::half*) hv)[dst] = (sycl::half) load(v, dt, src);
+    });
+    run(*sd, hq, hk, hv, ao);
+    qu.parallel_for(sycl::range<3>((size_t) (B * S), (size_t) H, (size_t) D), [=](sycl::id<3> id) {
+        const size_t b = id[0] / S, s = id[0] % S;
+        store(out, out_dt, (id[0] * H + id[1]) * D + id[2], (float) ao[((b * H + id[1]) * S + s) * D + id[2]]);
+    });
+    return true;
+}
+
 // Form 0 (the default; H3S_ATTN=onednn skips it): SageAttention v1 - q and k quantized to int8 here, the attention by Intel's ARK kernel on
 // sycl-tla in libh3sage.so (kernels/sage.cpp), v and the result in half. k's mean over the sequence is taken out
 // before quantizing: it adds the same amount to every score of a row, which the softmax ignores, and what is left
@@ -1476,6 +1609,24 @@ int h3s_attention(void* ctx, const void* q, const void* k, const void* v, int dt
         c.sdpa_ok = false;
     }
     return attention_split(c, q, k, v, dt, S, H, D, stride, out, out_dt);
+} catch (const std::exception& e) { g_err = e.what(); return -1; }
+
+int h3s_attention_batch(void* ctx, const void* q, const void* k, const void* v, int dt, int64_t B, int64_t S, int64_t H,
+                        int64_t D, int64_t stride, void* out, int out_dt) try {
+    auto& c = *static_cast<Ctx*>(ctx);
+    if (B <= 0 || S <= 0 || H <= 0 || D <= 0) return 0;
+    if (stride < H * D) { g_err = "h3s_attention_batch: the row stride is shorter than a row"; return -1; }
+    // SageAttention takes long sequences one at a time; short ones go to oneDNN's fused kernel, here all at once
+    const bool sage = c.sage_want && S >= c.sage_min_s;
+    if (B > 1 && !sage && c.sdpa_ok && attention_fused_batch(c, q, k, v, dt, B, S, H, D, stride, out, out_dt)) return 0;
+    const size_t ei = dt == H3S_F32 ? 4 : 2, eo = out_dt == H3S_F32 ? 4 : 2;
+    for (int64_t b = 0; b < B; ++b) {
+        const size_t io = (size_t) (b * S * stride) * ei, oo = (size_t) (b * S * H * D) * eo;
+        const int rc = h3s_attention(ctx, (const char*) q + io, (const char*) k + io, (const char*) v + io, dt, S, H, D, stride,
+                                     (char*) out + oo, out_dt);
+        if (rc != 0) return rc;
+    }
+    return 0;
 } catch (const std::exception& e) { g_err = e.what(); return -1; }
 
 static int attention_split(Ctx& c, const void* q, const void* k, const void* v, int dt, int64_t S, int64_t H, int64_t D,

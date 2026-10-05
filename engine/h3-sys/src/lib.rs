@@ -144,6 +144,21 @@ pub struct Api {
         *mut c_void,    // out
         c_int,          // out_dt
     ) -> c_int,
+    #[allow(clippy::type_complexity)]
+    pub attention_batch: unsafe extern "C" fn(
+        *mut c_void,    // ctx
+        *const c_void,  // q
+        *const c_void,  // k
+        *const c_void,  // v
+        c_int,          // dt
+        i64,            // B
+        i64,            // S
+        i64,            // H
+        i64,            // D
+        i64,            // stride
+        *mut c_void,    // out
+        c_int,          // out_dt
+    ) -> c_int,
 }
 
 fn dl_error() -> String {
@@ -255,6 +270,7 @@ impl Api {
             swiglu: sym!("h3s_swiglu"),
             gate_add: sym!("h3s_gate_add"),
             attention: sym!("h3s_attention"),
+            attention_batch: sym!("h3s_attention_batch"),
         })
     }
 

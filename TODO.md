@@ -34,6 +34,26 @@ step at 47k tokens (1%), and free ~9 GiB for activations.
 
 Expected: 15 s clips at 1024x576-class canvases and longer ones become possible; ~1-3% per step where used.
 
+## 2b. The video decoder (the largest piece of a clip after sampling)
+
+Profiled 2026-10-05 on the B65, 124 frames at 768x576 (the fp16 decoder, as production uses it): 17.6 s, of it the
+four linears 54% (already at the card's fp16 rate, ~88-90 TFLOP/s), attention 26% (oneDNN's fused kernel at ~33
+TFLOP/s on 1,797-token tiles), the gated activation 10%, norms + rotation 10%.
+
+- [x] Attention for the batch of tiles in one call, reading q/k/v and writing the result in place through strides
+      (`h3s_attention_batch`): the per-tile copies gone. 17.6 -> 16.6 s, output identical (PSNR inf).
+      `H3_VAE_ATTN_PER_TILE=1`: the old calls.
+- [x] The gated activation 8 features per work-item through 16-byte loads (`swiglu16`): 1.57 -> 0.51 s, identical
+      results. Decode 16.6 -> **15.6 s (-11% in all)**; the denoiser's step -2% (9.91 vs 10.09 s at 16k tokens).
+      `H3S_SWIGLU_SCALAR=1`: the old kernel.
+- [ ] **Opt-in, output changes:** the int8 decoder checkpoint (models/kitchen) is only 5% faster whole (its
+      rotations cost what the int8 GEMMs save, except in w1: 1.67x there), at PSNR 44.8 dB / SSIM 0.989 against
+      fp16. int8 for w1 alone would save ~1.7 s of 15.6 - a clip pair to judge first.
+- [ ] The two norms per block (0.84 s) and the q/k norm + rotation (0.66 s) run below the memory's rate, as the
+      gated activation did: the same treatment, ~0.5-0.8 s.
+- [ ] Attention itself: oneDNN's kernel at ~33 TFLOP/s for 64-feature heads on 1.8k tokens (SageAttention was 2x
+      slower at this length). A kernel of our own would have to beat oneDNN's; open.
+
 ## 3. Smaller
 
 - [ ] The denoiser's weight load (11.6 s per worker start) through a pipelined staging ring like Strata's expert
