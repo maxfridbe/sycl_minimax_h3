@@ -820,38 +820,45 @@ int h3s_dequant(void* ctx, const void* src, int qtype, int64_t n, void* out, int
     if (n % 256 != 0) { g_err = "h3s_dequant: a whole number of 256-value blocks"; return -1; }
     const uint8_t* b = static_cast<const uint8_t*>(src);
     auto h2f = [](const uint8_t* p) { sycl::half h; std::memcpy(&h, p, 2); return (float) h; };
+    // four consecutive values per work-item, so a sub-group writes one contiguous run (2026-10-05: one work-item per
+    // 32-value run wrote 32 strided streams, ~60 ms of a 16k-token block's 156 ms of Q4_K matrices on the B65); the
+    // arithmetic per value is the same as before, so are the results
+    const size_t items = (size_t) (n / 4);
     if (qtype == 12) {   // Q4_K
-        c.q.parallel_for(sycl::range<1>((size_t) (n / 32)), [=](sycl::id<1> id) {
-            const int64_t blk = id[0] / 8, sub = id[0] % 8;     // sub-block of 32
+        c.q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+            const size_t v0 = id[0] * 4;
+            const int64_t blk = (int64_t) (v0 / 256);
+            const int j0 = (int) (v0 % 256), j = j0 / 32, l0 = j0 % 32;     // sub-block j of 32, position l0 in it
             const uint8_t* x = b + blk * 144;
             const float d = h2f(x), dmin = h2f(x + 2);
             const uint8_t* sc = x + 4;
-            const uint8_t* qs = x + 16;
-            const int j = (int) sub;
             int s, m;
             if (j < 4) { s = sc[j] & 63; m = sc[j + 4] & 63; }
             else { s = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4); m = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4); }
             const float d1 = d * (float) s, m1 = dmin * (float) m;
-            const uint8_t* q = qs + (sub / 2) * 32;
-            const bool high = sub % 2 == 1;
-            const size_t o = (size_t) (blk * 256 + sub * 32);
-            for (int l = 0; l < 32; ++l) store(out, out_dt, o + l, d1 * (float) (high ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
+            const uint8_t* q = x + 16 + (j / 2) * 32;
+            const bool high = j % 2 == 1;
+            for (int t = 0; t < 4; ++t) {
+                const int l = l0 + t;
+                store(out, out_dt, v0 + t, d1 * (float) (high ? (q[l] >> 4) : (q[l] & 0xF)) - m1);
+            }
         });
     } else if (qtype == 14) {   // Q6_K
-        c.q.parallel_for(sycl::range<1>((size_t) (n / 32)), [=](sycl::id<1> id) {
-            const int64_t blk = id[0] / 8, part = id[0] % 8;    // 8 runs of 32 values: (half n, quarter k)
+        c.q.parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+            const size_t v0 = id[0] * 4;
+            const int64_t blk = (int64_t) (v0 / 256);
+            const int j0 = (int) (v0 % 256), half = j0 / 128, k = (j0 % 128) / 32, l0 = j0 % 32;
             const uint8_t* x = b + blk * 210;
-            const uint8_t* ql = x + (part / 4) * 64;
-            const uint8_t* qh = x + 128 + (part / 4) * 32;
-            const int8_t* sc = reinterpret_cast<const int8_t*>(x + 192) + (part / 4) * 8;
+            const uint8_t* ql = x + half * 64;
+            const uint8_t* qh = x + 128 + half * 32;
+            const int8_t* sc = reinterpret_cast<const int8_t*>(x + 192) + half * 8;
             const float d = h2f(x + 208);
-            const int k = (int) (part % 4);                     // which of q1..q4
-            const size_t o = (size_t) (blk * 256 + (part / 4) * 128 + k * 32);
-            for (int l = 0; l < 32; ++l) {
+            for (int t = 0; t < 4; ++t) {
+                const int l = l0 + t;
                 const int lo = (k == 0) ? (ql[l] & 0xF) : (k == 1) ? (ql[l + 32] & 0xF) : (k == 2) ? (ql[l] >> 4) : (ql[l + 32] >> 4);
                 const int hi = (qh[l] >> (2 * k)) & 3;
                 const int q = (lo | (hi << 4)) - 32;
-                store(out, out_dt, o + l, d * (float) sc[l / 16 + 2 * k] * (float) q);
+                store(out, out_dt, v0 + t, d * (float) sc[l / 16 + 2 * k] * (float) q);
             }
         });
     } else {

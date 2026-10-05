@@ -33,7 +33,7 @@ pub fn load(dev: &Arc<Device>, ckpt: &Checkpoint, threads: usize, keep: impl Fn(
     let mut jobs = Vec::new(); // (tensor index, offset in the tensor, file offset, bytes)
     let mut order = Vec::new();
     for (i, e) in wanted.iter().enumerate() {
-        let t = Tensor::new(dev, e.dtype, &e.shape).ctx(format!("allocating {}", e.name))?;
+        let t = Tensor::new(dev, e.dtype, &e.stored_shape()).ctx(format!("allocating {}", e.name))?;
         let mut off = 0;
         while off < e.bytes {
             let n = BLOCK.min(e.bytes - off);

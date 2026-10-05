@@ -76,7 +76,10 @@ tools (talk to the studio, like the front end):
 settings (environment, or NAME=value lines in sycl-h3.conf beside the repository or ~/.config/sycl-h3.conf):
   H3_MODELS        host directory with the checkpoints, seen as /models          (required for start)
   H3_MODEL         the checkpoint as seen in the container
-                   (default /models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors)
+                   (default /models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors), the engine INT8
+  H3_ENGINES       the other denoisers a clip may name, NAME=path in the container, space-separated, e.g.
+                   \"Q4_K_M=/models/MiniStack/diffusion_models/MiniMax-H3-FL2VA-pruned-Q4_K_M.gguf Q6_K=/models/engines/...\"
+                   (GGUF k-quants: less of the card than INT8, so longer clips fit; slower steps)
   H3_OUT           host directory for job files, seen as /out                    (default ./out)
   H3_GPUS          GPUs to serve, e.g. \"0 1\" (default all)   H3_SHARED_GPUS  GPUs the two hooks below are about
   H3_IDLE          seconds without a job before an engine unloads; 0 = never     (default 600)
@@ -194,11 +197,16 @@ fn start(cfg: &Config, raw: &[String]) -> Result<()> {
         format!("{SOCKET_DIR_IN}/h3d.sock"),
         "--model".into(),
         cfg.or("H3_MODEL", "/models/kitchen/minimax_h3_fl2va_pruned_int8_convrot.safetensors"),
+        "--model-name".into(),
+        "INT8".into(),
         "--idle".into(),
         cfg.or("H3_IDLE", "600"),
     ];
     for g in &gpus {
         daemon_args.extend(["--gpu".into(), g.clone()]);
+    }
+    for e in cfg.get("H3_ENGINES").unwrap_or_default().split_whitespace() {
+        daemon_args.extend(["--engine".into(), e.to_string()]);
     }
     for g in &shared {
         daemon_args.extend(["--shared-gpu".into(), g.clone()]);

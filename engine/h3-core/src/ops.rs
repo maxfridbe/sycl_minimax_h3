@@ -5,6 +5,7 @@ use std::ffi::c_void;
 
 use crate::device::Tensor;
 use crate::dtype::DType;
+use crate::gguf::GType;
 use crate::{Error, Result};
 
 fn floats(t: &Tensor, what: &str, n: usize) -> Result<*const f32> {
@@ -80,6 +81,54 @@ impl Int8Linear {
         };
         dev.check(rc)
     }
+}
+
+/// A linear layer with llama.cpp k-quant weights (one block matrix of a GGUF denoiser, Q4_K or Q6_K), on the device:
+/// the raw blocks stay there, and each call expands the matrix into a shared buffer in the activations' type and
+/// multiplies with that - one matrix at a time, so the card holds the quantized form (Q4_K: 4.5 bits a weight)
+/// plus the largest matrix in 16 bits.
+pub struct KLinear {
+    /// the k-quant blocks of the [N, K] matrix, as bytes
+    pub blocks: Tensor,
+    pub kind: GType,
+    pub n: usize,
+    pub k: usize,
+}
+
+impl KLinear {
+    /// `out = linear(x)`: x [M, K] and out [M, N] in one 16-bit type; `w` holds at least N x K values of it.
+    pub fn forward(&self, x: &Tensor, out: &Tensor, w: &Tensor) -> Result<()> {
+        let (n, k) = (self.n, self.k);
+        let m = x.elements() / k;
+        if x.elements() != m * k || out.elements() != m * n || w.dtype != x.dtype || w.elements() < n * k {
+            return Err(Error(format!("klinear: x {:?} {:?}, out {:?}, buffer {:?} {:?} for a [{n}, {k}] weight", x.dtype, x.shape, out.shape, w.dtype, w.shape)));
+        }
+        expand_into(&self.blocks, self.kind, n * k, w)?;
+        let dev = x.buf.device();
+        let code = x.dtype.kernel_code()?;
+        // SAFETY: device pointers of this device; w holds the [n, k] matrix just expanded, sizes checked above.
+        let rc = unsafe { (dev.api.linear)(dev.ctx, x.buf.ptr(), code, m as i64, k as i64, w.buf.ptr(), n as i64, std::ptr::null(), out.buf.ptr(), out.dtype.kernel_code()?) };
+        dev.check(rc)
+    }
+}
+
+/// `n` values of k-quant blocks (raw bytes on the device) into the front of `out`, in `out`'s type.
+pub fn expand_into(blocks: &Tensor, kind: GType, n: usize, out: &Tensor) -> Result<()> {
+    let code = kind.quant_code().ok_or_else(|| Error(format!("{kind:?} is not a k-quant")))?;
+    if blocks.buf.len() < kind.bytes(n) || out.elements() < n {
+        return Err(Error(format!("expand: {} bytes of {kind:?} blocks for {n} values into {:?}", blocks.buf.len(), out.shape)));
+    }
+    let dev = blocks.buf.device();
+    // SAFETY: device buffers of this device, sizes checked above.
+    let rc = unsafe { (dev.api.dequant)(dev.ctx, blocks.buf.ptr().cast_const(), code, n as i64, out.buf.ptr(), out.dtype.kernel_code()?) };
+    dev.check(rc)
+}
+
+/// A k-quant tensor's raw blocks (on the device) -> a new tensor of `shape` in `dt`.
+pub fn expand(blocks: &Tensor, kind: GType, shape: &[usize], dt: DType) -> Result<Tensor> {
+    let out = Tensor::new(blocks.buf.device(), dt, shape)?;
+    expand_into(blocks, kind, shape.iter().product(), &out)?;
+    Ok(out)
 }
 
 /// A low-rank addition to a layer (a LoRA): `out += B (A x)`, A [r, K], B [N, r] in the activations' type, the

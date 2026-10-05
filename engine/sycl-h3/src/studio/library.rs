@@ -314,9 +314,26 @@ impl Studio {
         v
     }
 
-    /// One engine: the int8 denoiser the daemon has loaded (the GGUF quantizations of the old pipeline are gone).
+    /// The denoisers the engine daemon has (its `--model`, INT8, and the GGUF forms of H3_ENGINES), in the legacy
+    /// shape; INT8 alone when the daemon does not answer.
     pub fn engines(&self) -> Vec<Value> {
-        vec![json!({"quant": "INT8", "file": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "path": "", "gib": 19.53, "ready": true, "default": true})]
+        let listed: Vec<Value> = h3_http::call(&h3_http::Target::Unix(self.socket.clone()), "GET", "/engine/status", None)
+            .ok()
+            .and_then(|v| v["engines"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| {
+                let path = e["path"].as_str()?;
+                Some(json!({"quant": e["name"], "file": path.rsplit('/').next().unwrap_or(path), "path": path,
+                            "gib": (e["gib"].as_f64().unwrap_or(0.0) * 100.0).round() / 100.0, "ready": true, "default": e["default"]}))
+            })
+            .collect();
+        if listed.is_empty() {
+            return vec![json!({"quant": "INT8", "file": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "path": "", "gib": 19.53, "ready": true, "default": true})];
+        }
+        let mut v = listed;
+        v.sort_by(|a, b| a["gib"].as_f64().unwrap_or(0.0).total_cmp(&b["gib"].as_f64().unwrap_or(0.0)));
+        v
     }
 
     /// The canvas table's model. `gpus` is what `sycl-h3 plan measure` found on each of this box's GPUs (plan.json in
@@ -330,7 +347,7 @@ impl Studio {
         let fastest = gpus.iter().min_by(|a, b| a["step_a"].as_f64().unwrap_or(1.0).total_cmp(&b["step_a"].as_f64().unwrap_or(1.0)));
         let (a, b) = fastest.map(|g| (g["step_a"].as_f64().unwrap_or(1.829e-8), g["step_b"].as_f64().unwrap_or(3.4634e-4))).unwrap_or((1.829e-8, 3.4634e-4));
         json!({"engines": self.engines(), "canvases": self.canvases(),
-               "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": "Q6_K"},
+               "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": "INT8"},
                "cap_gib": 30.3, "gib_per_token": 1.64e-4, "margin_gib": 0.8, "step_a": a, "step_b": b, "gpus": gpus,
                "chain_modes": super::queue::CHAIN_MODES.iter().map(|(k, v)| (k.to_string(), json!(v))).collect::<Map<String, Value>>(),
                "measured": {}})

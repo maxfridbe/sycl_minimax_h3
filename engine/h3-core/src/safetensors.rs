@@ -1,5 +1,6 @@
 //! Reading a `.safetensors` checkpoint: an 8-byte length, a JSON header (name -> type, shape, byte range), then the
-//! tensors' bytes back to back.
+//! tensors' bytes back to back. A `.gguf` file opens as a checkpoint too (the denoiser's llama.cpp-quantized forms,
+//! Q4_K / Q6_K): its float tensors as such, its k-quant matrices as their raw blocks with `kquant` set.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -7,6 +8,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::dtype::DType;
+use crate::gguf::{GType, Gguf};
 use crate::{Ctx, Error, Result};
 
 /// Where one tensor lives in the file.
@@ -18,6 +20,19 @@ pub struct Entry {
     /// Absolute byte offset in the file.
     pub offset: u64,
     pub bytes: usize,
+    /// A llama.cpp k-quant (a GGUF file's Q4_K / Q6_K matrix): `bytes` of its blocks, `dtype` U8, `shape` the
+    /// matrix's own.
+    pub kquant: Option<GType>,
+}
+
+impl Entry {
+    /// The shape of the bytes as they go to the device: a k-quant's blocks are a flat byte buffer.
+    pub fn stored_shape(&self) -> Vec<usize> {
+        match self.kquant {
+            Some(_) => vec![self.bytes],
+            None => self.shape.clone(),
+        }
+    }
 }
 
 /// A checkpoint's table of contents. The file is opened per read; nothing is mapped.
@@ -34,6 +49,9 @@ impl Checkpoint {
         let file_bytes = f.metadata()?.len();
         let mut len8 = [0u8; 8];
         f.read_exact_at(&mut len8, 0).ctx("reading the header length")?;
+        if &len8[..4] == b"GGUF" {
+            return Checkpoint::open_gguf(path, file_bytes);
+        }
         let hlen = u64::from_le_bytes(len8);
         if hlen == 0 || hlen > 256 << 20 || 8 + hlen > file_bytes {
             return Err(Error(format!("{}: not a safetensors file (header length {hlen})", path.display())));
@@ -69,9 +87,32 @@ impl Checkpoint {
             if bytes != shape.iter().product::<usize>() * dtype.size() || base + b > file_bytes {
                 return Err(Error(format!("header entry {name}: byte range does not match its shape")));
             }
-            entries.insert(name.clone(), Entry { name: name.clone(), dtype, shape, offset: base + a, bytes });
+            entries.insert(name.clone(), Entry { name: name.clone(), dtype, shape, offset: base + a, bytes, kquant: None });
         }
         Ok(Checkpoint { path: path.to_path_buf(), entries, metadata, file_bytes })
+    }
+
+    fn open_gguf(path: &Path, file_bytes: u64) -> Result<Checkpoint> {
+        let g = Gguf::open(path)?;
+        let entries = g
+            .entries
+            .into_values()
+            .map(|e| {
+                let (dtype, kquant) = match e.ty {
+                    GType::F32 => (DType::F32, None),
+                    GType::F16 => (DType::F16, None),
+                    GType::BF16 => (DType::BF16, None),
+                    GType::Q4K | GType::Q6K => (DType::U8, Some(e.ty)),
+                };
+                (e.name.clone(), Entry { name: e.name, dtype, shape: e.shape, offset: e.offset, bytes: e.bytes, kquant })
+            })
+            .collect();
+        Ok(Checkpoint { path: path.to_path_buf(), entries, metadata: BTreeMap::new(), file_bytes })
+    }
+
+    /// Whether the block matrices are llama.cpp k-quants (a GGUF denoiser) - and which.
+    pub fn kquant_of(&self, name: &str) -> Option<GType> {
+        self.entries.get(name).and_then(|e| e.kquant)
     }
 
     pub fn get(&self, name: &str) -> Result<&Entry> {

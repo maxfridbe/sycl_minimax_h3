@@ -82,6 +82,7 @@ impl Studio {
         let mut spec = json!({
             "kind": "generate", "prompt": item["prompt"], "width": item["width"], "height": item["height"], "seconds": item["seconds"],
             "steps": item["steps"], "seed": item["seed"], "out": format!("{}/{name}.mp4", self.out_in),
+            "engine": super::queue::engine_name(item["engine"].as_str()),
         });
         let mut resolved = json!({});
         let mode = s(item, "chain_mode");

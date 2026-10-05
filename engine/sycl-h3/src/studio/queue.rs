@@ -123,6 +123,15 @@ pub fn num(p: &Value, key: &str, default: f64, lo: f64, hi: f64, int: bool) -> R
     Ok(if int { json!(v as i64) } else { json!(v) })
 }
 
+/// A request's denoiser -> the engine's name for it: INT8 (the default; the legacy Q8_0 was its counterpart), or a
+/// GGUF form the engine was given (H3_ENGINES: Q6_K, Q4_K_M).
+pub fn engine_name(e: Option<&str>) -> String {
+    match e.map(|e| e.trim().to_uppercase()).filter(|e| !e.is_empty()).as_deref() {
+        None | Some("Q8_0") | Some("INT8") => "INT8".into(),
+        Some(e) => e.to_string(),
+    }
+}
+
 impl Studio {
     /// A request -> a queue item, checked (the legacy `build_item`, plus the engine's new options).
     pub fn build_item(&self, p: &Value) -> Result<Value, RpcError> {
@@ -148,7 +157,7 @@ impl Studio {
         it.insert("seed".into(), num(p, "seed", 0.0, -2147483648.0, 2147483648.0, true)?);
         it.insert("te".into(), json!(te));
         it.insert("label".into(), json!(clean_label(&p.get("label").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default())));
-        it.insert("engine".into(), json!(p.get("engine").and_then(|v| v.as_str()).filter(|e| !e.is_empty()).unwrap_or("Q6_K").to_uppercase()));
+        it.insert("engine".into(), json!(engine_name(p.get("engine").and_then(|v| v.as_str()))));
         it.insert("width".into(), width);
         it.insert("height".into(), height);
         it.insert("chain_mode".into(), json!(chain_mode));

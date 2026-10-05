@@ -1,7 +1,8 @@
 //! `h3d` - the MiniMax H3 engine, inside its container. Not the command a person types: `sycl-h3` (on the host)
 //! starts `h3d daemon` in a container and talks to it over a Unix socket; the daemon starts `h3d worker` per GPU.
 //!
-//!     h3d daemon --socket <path> --model <checkpoint> [--all | --gpu N ...] [--idle 600]
+//!     h3d daemon --socket <path> --model <checkpoint> [--model-name int8] [--engine NAME=PATH ...]
+//!                [--all | --gpu N ...] [--idle 600]
 //!                [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
 //!                                              the engine service (daemon.rs)
 //!     h3d worker --gpu N --model <checkpoint>  the process that holds one GPU (worker.rs); the daemon starts it
@@ -47,7 +48,8 @@ pub(crate) fn version() -> String {
 }
 
 const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
-  h3d daemon --socket <path> --model <checkpoint.safetensors> [--all | --gpu N ...] [--idle 600]
+  h3d daemon --socket <path> --model <checkpoint.safetensors> [--model-name int8] [--engine NAME=PATH ...]
+             [--all | --gpu N ...] [--idle 600]
              [--gpu-lock <file>] [--llm-switcher <url>] [--shared-gpu N ...] [--threads 8]
   h3d worker --gpu N --model <checkpoint.safetensors>
   h3d gpus [--json]
@@ -339,8 +341,27 @@ fn take_repeated(raw: &[String], name: &str) -> Result<(Vec<usize>, Vec<String>)
     Ok((vals, rest))
 }
 
+type Engines = Vec<(String, std::path::PathBuf)>;
+
+/// Every `--engine NAME=PATH`: the other denoiser checkpoints a job may name (`"engine": NAME`).
+fn take_engines(raw: &[String]) -> Result<(Engines, Vec<String>)> {
+    let (mut vals, mut rest) = (Vec::new(), Vec::new());
+    let mut it = raw.iter();
+    while let Some(a) = it.next() {
+        if a == "--engine" {
+            let v = it.next().ok_or("--engine needs NAME=PATH")?;
+            let (n, p) = v.split_once('=').ok_or_else(|| Error(format!("--engine {v}: not NAME=PATH")))?;
+            vals.push((n.to_string(), p.into()));
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    Ok((vals, rest))
+}
+
 fn cmd_daemon(raw: &[String]) -> Result<()> {
-    let (gpus, raw) = take_repeated(raw, "--gpu")?;
+    let (engines, raw) = take_engines(raw)?;
+    let (gpus, raw) = take_repeated(&raw, "--gpu")?;
     let (shared, raw) = take_repeated(&raw, "--shared-gpu")?;
     let all = raw.iter().any(|a| a == "--all");
     let raw: Vec<String> = raw.into_iter().filter(|a| a != "--all").collect();
@@ -354,6 +375,8 @@ fn cmd_daemon(raw: &[String]) -> Result<()> {
     daemon::serve(daemon::Options {
         socket: socket.into(),
         model: model.into(),
+        model_name: args.options.get("model-name").cloned().unwrap_or_else(|| "int8".into()),
+        engines,
         idle: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
         gpu_lock: args.options.get("gpu-lock").map(Into::into),
         llm_switcher: args.options.get("llm-switcher").cloned(),

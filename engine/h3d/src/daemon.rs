@@ -14,6 +14,10 @@
 //!   sycl-h3 web service (its own container) --'                                               (JSON lines)
 //! ```
 //!
+//! The denoiser: `--model` (named `--model-name`, default int8) unless a job names another one given as `--engine
+//! NAME=PATH` (`"engine": "Q4_K_M"`: a GGUF form that holds less of the card). A slot whose worker holds another
+//! denoiser than the job's ends that worker and starts one with the job's; a shared GPU keeps its hooks meanwhile.
+//!
 //! Jobs wait in one queue and run on whichever GPU slot is free, in the order they came - an unshared GPU before a
 //! shared one (below); a job that names a GPU (`"gpu": 1`) waits for that one. A job can be cancelled; it stops at the next block boundary, never inside a kernel
 //! (a GPU process stopped mid-kernel can leave the xe driver stuck).
@@ -55,6 +59,9 @@ pub struct Options {
     /// The Unix socket the API answers on.
     pub socket: PathBuf,
     pub model: PathBuf,
+    /// `model`'s name for jobs (`"engine"`), and the other denoisers by name
+    pub model_name: String,
+    pub engines: Vec<(String, PathBuf)>,
     /// The GPUs to serve (indices of `h3 gpus`); `None`: every one there is.
     pub gpus: Option<Vec<usize>>,
     /// The GPUs the hooks below are about; `None`: every served GPU.
@@ -76,6 +83,8 @@ struct Proc {
     events: mpsc::Receiver<Value>,
     /// it holds a share of the hooks (lock file, the front end's model)
     shared: bool,
+    /// the denoiser it loaded (an engine name)
+    engine: String,
 }
 
 struct JobRec {
@@ -112,6 +121,29 @@ impl JobRec {
     fn wants_gpu(&self) -> Option<usize> {
         self.spec.get("gpu").and_then(|g| g.as_u64()).map(|g| g as usize)
     }
+}
+
+impl Options {
+    /// The denoiser checkpoint for an engine name (`None`: the default).
+    fn engine_path(&self, name: Option<&str>) -> Option<(String, PathBuf)> {
+        match name {
+            None => Some((self.model_name.clone(), self.model.clone())),
+            Some(n) if n == self.model_name => Some((self.model_name.clone(), self.model.clone())),
+            Some(n) => self.engines.iter().find(|(e, _)| e == n).cloned(),
+        }
+    }
+    /// The name of the engine a worker reported loading (its `model` path).
+    fn engine_of_path(&self, model: Option<&Value>) -> Option<String> {
+        let m = PathBuf::from(model?.as_str()?);
+        self.engine_names().into_iter().find(|n| self.engine_path(Some(n)).is_some_and(|(_, p)| p == m))
+    }
+    fn engine_names(&self) -> Vec<String> {
+        std::iter::once(self.model_name.clone()).chain(self.engines.iter().map(|(n, _)| n.clone())).collect()
+    }
+}
+
+fn job_engine(spec: &Value) -> Option<&str> {
+    spec.get("engine").and_then(|e| e.as_str())
 }
 
 /// One GPU and the engine process on it.
@@ -261,17 +293,19 @@ impl Daemon {
 
     /// Hooks (cheap, no GPU) when the slot's GPU is shared, then the engine process on that GPU, which waits for the
     /// card's memory and loads.
-    fn start_worker(&self, k: usize, cancel: &AtomicBool) -> Result<Proc> {
+    /// `held`: the slot's share of the hooks is still taken (a worker with another denoiser just ended).
+    fn start_worker(&self, k: usize, cancel: &AtomicBool, engine: &str, held: bool) -> Result<Proc> {
         let (gpu, shared) = {
             let s = self.s.lock().unwrap();
             (s.slots[k].gpu, s.slots[k].shared)
         };
-        if shared {
+        let (engine, model) = self.opts.engine_path(Some(engine)).ok_or_else(|| Error(format!("no engine {engine:?}")))?;
+        if shared && !held {
             self.acquire_hooks(k, cancel)?;
         }
         let spawned = Command::new(std::env::current_exe()?)
             .args(["worker", "--gpu", &gpu.to_string(), "--model"])
-            .arg(&self.opts.model)
+            .arg(&model)
             .args(["--threads", &self.opts.threads.to_string()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -301,7 +335,7 @@ impl Daemon {
         let stdin = child.stdin.take().unwrap();
         self.set_engine(k, "starting the engine process");
         self.s.lock().unwrap().slots[k].worker_pid = Some(child.id());
-        Ok(Proc { child, stdin, events, shared })
+        Ok(Proc { child, stdin, events, shared, engine })
     }
 
     /// What a worker said that is not about a job's result.
@@ -328,8 +362,9 @@ impl Daemon {
         }
     }
 
-    /// After a worker ended (asked or not): the slot forgets it, the hooks get their share back.
-    fn worker_gone(&self, k: usize, p: Proc) {
+    /// After a worker ended (asked or not): the slot forgets it, the hooks get their share back (unless `keep`: another
+    /// worker follows at once).
+    fn worker_gone(&self, k: usize, p: Proc, keep: bool) {
         {
             let mut s = self.s.lock().unwrap();
             let sl = &mut s.slots[k];
@@ -340,7 +375,7 @@ impl Daemon {
         self.set_engine(k, "unloaded");
         // the hooks last: the model switcher starts its model only once our status shows the card free (2026-10-05:
         // released first, the studio still saw this worker and left the chat model off until its idle watchdog)
-        if p.shared {
+        if p.shared && !keep {
             self.release_hooks();
         }
     }
@@ -348,6 +383,10 @@ impl Daemon {
     /// Ends a worker: asks it to exit (it finishes the kernel it is in, unloads, ends) and waits for it. Never a kill:
     /// a GPU process stopped mid-kernel can leave the driver stuck.
     fn stop_worker(&self, k: usize, proc: &mut Option<Proc>) {
+        self.end_worker(k, proc, false);
+    }
+
+    fn end_worker(&self, k: usize, proc: &mut Option<Proc>, keep_hooks: bool) {
         let Some(mut p) = proc.take() else { return };
         self.set_engine(k, "unloading");
         let _ = writeln!(p.stdin, "{}", json!({"exit": true}));
@@ -357,21 +396,36 @@ impl Daemon {
         }
         let status = p.child.wait();
         eprintln!("[gpu {k}] the engine process ended ({})", status.map_or("unknown".into(), |s| s.to_string()));
-        self.worker_gone(k, p);
+        self.worker_gone(k, p, keep_hooks);
     }
 
     /// A worker that ended on its own (a crash): clean up after it.
     fn reap_if_dead(&self, k: usize, proc: &mut Option<Proc>) -> Option<String> {
         let status = proc.as_mut()?.child.try_wait().ok()??;
         let p = proc.take().unwrap();
-        self.worker_gone(k, p);
+        self.worker_gone(k, p, false);
         Some(format!("the engine process ended unexpectedly ({status})"))
     }
 
     /// Hands a job to the slot's worker and relays its events until the result.
     fn run_job(&self, k: usize, proc: &mut Option<Proc>, id: u64, spec: &Value, cancel: &AtomicBool) -> std::result::Result<Value, String> {
+        let want = self.opts.engine_path(job_engine(spec)).map(|(n, _)| n).ok_or("no such engine")?;
+        let mut held = false;
+        if let Some(p) = proc.as_ref().filter(|p| p.engine != want) {
+            self.log_job(id, format!("engine : the GPU holds {}; loading {want} instead", p.engine));
+            held = p.shared;
+            self.end_worker(k, proc, true);
+        }
         if proc.is_none() {
-            *proc = Some(self.start_worker(k, cancel).map_err(|e| e.0)?);
+            match self.start_worker(k, cancel, &want, held) {
+                Ok(p) => *proc = Some(p),
+                Err(e) => {
+                    if held {
+                        self.release_hooks();
+                    }
+                    return Err(e.0);
+                }
+            }
         }
         let p = proc.as_mut().unwrap();
         writeln!(p.stdin, "{}", json!({"job": id, "spec": spec})).map_err(|e| format!("the engine process does not listen: {e}"))?;
@@ -542,13 +596,15 @@ impl Daemon {
                     };
                     gpus.push(json!({
                         "gpu": sl.gpu, "name": sl.name, "pci": sl.pci, "mem_gib": sl.mem_gib, "shared": sl.shared,
-                        "engine": sl.engine, "info": sl.info,
+                        "engine": sl.engine, "info": sl.info, "denoiser": self.opts.engine_of_path(sl.info.get("model")),
                         "worker": sl.worker_pid.map(|pid| json!({"pid": pid, "rss_gib": rss_gib(pid)})),
                         "busy_pct": busy, "engine_gib": sl.stats["gib_in_use"], "cap_gib": sl.stats["gib_cap"],
                         "card_free_gib": sl.stats["gib_free_card"], "running": running,
                         "idle_seconds": if sl.running.is_some() { 0 } else { idle }, "unload_in_seconds": unload_in}));
                 }
-                (200, json!({"version": crate::version(), "model": self.opts.model, "gpus": gpus,
+                (200, json!({"version": crate::version(), "model": self.opts.model, "engines": self.opts.engine_names().iter().filter_map(|n| self.opts.engine_path(Some(n))).map(|(n, p)| json!({
+                                 "name": n, "path": p, "gib": std::fs::metadata(&p).map_or(0.0, |m| m.len() as f64 / (1u64 << 30) as f64),
+                                 "default": n == self.opts.model_name})).collect::<Vec<_>>(), "gpus": gpus,
                              "queued": s.queue.iter().collect::<Vec<_>>(),
                              "unload_after_idle_seconds": self.opts.idle.map(|d| d.as_secs())}))
             }
@@ -576,6 +632,11 @@ impl Daemon {
                 }
                 if body.get("kind").and_then(|k| k.as_str()).is_none() {
                     return (400, json!({"error": "a job needs a \"kind\" (bench-blocks, check-block, denoise, decode, encode, generate)"}));
+                }
+                if let Some(e) = body.get("engine") {
+                    if !e.as_str().is_some_and(|e| self.opts.engine_path(Some(e)).is_some()) {
+                        return (400, json!({"error": format!("\"engine\": {e} is not one this daemon has ({:?})", self.opts.engine_names())}));
+                    }
                 }
                 if let Some(g) = body.get("gpu") {
                     let served: Vec<usize> = s.slots.iter().map(|sl| sl.gpu).collect();
@@ -665,8 +726,10 @@ fn list_gpus() -> Result<Vec<Value>> {
 }
 
 pub fn serve(opts: Options) -> Result<()> {
-    if !opts.model.exists() {
-        return Err(Error(format!("{}: no such checkpoint", opts.model.display())));
+    for (name, path) in std::iter::once((&opts.model_name, &opts.model)).chain(opts.engines.iter().map(|(n, p)| (n, p))) {
+        if !path.exists() {
+            return Err(Error(format!("{}: no such checkpoint (engine {name})", path.display())));
+        }
     }
     let found = list_gpus().unwrap_or_else(|e| {
         eprintln!("[daemon] {e}: serving GPU 0 blind");
@@ -712,6 +775,9 @@ pub fn serve(opts: Options) -> Result<()> {
     let listener = UnixListener::bind(&opts.socket).map_err(|e| Error(format!("cannot listen on {}: {e}", opts.socket.display())))?;
     eprintln!("h3d {} on {} - model {} (loaded on the first job){}", crate::version(), opts.socket.display(), opts.model.display(),
               opts.idle.map_or(String::new(), |d| format!(", unloaded after {} s idle", d.as_secs())));
+    for (name, path) in &opts.engines {
+        eprintln!("  engine {name}: {}", path.display());
+    }
     for sl in &slots {
         eprintln!("  GPU {}: {} ({:.0} GiB{}){}", sl.gpu, sl.name, sl.mem_gib,
                   if sl.pci.is_empty() { String::new() } else { format!(", {}", sl.pci) },

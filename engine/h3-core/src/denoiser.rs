@@ -36,10 +36,15 @@ const PATCH: usize = 2;
 /// The final layer runs over the streams' rows this many at a time, so its float32 intermediates stay small.
 const FINAL_CHUNK: usize = 4096;
 
-/// A tensor as stored (its own type), on the device.
-fn raw(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
+/// A weight as float32, on the device: the int8 checkpoint stores these in float32; a GGUF one in half, or as a
+/// k-quant (expanded on the device).
+fn f32_weight(dev: &Arc<Device>, ck: &Checkpoint, name: &str) -> Result<Tensor> {
     let e = ck.get(name)?;
-    Tensor::from_bytes(dev, e.dtype, &e.shape, &ck.read(name)?)
+    let bytes = ck.read(name)?;
+    match e.kquant {
+        Some(kind) => ops::expand(&Tensor::from_bytes(dev, DType::U8, &[e.bytes], &bytes)?, kind, &e.shape, DType::F32),
+        None => Tensor::from_bytes(dev, DType::F32, &e.shape, &f32_bytes(&crate::dtype::bytes_to_f32(&bytes, e.dtype)?)),
+    }
 }
 
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
@@ -72,7 +77,7 @@ pub struct Outer {
 impl Outer {
     pub fn load(dev: &Arc<Device>, ck: &Checkpoint) -> Result<Outer> {
         let linear = |name: &str| -> Result<Linear> {
-            Ok(Linear { weight: raw(dev, ck, &format!("{name}.weight"))?, bias: Some(small(dev, ck, &format!("{name}.bias"))?) })
+            Ok(Linear { weight: f32_weight(dev, ck, &format!("{name}.weight"))?, bias: Some(small(dev, ck, &format!("{name}.bias"))?) })
         };
         let video_patch = linear("video_patch_proj")?;
         let audio_patch = linear("audio_patch_proj")?;
@@ -143,6 +148,15 @@ impl TextRefiner {
                 || name.strip_prefix("token_refiner.blocks.").and_then(|r| r.split_once('.')).is_some_and(|(_, t)| LIN.iter().any(|l| t == format!("{l}.weight")))
         };
         let mut big = load::load(dev, ck, threads, wanted).ctx("loading the text refiner")?.tensors;
+        // a GGUF checkpoint's k-quant matrices: expanded to bfloat16 here (the int8 checkpoint stores them so)
+        for (name, t) in big.iter_mut() {
+            let e = ck.get(name)?;
+            if let Some(kind) = e.kquant {
+                *t = ops::expand(t, kind, &e.shape, DType::BF16)?;
+            } else if e.dtype != DType::BF16 {
+                return Err(Error(format!("{name}: the text refiner's matrices are expected in bfloat16 or a k-quant, not {:?}", e.dtype)));
+            }
+        }
         let mut take = |k: String| big.remove(&k).ok_or_else(|| Error(format!("{k} was not loaded")));
         let proj = Linear { weight: take("condition_proj.weight".into())?, bias: Some(small(dev, ck, "condition_proj.bias")?) };
         let n = ck.entries.keys().filter_map(|k| k.strip_prefix("token_refiner.blocks.")?.split('.').next()?.parse::<usize>().ok()).max().map_or(0, |m| m + 1);

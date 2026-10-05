@@ -14,13 +14,19 @@
 //! ```
 //!
 //! The six tables come from a small linear on the timestep embedding, computed on the host once per step.
+//!
+//! The four block matrices come in two forms: int8 (ComfyUI's `int8_convrot` safetensors, int8 GEMMs) or a
+//! llama.cpp k-quant (the GGUF denoisers, Q4_K / Q6_K: expanded to bfloat16 one matrix at a time, then a 16-bit
+//! GEMM). The k-quants hold less of the card (Q4_K 10.6 GiB, Q6_K 15.4, int8 19.5), which leaves the room for
+//! longer sequences; the int8 form computes faster.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::device::{Device, Tensor};
 use crate::dtype::{bytes_to_f32, DType};
-use crate::ops::{self, Int8Linear, Mod, Rows};
+use crate::gguf::GType;
+use crate::ops::{self, Int8Linear, KLinear, Mod, Rows};
 use crate::safetensors::Checkpoint;
 use crate::{load, Ctx, Error, Result};
 
@@ -72,16 +78,31 @@ impl Config {
     }
 }
 
+/// A block matrix in either of the checkpoint forms.
+pub enum Weight {
+    I8(Int8Linear),
+    K(KLinear),
+}
+
+impl Weight {
+    fn size(&self) -> (usize, usize) {
+        match self {
+            Weight::I8(l) => (l.outputs(), l.inputs()),
+            Weight::K(l) => (l.n, l.k),
+        }
+    }
+}
+
 /// One block's weights, on the device (the big ones) and on the host (the small table projection).
 pub struct Block {
     norm1: Tensor,
     norm2: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
-    qkv: Int8Linear,
-    out_proj: Int8Linear,
-    fc1: Int8Linear,
-    fc2: Int8Linear,
+    qkv: Weight,
+    out_proj: Weight,
+    fc1: Weight,
+    fc2: Weight,
     /// [6 * hidden * modalities, t_dim] and its bias
     adaln_w: Vec<f32>,
     adaln_b: Vec<f32>,
@@ -104,11 +125,16 @@ impl Block {
     /// `big`: the int8 weights and their scales, already on the device (see `Blocks::load`).
     fn assemble(dev: &Arc<Device>, ck: &Checkpoint, index: usize, big: &mut BTreeMap<String, Tensor>) -> Result<Block> {
         let p = format!("blocks.{index}");
-        let mut linear = |l: &str| -> Result<Int8Linear> {
+        let mut linear = |l: &str| -> Result<Weight> {
             let name = format!("{p}.{l}");
-            let q = ck.quant(&name)?.ok_or_else(|| Error(format!("{name} has no quantization record: not an int8 checkpoint")))?;
             let mut take = |k: String| big.remove(&k).ok_or_else(|| Error(format!("{k} was not loaded")));
-            Ok(Int8Linear { weight: take(format!("{name}.weight"))?, scale: take(format!("{name}.weight_scale"))?, bias: None, group: q.convrot.then_some(q.group) })
+            let wn = format!("{name}.weight");
+            if let Some(kind) = ck.kquant_of(&wn) {
+                let shape = ck.get(&wn)?.shape.clone();
+                return Ok(Weight::K(KLinear { blocks: take(wn)?, kind, n: shape[0], k: shape[1] }));
+            }
+            let q = ck.quant(&name)?.ok_or_else(|| Error(format!("{name} has no quantization record: neither an int8 nor a k-quant checkpoint")))?;
+            Ok(Weight::I8(Int8Linear { weight: take(wn)?, scale: take(format!("{name}.weight_scale"))?, bias: None, group: q.convrot.then_some(q.group) }))
         };
         Ok(Block {
             qkv: linear(LINEARS[0])?,
@@ -258,6 +284,9 @@ pub struct Blocks {
     pub blocks: Vec<Block>,
     pub load_seconds: f64,
     pub load_bytes: u64,
+    /// the k-quant form's (`None` for int8): which, and the bfloat16 buffer each matrix is expanded into
+    pub kquant: Option<GType>,
+    wbuf: Option<Tensor>,
 }
 
 impl Blocks {
@@ -276,7 +305,23 @@ impl Blocks {
         for i in 0..n {
             blocks.push(Block::assemble(dev, ck, i, &mut loaded.tensors).ctx(format!("block {i}"))?);
         }
-        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes })
+        let kquant = ck.kquant_of("blocks.0.mlp.fc1.weight");
+        let wbuf = match kquant {
+            Some(_) => {
+                let most = blocks.iter().flat_map(|b| [&b.qkv, &b.out_proj, &b.fc1, &b.fc2]).map(|w| { let (n, k) = w.size(); n * k }).max().unwrap_or(0);
+                Some(Tensor::new(dev, DType::BF16, &[most]).ctx("the buffer the k-quant matrices expand into")?)
+            }
+            None => None,
+        };
+        Ok(Blocks { cfg, blocks, load_seconds: loaded.seconds, load_bytes: loaded.bytes, kquant, wbuf })
+    }
+
+    /// `out = linear(x)` with one of the blocks' matrices.
+    fn mm(&self, w: &Weight, x: &Tensor, out: &Tensor) -> Result<()> {
+        match w {
+            Weight::I8(l) => l.forward(x, out),
+            Weight::K(l) => l.forward(x, out, self.wbuf.as_ref().ok_or("a k-quant matrix without its expansion buffer")?),
+        }
     }
 
     /// Runs block `index` on the stream `x` [S, hidden], in place.
@@ -294,7 +339,7 @@ impl Blocks {
         // attention half
         ops::rms_norm_mod(x, &b.norm1, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_a, shift: shift_a }), &s.h)?;
         tap("h1", &s.h)?;
-        b.qkv.forward(&s.h, &s.qkv)?;
+        self.mm(&b.qkv, &s.h, &s.qkv)?;
         side(lora, 0, &s.h, &s.qkv, &s.lora)?;
         tap("qkv", &s.qkv)?;
         let w = cfg.heads * cfg.head_dim;
@@ -304,7 +349,7 @@ impl Blocks {
         tap("qkv_rotated", &s.qkv)?;
         ops::attention(part(0), part(1), part(2), &s.att)?;
         tap("att", &s.att)?;
-        b.out_proj.forward(&s.att, &s.proj)?;
+        self.mm(&b.out_proj, &s.att, &s.proj)?;
         side(lora, 1, &s.att, &s.proj, &s.lora)?;
         tap("attn_out", &s.proj)?;
         ops::gate_add(x, &s.proj, &step.rows, gate_a)?;
@@ -312,11 +357,11 @@ impl Blocks {
         // MLP half
         ops::rms_norm_mod(x, &b.norm2, cfg.norm_eps, Some(&Mod { rows: &step.rows, scale: scale_m, shift: shift_m }), &s.h)?;
         tap("h2", &s.h)?;
-        b.fc1.forward(&s.h, &s.fc1)?;
+        self.mm(&b.fc1, &s.h, &s.fc1)?;
         side(lora, 2, &s.h, &s.fc1, &s.lora)?;
         tap("fc1", &s.fc1)?;
         ops::swiglu(&s.fc1, &s.act)?;
-        b.fc2.forward(&s.act, &s.proj)?;
+        self.mm(&b.fc2, &s.act, &s.proj)?;
         side(lora, 3, &s.act, &s.proj, &s.lora)?;
         tap("mlp", &s.proj)?;
         ops::gate_add(x, &s.proj, &step.rows, gate_m)?;
