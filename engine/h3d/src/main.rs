@@ -43,8 +43,8 @@ use h3_core::{load, reference, Error, Result};
 
 /// The repository's version, yy.mmdd.### (Cargo carries it without the leading zeros).
 pub(crate) fn version() -> String {
-    let p: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|x| x.parse().unwrap_or(0)).collect();
-    format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
+    // yy.mmdd.### from git (version.sh), handed in by build.sh; "dev" for a build without it
+    option_env!("H3_VERSION").unwrap_or("dev").to_string()
 }
 
 const USAGE: &str = "usage (the daemon side; people use sycl-h3 on the host):
@@ -423,13 +423,5 @@ fn main() -> ExitCode {
             eprintln!("h3d: {e}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn version_matches_the_version_file() {
-        assert_eq!(super::version(), include_str!("../../../VERSION").trim());
     }
 }

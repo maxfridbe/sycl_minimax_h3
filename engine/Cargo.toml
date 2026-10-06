@@ -2,11 +2,10 @@
 resolver = "2"
 members = ["h3-sys", "h3-core", "h3-http", "h3d", "sycl-h3"]
 
-# The repository's version is yy.mmdd.### (the VERSION file): year, month and day, then the day's sequence number.
-# Cargo wants it without leading zeros, so 26.1002.001 is written 26.1002.1 here; `h3 version` prints the full form,
-# and a test keeps this line and VERSION in step.
+# The release version is not kept here: it is yy.mmdd.### from git (version.sh), which build.sh hands to cargo as
+# H3_VERSION and `sycl-h3 version` prints.
 [workspace.package]
-version = "26.1002.1"
+version = "0.0.0"
 edition = "2021"
 
 [profile.release]

@@ -1,8 +1,10 @@
 # Build everything in the project's own container, test it, and publish.
 #
 #   every push (any branch) and pull request   build image -> ./build.sh -> ./build.sh test -> tarball artifact
-#   pushes to main                also publish the build image to the GitHub container registry
-#   tags v<VERSION>               also publish a GitHub release with the tarball (e.g. v26.1002.001)
+#   pushes to the default branch  also publish the build image to the GitHub container registry, and a GitHub
+#                                 release v<version> with the tarball
+#
+# The version is yy.mmdd.### from git (./version.sh): the commit's date, then its number among that day's commits.
 #
 # No GPU is needed: the SYCL kernels are compiled ahead of use and the Rust tests run on the CPU. What needs the card
 # (check-linear, check-block, bench-blocks) is run by hand on a machine that has one.
@@ -11,7 +13,6 @@ name: build
 on:
   push:
     branches: ["**"]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -28,6 +29,13 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version.sh counts the day's commits
+
+      - name: Version
+        run: |
+          echo "H3_VERSION=$(./version.sh)" >> "$GITHUB_ENV"
+          ./version.sh
 
       - name: Free disk space (the build image is about 10 GB)
         run: |
@@ -57,9 +65,10 @@ jobs:
 
       - name: Package
         run: |
-          name="h3-engine-$(cat VERSION)-linux-x86_64"
+          name="h3-engine-$H3_VERSION-linux-x86_64"
           mkdir -p "pkg/$name"
-          cp -r dist/sycl-h3 dist/h3d dist/libh3sycl.so dist/libh3sage.so dist/libdnnl.so.3 dist/wfe kernels/h3sycl.h README.md VERSION "pkg/$name/"
+          cp -r dist/sycl-h3 dist/h3d dist/libh3sycl.so dist/libh3sage.so dist/libdnnl.so.3 dist/wfe kernels/h3sycl.h README.md "pkg/$name/"
+          echo "$H3_VERSION" > "pkg/$name/VERSION"
           tar -C pkg -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           echo "PKG=$name.tar.gz" >> "$GITHUB_ENV"
@@ -73,20 +82,18 @@ jobs:
             ${{ env.PKG }}.sha256
 
       - name: Publish the build image
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         run: |
           podman tag h3-build "$IMAGE_REF:$IMAGE_TAG"
           podman push "$IMAGE_REF:$IMAGE_TAG"
-          if [ "$GITHUB_REF" = refs/heads/main ]; then
-            podman tag h3-build "$IMAGE_REF:latest"
-            podman push "$IMAGE_REF:latest"
-          fi
+          podman tag h3-build "$IMAGE_REF:latest"
+          podman push "$IMAGE_REF:latest"
 
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # a release is cut by tagging v<VERSION>; the tag and the VERSION file must agree
-          [ "$GITHUB_REF_NAME" = "v$(cat VERSION)" ] || { echo "tag $GITHUB_REF_NAME is not v$(cat VERSION)"; exit 1; }
-          gh release create "$GITHUB_REF_NAME" "$PKG" "$PKG.sha256" --title "$(cat VERSION)" --generate-notes
+          # every push to the default branch is a release, tagged v<version> on the commit built
+          if gh release view "v$H3_VERSION" >/dev/null 2>&1; then echo "v$H3_VERSION is out already"; exit 0; fi
+          gh release create "v$H3_VERSION" "$PKG" "$PKG.sha256" --target "$GITHUB_SHA" --title "$H3_VERSION" --generate-notes

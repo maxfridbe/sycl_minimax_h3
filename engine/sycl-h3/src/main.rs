@@ -31,8 +31,8 @@ use config::Config;
 use container::{mount, Ce, ENGINE, SOCKET_DIR_IN};
 
 pub(crate) fn version() -> String {
-    let p: Vec<u32> = env!("CARGO_PKG_VERSION").split('.').map(|x| x.parse().unwrap_or(0)).collect();
-    format!("{:02}.{:04}.{:03}", p[0], p[1], p[2])
+    // yy.mmdd.### from git (version.sh), handed in by build.sh; "dev" for a build without it
+    option_env!("H3_VERSION").unwrap_or("dev").to_string()
 }
 
 const USAGE: &str = "sycl-h3 - MiniMax H3 on Intel Arc GPUs
@@ -469,11 +469,6 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn version_matches_the_version_file() {
-        assert_eq!(super::version(), include_str!("../../../VERSION").trim());
-    }
-
     #[test]
     fn repeated_options() {
         let raw: Vec<String> = ["--gpu", "0", "--x", "--gpu", "1"].iter().map(|s| s.to_string()).collect();

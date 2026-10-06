@@ -236,12 +236,12 @@ For measuring and debugging the engine itself, `./run.sh` runs one-shot checks i
 
 ### Versions and releases
 
-The version is `yy.mmdd.###` - year, month and day, then that day's sequence number - and lives in the `VERSION`
-file (`sycl-h3 version` prints it; a test keeps Cargo's copy in step). `.github/workflows/build.yml` builds the image,
-runs `./build.sh` and `./build.sh test` on every push and pull request and keeps the result as a workflow artifact;
-on `main` it also publishes the build image to the GitHub container registry, and on a tag `v<VERSION>` it publishes
-a release with `h3-engine-<VERSION>-linux-x86_64.tar.gz` (sycl-h3, h3d, the kernel libraries with their oneDNN, the
-built front end).
+The version is `yy.mmdd.###` - the commit's date (UTC), then its number among that day's commits - and comes from
+git: `./version.sh` prints it (with `-dirty` for uncommitted changes), `./build.sh` builds it in, `sycl-h3 version`
+prints it. There is no file to bump. `.github/workflows/build.yml` builds the image, runs `./build.sh` and
+`./build.sh test` on every push and pull request and keeps the result as a workflow artifact; on the default branch
+it also publishes the build image to the GitHub container registry and a release `v<version>` with
+`h3-engine-<version>-linux-x86_64.tar.gz` (sycl-h3, h3d, the kernel libraries with their oneDNN, the built front end).
 
 One model per GPU: Intel's `xe` driver has no out-of-memory error, an over-committed card stalls the whole machine.
 The engine counts its own allocations and refuses to pass 94% of the card; do not start it beside another program
