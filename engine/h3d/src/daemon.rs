@@ -303,7 +303,7 @@ impl Daemon {
         if shared && !held {
             self.acquire_hooks(k, cancel)?;
         }
-        let spawned = Command::new(std::env::current_exe()?)
+        let spawned = Command::new(program()?)
             .args(["worker", "--gpu", &gpu.to_string(), "--model"])
             .arg(&model)
             .args(["--threads", &self.opts.threads.to_string()])
@@ -715,9 +715,18 @@ impl Daemon {
     }
 }
 
+/// This program, to start workers with: the path it was started by (a rebuild renames a new h3d over it, which the next
+/// worker then runs; `current_exe` would name the replaced file, deleted - "No such file or directory")
+fn program() -> Result<std::path::PathBuf> {
+    match std::env::args_os().next().map(std::path::PathBuf::from) {
+        Some(p) if p.is_absolute() && p.exists() => Ok(p),
+        _ => Ok(std::env::current_exe()?),
+    }
+}
+
 /// The GPUs there are, asked of a short-lived `h3d gpus --json` (the daemon itself does not start the GPU runtime).
 fn list_gpus() -> Result<Vec<Value>> {
-    let out = Command::new(std::env::current_exe()?).args(["gpus", "--json"]).stderr(Stdio::inherit()).output()?;
+    let out = Command::new(program()?).args(["gpus", "--json"]).stderr(Stdio::inherit()).output()?;
     if !out.status.success() {
         return Err(Error("cannot list the GPUs (h3d gpus failed)".into()));
     }
