@@ -1,8 +1,8 @@
 # The port: what moves where
 
 The rule: **the arithmetic on the GPU is SYCL (C++), everything else is Rust, and the web front end is TypeScript/TSX
-on snabbdom, as it was.** No Python in the engine. The Python under `reference/` drives the *existing* PyTorch
-pipeline so that every ported piece can be compared against it; it goes away when the port has parity.
+on snabbdom, as it was.** No Python in the engine. A Python harness (kept outside this repository) drove the
+*existing* PyTorch pipeline so that every ported piece could be compared against it.
 
 `done` = runs on the card and is checked against a reference. `next` = being worked on. Everything else is open.
 
@@ -35,7 +35,7 @@ pipeline so that every ported piece can be compared against it; it goes away whe
 | tokenizer (text-to-video presentation: the raw prompt) | transformers `Qwen2Tokenizer` | `h3-core::tokenizer` | done: identical ids (picture/video prompts with vision blocks: open) |
 | mp4 writing | PyAV | ffmpeg subprocess from Rust (`h3d/media.rs`) | done |
 | job queue, HTTP API, LLM mode switching | `server.py` | `sycl-h3 serve` = the studio (`engine/sycl-h3/src/studio`) on the daemon | done, checked end to end beside the legacy server (docs/LEGACY-API.md) |
-| film tools (speech queue, scene runner, joiner, speech %) | `h3cli/tools/*.py` | `sycl-h3 speech / scene / join / speechpct` | done (data/borg/patter queues: superseded by speech and scene files) |
+| film tools (speech queue, scene runner, joiner, speech %) | `h3cli/tools/*.py` | `sycl-h3 speech / scene / join / speechpct` | done (the legacy queue files: superseded by speech and scene files) |
 | web front end | TSX + snabbdom | `wfe/` unchanged | done (served by the studio) |
 
 ## Order
@@ -44,7 +44,7 @@ By what a clip's time is made of (docs/BASELINE.md): the denoiser is ~75% of a p
 of the denoiser at production size. So:
 
 1. **The denoiser, complete, in Rust + SYCL**, checked step by step against tensors dumped from the reference
-   (`reference/h3x.py`, `H3X_DUMP_STEPS`). This is where the time is, and it needs no part of PyTorch once the
+   (the reference pipeline's step dumps). This is where the time is, and it needs no part of PyTorch once the
    conditioning and the starting noise are read from files.
 2. **Attention** inside it: oneDNN's fused attention first (what PyTorch reaches), then our own kernel, then the
    block-sparse form the model family was trained to tolerate - each with a clip to look at.

@@ -25,9 +25,8 @@ anchors, voice references, masked regeneration, LoRAs, the studio and the film t
   command line, and the server.
 - **TypeScript / TSX on snabbdom** for the web front end - `wfe/`, unchanged from the one in use.
 
-Each piece is checked against the running PyTorch pipeline (`reference/`) before it replaces it: numerically, and
-with a pair of clips to look at and listen to. `reference/` is the only Python here; it drives the old pipeline for
-those comparisons and is deleted when the port has parity. The plan and its state: [docs/PORT-PLAN.md](docs/PORT-PLAN.md).
+Each piece was checked against the running PyTorch pipeline before it replaced it: numerically, and with a pair of
+clips to look at and listen to. That comparison harness is not part of this repository: the port has parity. The plan and its state: [docs/PORT-PLAN.md](docs/PORT-PLAN.md).
 
 ## Timings on a B70
 
@@ -37,7 +36,7 @@ production path it replaced (Q8 GGUF, `torch.compile`: 286 s for the clip below)
 
 ### A whole clip, prompt to .mp4, in the engine
 
-"Goodnight Borg" (`reference/prompts/borg_goodnight_5s.txt`, 356 tokens), the production recipe: 768x576 sampled,
+A 5-second dialogue prompt (356 tokens), the production recipe: 768x576 sampled,
 5 s (124 frames), 8 steps, the realism LoRA at 0.5, a 1.5x latent upscale to 1152x864, sound. `h3d generate`:
 
 | | reference | this engine | |
@@ -55,7 +54,7 @@ roughly a third of what the card does on a bare matrix product - the next thing 
 
 ### A film: five chained clips through the studio
 
-"Goodnight Borg" part 1, clips 1-5 (54.9 s of clips: 15.1, 14.4, 13.7, 7.3 and 4.5 s), each anchored on the first
+A five-clip dialogue scene (54.9 s of clips: 15.1, 14.4, 13.7, 7.3 and 4.5 s), each anchored on the first
 clip's last frame at both ends and on the previous clip's last second of sound; 768x576 -> 1.5x, 8 steps, the
 realism LoRA. Queued in the studio, joined by `sycl-h3 join` (anchor overlaps, -18 LUFS, sync checked); measured
 while Sage also ran the video decoder, which now stays on oneDNN (~1 s faster per second of video):
@@ -68,7 +67,7 @@ while Sage also ran the video decoder, which now stays on oneDNN (~1 s faster pe
 
 ### Each piece against the reference
 
-Every piece was checked against the reference on the same inputs (`reference/` dumps them):
+Every piece was checked against the reference pipeline on the same inputs (its dumps):
 
 | piece | agreement | reference | this engine |
 |---|---|---:|---:|
@@ -149,8 +148,8 @@ clip on that GPU (a clip's step is the 50 blocks plus its embeddings, final laye
     tokenizer/    the Qwen2 tokenizer's vocabulary and merges (Apache-2.0)
     wfe/          the web front end (TSX + snabbdom, vendored compiler, no node_modules)
     container/    the build-and-run image (podman)
-    tools/        examples for the studio's configuration (characters for sycl-h3 speech, language-model modes)
-    reference/    the PyTorch pipeline's harness, for comparisons only
+    tools/        examples for the studio's configuration (characters for sycl-h3 speech, language-model modes), and
+                  esrgan_to_safetensors.py (an ESRGAN network's weights for the pixel upscaler)
     docs/
 
 ## Build and run
@@ -262,4 +261,3 @@ never with a kill.
 | [docs/BASELINE.md](docs/BASELINE.md) | the reference pipeline's numbers and where a step's time goes |
 | [docs/LESSONS-FROM-STRATA.md](docs/LESSONS-FROM-STRATA.md) | what an earlier SYCL port on this card taught |
 | [docs/ASSESSMENT.md](docs/ASSESSMENT.md) | the first assessment (before the measurements; kept for the record) |
-| [reference/README.md](reference/README.md) | the comparison harness |

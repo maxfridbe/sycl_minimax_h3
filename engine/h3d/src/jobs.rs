@@ -105,7 +105,7 @@ fn columns(v: &[f32], stride: usize, from: usize, width: usize) -> Vec<f32> {
     v.chunks_exact(stride).flat_map(|r| r[from..from + width].iter().copied()).collect()
 }
 
-/// The denoiser's blocks against a dump of the reference pipeline (reference/h3x.py, H3X_DUMP_BLOCK): the host-side
+/// The denoiser's blocks against a dump of the reference pipeline (the PyTorch reference pipeline's block dump): the host-side
 /// tables, every stage of block 0, then the stream after later blocks. Fails when the result drifts.
 pub fn check_block(e: &Engine, dump_path: &Path, ctl: &mut Ctl) -> Result<Value> {
     let dump = Checkpoint::open(dump_path)?;
@@ -295,7 +295,7 @@ pub fn bench_blocks(e: &Engine, tokens: usize, blocks: Option<usize>, ctl: &mut 
               "gib_in_use": gib(dev.mem_used()), "stages_ms_per_block": out}))
 }
 
-/// A whole sampling run against a run dump of the reference pipeline (reference/h3x.py, H3X_DUMP_RUN): the same
+/// A whole sampling run against a run dump of the reference pipeline (the reference pipeline's run dump): the same
 /// text conditioning, starting noise and schedule; every step's denoised estimate compared with the reference's,
 /// then the finished latents. `out`: where to write the latents (for the reference's decoders).
 pub fn denoise(e: &Engine, dump_path: &Path, out: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
@@ -461,7 +461,7 @@ pub struct Vaes<'a> {
 
 /// Latents -> a clip: the video decoder (and the audio decoder) on the latents in `latents` (a `.safetensors` with
 /// `samples.video` / `samples.audio`, as `denoise` writes it, or `latents.*`), written to `out` (.mp4). `check`: a
-/// decode dump of the reference (h3x.py H3X_DUMP_DECODE) to compare the frames and the sound with.
+/// decode dump of the reference (the reference pipeline's) to compare the frames and the sound with.
 pub fn decode(dev: &Arc<Device>, threads: usize, latents: &Path, vaes: &Vaes, out: Option<&Path>, check: Option<&Path>, ctl: &mut Ctl) -> Result<Value> {
     let lat = Checkpoint::open(latents)?;
     let key = ["samples.video", "latents.video"].into_iter().find(|k| lat.entries.contains_key(*k)).ok_or("the latents file has no samples.video")?;
@@ -633,7 +633,7 @@ pub fn decode_latents_chain(dev: &Arc<Device>, threads: usize, lat: Latents, vae
     Ok(report)
 }
 
-/// The encoders against a reference encoder dump (h3x.py encdump): the video encoder on a picture and on a clip's
+/// The encoders against a reference encoder dump (the reference pipeline's): the video encoder on a picture and on a clip's
 /// last frames, the audio encoder on a stretch of sound - the same inputs, the latents compared.
 pub fn check_encoders(dev: &Arc<Device>, vae: &Path, audio_vae: &Path, dump_path: &Path, ctl: &mut Ctl) -> Result<Value> {
     let d = Checkpoint::open(dump_path)?;
@@ -775,7 +775,7 @@ pub struct ClipSpec<'a> {
     pub inputs: ClipInputs<'a>,
 }
 
-/// What a clip is anchored to, as the reference's options name them (reference/h3x.py gen --help).
+/// What a clip is anchored to, as the reference's options name them (the reference pipeline's options).
 #[derive(Default)]
 pub struct ClipInputs<'a> {
     /// a previous clip's `.lastlat.safetensors`: its last latent frame pinned at frame 0 (no decode, no codec)

@@ -149,7 +149,7 @@ impl Studio {
             spec["upscale"] = json!(u);
             // "upscaler": an ESRGAN-type network on the decoded frames - general-x4v3 by default (the user's pick,
             // 2026-10-05: sharp and natural on detailed shots, and about half the decode stage's time) - or "latent",
-            // the latent upscaler. h3-core esrgan.rs; the weights from reference/esrgan_to_safetensors.py in
+            // the latent upscaler. h3-core esrgan.rs; the weights from tools/esrgan_to_safetensors.py in
             // models/esrgan (a box without them falls back to the latent upscaler, see jobs.rs).
             let pixel = match item["upscaler"].as_str().unwrap_or("esrgan-general") {
                 "esrgan-anime" => Some("/models/esrgan/realesr-animevideov3.safetensors"),

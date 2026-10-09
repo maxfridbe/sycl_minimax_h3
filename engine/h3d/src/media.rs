@@ -1,5 +1,5 @@
 //! Writing a clip: frames (and sound) -> .mp4, through ffmpeg (H.264 + AAC), the way the reference pipeline writes
-//! its clips (reference/h3x.py `_write_video`): 24 fps, yuv420p, the sound cut or padded to exactly the video's
+//! its clips (the reference pipeline's writer): 24 fps, yuv420p, the sound cut or padded to exactly the video's
 //! length and peak-normalized to -3 dBFS.
 
 use std::io::Write;

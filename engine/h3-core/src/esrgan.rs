@@ -8,7 +8,7 @@
 //! The network, per frame: a 3x3 convolution 3 -> 64, PReLU, then `n` times (3x3 convolution 64 -> 64, PReLU), a 3x3
 //! convolution 64 -> 3 r^2, PixelShuffle(r), plus the input repeated r x r (nearest). The weights are Real-ESRGAN's
 //! release files converted to safetensors with their own names (`body.<i>.weight`, `body.<i>.bias`) by
-//! reference/esrgan_to_safetensors.py. Frames go through a few at a time, channels-last, in IEEE half.
+//! tools/esrgan_to_safetensors.py. Frames go through a few at a time, channels-last, in IEEE half.
 
 use std::sync::Arc;
 

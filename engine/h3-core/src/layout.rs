@@ -258,7 +258,7 @@ mod tests {
     use std::path::Path;
 
     /// Positions and table rows of a real call of the reference pipeline (384x288, 2 s, first step), from
-    /// reference/h3x.py's block dump.
+    /// the PyTorch reference pipeline's block dump.
     fn fixture() -> Checkpoint {
         Checkpoint::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/layout_384x288_2s.safetensors")).unwrap()
     }

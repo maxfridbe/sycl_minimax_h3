@@ -1,7 +1,7 @@
 //! The latent upscaler: video latents [24, T, H, W] -> [24, T, s H, s W] before the video decoder, so a clip
 //! sampled small comes out at s times the resolution without paying the denoiser's cost at that size.
 //!
-//! A convolution network (the LBH-123-AI "3d_conv" pack, as reference/h3x.py runs it): a 3x3x3 convolution to 512
+//! A convolution network (the LBH-123-AI "3d_conv" pack, as the reference pipeline runs it): a 3x3x3 convolution to 512
 //! channels, 12 residual blocks (GroupNorm + SiLU + 3x3x3 convolution, twice, the second norm scaled and shifted
 //! by an embedding of the scale factor) with a temporal depthwise convolution after every other one, a trilinear
 //! resize to the target size, 12 more blocks at that size, a norm and a 3x3x3 convolution back to 24 channels.

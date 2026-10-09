@@ -129,7 +129,7 @@ mod tests {
     fn matches_the_reference_tokenizer() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let tok = Tokenizer::load(&root.join("../../tokenizer")).unwrap();
-        // the reference's ids (reference/tokens.py): two prompts and a set of awkward strings
+        // the reference tokenizer's ids (Hugging Face's, on the same files): a prompt and a set of awkward strings
         let fx: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("tests/data/tokens_reference.json")).unwrap()).unwrap();
         let mut bad = Vec::new();
         for (name, case) in fx.as_object().unwrap() {

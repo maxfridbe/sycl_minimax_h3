@@ -1,9 +1,9 @@
 # Phase 0 results (2026-10-02)
 
-Measured on the B70 with the harness in `reference/`. Clips: the bakery prompt, 768x576, 5 s (124 frames, about 16.5k
+Measured on the B70 with the PyTorch comparison harness (not part of this repository). Clips: the bakery prompt, 768x576, 5 s (124 frames, about 16.5k
 tokens, ~11 s per steady step), seed 0.
 
-## 1. Matrix multiply on the card: int8 against 16-bit float (oneDNN, `reference/gemm_bench.cpp`)
+## 1. Matrix multiply on the card: int8 against 16-bit float (oneDNN, `kernels/gemm_bench.cpp`)
 
 Rates in trillions of multiply-adds per second.
 

@@ -82,7 +82,7 @@ set (oneDNN convolutions, the residual-in-residual dense blocks, pixel shuffle).
       `h3s_resize_area` (adaptive-average area resize to the latent path's exact output size, clamped, planar);
       `h3-core::esrgan::PixelUpscaler` (SRVGGNetCompact, 4 frames a pass, half); jobs take `pixel_upscaler`, `h3d
       decode --pixel-upscaler`, the studio a per-clip `upscaler`: "latent" | "esrgan-anime" | "esrgan-general" (a
-      select beside the factor). Weights: reference/esrgan_to_safetensors.py into models/esrgan.
+      select beside the factor). Weights: tools/esrgan_to_safetensors.py into models/esrgan.
       B65, 124 frames to 1152x864: the network **3.0 s** (animevideov3) / 4.7 s (general-x4v3) after a 14.9 s decode,
       against 5.6 + 36.3 s through the latent upscaler: **17.9 / 19.6 s against 41.9 s**. Frames against the CPU
       PyTorch run: 42.0 / 41.0 dB (half precision, and the CPU run's input was the mp4).
