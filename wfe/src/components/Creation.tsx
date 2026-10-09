@@ -37,7 +37,7 @@ export const form: Form = {
   label: "",
   width: 768,
   height: 576,
-  engine: "Q6_K",
+  engine: "INT8",
   upscale: 1.5,
   upscaler: "esrgan-general",
   chain: false,
@@ -52,7 +52,7 @@ export function useSettings(j: GenerateRequest): void {
   if (j.te) form.te = j.te;
   if (j.width) form.width = j.width;
   if (j.height) form.height = j.height;
-  if (j.engine) form.engine = j.engine;
+  if (j.engine) form.engine = j.engine === "Q8_0" ? "INT8" : j.engine;
   if (j.upscale) form.upscale = j.upscale;
   form.upscaler = j.upscaler ?? "esrgan-general";
   form.label = j.label ?? "";

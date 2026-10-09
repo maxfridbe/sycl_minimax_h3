@@ -11,7 +11,8 @@ export type ErrorCode =
 /** "prev" = previous clip of this series, "first" = the series hub, "*_cam" = same camera only. */
 export type Anchor = "prev" | "prev_cam" | "first" | "first_cam" | (string & {});
 export type ChainMode = "png" | "video" | "latent" | "none";
-export type Engine = "Q4_K_M" | "Q6_K" | "Q8_0";
+/** a denoiser the engine has: INT8 (the default), or a GGUF k-quant it was given (Q6_K, Q4_K_M) */
+export type Engine = string;
 export type ClipState = "done" | "running" | "queued" | "held";
 
 export interface GenerateRequest {
@@ -169,6 +170,8 @@ export interface MeasuredCell {
  *  real clip's step is of them. */
 export interface GpuPlan {
   gpu: number;
+  /** the denoiser measured (INT8 when absent: a plan from before engines) */
+  engine?: string;
   name: string;
   shared: boolean;
   step_scale: number;

@@ -1,7 +1,7 @@
 //! `sycl-h3 plan`: what a denoiser step costs on each of this box's GPUs, measured, for the studio's canvas table
 //! (`/api/plan`, the front end's CanvasPicker).
 //!
-//!     sycl-h3 plan measure [--gpu N ...] [--tokens 2048,4096,...] [--no-clip] [--no-cells]
+//!     sycl-h3 plan measure [--gpu N ...] [--engine NAME ...] [--tokens 2048,4096,...] [--no-clip] [--no-cells]
 //!     sycl-h3 plan show
 //!
 //! For every GPU the engine serves, `measure` queues `bench-blocks` over a range of token counts (the 50 blocks of
@@ -12,6 +12,10 @@
 //! canvas at each of LENGTHS, at the cell's exact token count): the cell's own step time and peak memory, or "over"
 //! when the engine refuses it (it counts its allocations and refuses past its cap - no stall). GPUs run their jobs side by side; one the engine shares
 //! with another program is handed over the usual way (lock file, model switch).
+//!
+//! Each denoiser the engine has (INT8, and the GGUF forms of H3_ENGINES: `--engine NAME` for some) is measured on its
+//! own: one entry per GPU and engine (`"engine"`; an entry without one is INT8, from before). A GPU's jobs are queued
+//! engine after engine, so its worker changes model once per engine.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,9 +111,10 @@ fn clip_steps(job: &Value) -> Option<(f64, Vec<f64>)> {
     Some((tokens, times))
 }
 
-/// One GPU's queued jobs: (tokens, job id) for each bench, and the calibration clip's job.
+/// One GPU's queued jobs for one engine: (tokens, job id) for each bench, and the calibration clip's job.
 struct Queued {
     gpu: u64,
+    engine: String,
     bench: Vec<(u64, u64)>,
     clip: Option<u64>,
     /// the canvas table's cells: (key "WxH|S", tokens, job) - one job per distinct token count
@@ -130,8 +135,8 @@ pub fn run(cfg: &Config, raw: &[String]) -> Result<()> {
                 .map_err(|e| Error(format!("{}: {e}", p.display())))?;
             for g in v["gpus"].as_array().into_iter().flatten() {
                 let scale = g["step_scale"].as_f64().unwrap_or(1.0);
-                println!("GPU {} {} - a clip's step is {scale:.3} x the blocks (from a {:.0}-token clip)", g["gpu"],
-                         g["name"].as_str().unwrap_or("?"), g["clip_tokens"].as_f64().unwrap_or(0.0));
+                println!("GPU {} {}, {} - a clip's step is {scale:.3} x the blocks (from a {:.0}-token clip)", g["gpu"],
+                         g["name"].as_str().unwrap_or("?"), g["engine"].as_str().unwrap_or("INT8"), g["clip_tokens"].as_f64().unwrap_or(0.0));
                 for p in g["points"].as_array().into_iter().flatten() {
                     let (t, s) = (p[0].as_f64().unwrap_or(0.0), p[1].as_f64().unwrap_or(0.0));
                     println!("  {t:>6.0} tokens  {s:6.2} s (blocks)  {:6.2} s per clip step", s * scale);
@@ -144,11 +149,12 @@ pub fn run(cfg: &Config, raw: &[String]) -> Result<()> {
 }
 
 fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
-    let (mut gpus, mut tokens, mut clip, mut cells) = (Vec::<u64>::new(), TOKENS.to_vec(), true, true);
+    let (mut gpus, mut engines, mut tokens, mut clip, mut cells) = (Vec::<u64>::new(), Vec::<String>::new(), TOKENS.to_vec(), true, true);
     let mut it = raw.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--gpu" => gpus.push(it.next().and_then(|v| v.parse().ok()).ok_or("--gpu N")?),
+            "--engine" => engines.push(it.next().ok_or("--engine NAME")?.to_uppercase()),
             "--tokens" => {
                 tokens = it.next().ok_or("--tokens 2048,4096,...")?.split(',').map(|v| v.trim().parse().map_err(|_| Error(format!("{v}: not a token count")))).collect::<Result<_>>()?
             }
@@ -162,15 +168,25 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
     if gpus.is_empty() {
         gpus = served.iter().filter_map(|g| g["gpu"].as_u64()).collect();
     }
+    let have: Vec<String> = status["engines"].as_array().into_iter().flatten().filter_map(|e| e["name"].as_str().map(str::to_string)).collect();
+    let have = if have.is_empty() { vec!["INT8".to_string()] } else { have };
+    if engines.is_empty() {
+        engines = have.clone();
+    }
+    if let Some(bad) = engines.iter().find(|e| !have.contains(e)) {
+        return Err(Error(format!("--engine {bad}: the engine has {have:?}")));
+    }
     // every job first, so the GPUs measure side by side
     let mut queued: Vec<Queued> = Vec::new();
     for &g in &gpus {
-        let bench = tokens.iter().map(|&t| Ok((t, add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g}))?))).collect::<Result<Vec<_>>>()?;
+      for engine in &engines {
+        let en = engine.as_str();
+        let bench = tokens.iter().map(|&t| Ok((t, add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g, "engine": en}))?))).collect::<Result<Vec<_>>>()?;
         let c = if clip {
             let (w, h, s, steps) = CLIP;
-            Some(add(json!({"kind": "generate", "gpu": g, "prompt": "a lighthouse on a cliff at dusk, waves breaking below, a slow push in",
+            Some(add(json!({"kind": "generate", "gpu": g, "engine": en, "prompt": "a lighthouse on a cliff at dusk, waves breaking below, a slow push in",
                             "width": w, "height": h, "seconds": s, "steps": steps, "seed": 0, "upscale": 1,
-                            "out": format!("/out/plan-measure-gpu{g}.mp4")}))?)
+                            "out": format!("/out/plan-measure-gpu{g}-{en}.mp4")}))?)
         } else {
             None
         };
@@ -183,7 +199,7 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
                     let id = match by_tokens.get(&t) {
                         Some(id) => *id,
                         None => {
-                            let id = add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g}))?;
+                            let id = add(json!({"kind": "bench-blocks", "tokens": t, "gpu": g, "engine": en}))?;
                             by_tokens.insert(t, id);
                             id
                         }
@@ -192,17 +208,19 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
                 }
             }
         }
-        eprintln!("GPU {g}: {} bench jobs{}{} queued", bench.len(), if c.is_some() { ", a calibration clip" } else { "" },
+        eprintln!("GPU {g}, {en}: {} bench jobs{}{} queued", bench.len(), if c.is_some() { ", a calibration clip" } else { "" },
                   if cells { ", the canvas table's cells" } else { "" });
-        queued.push(Queued { gpu: g, bench, clip: c, cells: cell_jobs });
+        queued.push(Queued { gpu: g, engine: engine.clone(), bench, clip: c, cells: cell_jobs });
+      }
     }
     let mut out = Vec::new();
-    for Queued { gpu: g, bench, clip: c, cells: cell_jobs } in queued {
+    for Queued { gpu: g, engine, bench, clip: c, cells: cell_jobs } in queued {
+        let who = format!("GPU {g}, {engine}");
         let mut points = Vec::new();
         for (t, id) in bench {
             let j = wait(id)?;
             let s = j["result"]["seconds"].as_f64().ok_or_else(|| Error(format!("job {id}: no seconds in its result")))?;
-            eprintln!("GPU {g}: {t:>6} tokens  {s:6.2} s/step (blocks), {:.1} GiB", j["result"]["gib_in_use"].as_f64().unwrap_or(0.0));
+            eprintln!("{who}: {t:>6} tokens  {s:6.2} s/step (blocks), {:.1} GiB", j["result"]["gib_in_use"].as_f64().unwrap_or(0.0));
             points.push((t as f64, s));
         }
         points.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -214,7 +232,7 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
             let steady = median(if times.len() > 1 { times[1..].to_vec() } else { times });
             scale = steady / interp(&points, t);
             ctok = json!(t);
-            eprintln!("GPU {g}: a {t}-token clip steps in {steady:.2} s: {scale:.3} x the blocks");
+            eprintln!("{who}: a {t}-token clip steps in {steady:.2} s: {scale:.3} x the blocks");
         }
         // the cells: the bench of each distinct token count once, read for every cell that has it
         let mut cell_out = serde_json::Map::new();
@@ -227,16 +245,16 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
                         Ok(j) => {
                             let s = j["result"]["seconds"].as_f64().unwrap_or(0.0) * scale;
                             let gib = j["result"]["gib_in_use"].as_f64().unwrap_or(0.0);
-                            eprintln!("GPU {g}: cell tokens {t:>6}: {s:6.2} s per clip step, {gib:.1} GiB");
+                            eprintln!("{who}: cell tokens {t:>6}: {s:6.2} s per clip step, {gib:.1} GiB");
                             json!({"tokens": t, "s_per_step": (s * 100.0).round() / 100.0, "gib": (gib * 10.0).round() / 10.0})
                         }
                         // only the engine's refusal of the size is "over"; anything else (a stopped daemon) ends the run
                         // rather than writing a table of false overs
                         Err(e) if e.0.contains("cap") || e.0.contains("memory") || e.0.contains("refused") => {
-                            eprintln!("GPU {g}: cell tokens {t:>6}: does not fit ({e})");
+                            eprintln!("{who}: cell tokens {t:>6}: does not fit ({e})");
                             json!({"tokens": t, "over": true})
                         }
-                        Err(e) => return Err(Error(format!("GPU {g}, a cell of {t} tokens: {e} - nothing written"))),
+                        Err(e) => return Err(Error(format!("{who}, a cell of {t} tokens: {e} - nothing written"))),
                     };
                     seen.insert(t, v.clone());
                     v
@@ -247,7 +265,7 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
         let name = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).and_then(|s| s["name"].as_str()).unwrap_or("?").to_string();
         let shared = served.iter().find(|s| s["gpu"].as_u64() == Some(g)).map(|s| s["shared"] == true).unwrap_or(false);
         let (a, b) = fit(&points.iter().map(|&(t, s)| (t, s * scale)).collect::<Vec<_>>());
-        out.push(json!({"gpu": g, "name": name, "shared": shared, "step_scale": scale, "clip_tokens": ctok,
+        out.push(json!({"gpu": g, "engine": engine, "name": name, "shared": shared, "step_scale": scale, "clip_tokens": ctok,
                         "points": points.iter().map(|&(t, s)| json!([t, s])).collect::<Vec<_>>(), "step_a": a, "step_b": b,
                         "cells": Value::Object(cell_out)}));
     }
@@ -255,12 +273,18 @@ fn measure(cfg: &Config, raw: &[String]) -> Result<()> {
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
-    // keep the GPUs measured before that this run did not cover
+    // keep the (GPU, engine) entries measured before that this run did not cover
+    let covered = |o: &Value| gpus.contains(&o["gpu"].as_u64().unwrap_or(u64::MAX)) && engines.iter().any(|e| e == o["engine"].as_str().unwrap_or("INT8"));
     let mut all: Vec<Value> = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|v| v["gpus"].as_array().cloned()).unwrap_or_default()
-        .into_iter().filter(|o| !gpus.contains(&o["gpu"].as_u64().unwrap_or(u64::MAX))).collect();
+        .into_iter().filter(|o| !covered(o)).collect();
     all.extend(out);
-    all.sort_by_key(|g| g["gpu"].as_u64().unwrap_or(0));
+    for o in &mut all {
+        if o["engine"].is_null() {
+            o["engine"] = json!("INT8");
+        }
+    }
+    all.sort_by_key(|g| (g["gpu"].as_u64().unwrap_or(0), g["engine"].as_str().unwrap_or("").to_string()));
     let text = serde_json::to_string_pretty(&json!({"measured": now(), "gpus": all})).map_err(|e| Error(e.to_string()))?;
     std::fs::write(&p, text + "\n")?;
     println!("written to {}", p.display());

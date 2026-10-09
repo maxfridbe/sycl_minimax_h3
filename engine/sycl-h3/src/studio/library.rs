@@ -343,8 +343,8 @@ impl Studio {
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .and_then(|v| v["gpus"].as_array().cloned())
             .unwrap_or_default();
-        // the single curve older front ends read: the fastest GPU's
-        let fastest = gpus.iter().min_by(|a, b| a["step_a"].as_f64().unwrap_or(1.0).total_cmp(&b["step_a"].as_f64().unwrap_or(1.0)));
+        // the single curve older front ends read: the fastest GPU's, with the default denoiser
+        let fastest = gpus.iter().filter(|g| g["engine"].as_str().unwrap_or("INT8") == "INT8").min_by(|a, b| a["step_a"].as_f64().unwrap_or(1.0).total_cmp(&b["step_a"].as_f64().unwrap_or(1.0)));
         let (a, b) = fastest.map(|g| (g["step_a"].as_f64().unwrap_or(1.829e-8), g["step_b"].as_f64().unwrap_or(3.4634e-4))).unwrap_or((1.829e-8, 3.4634e-4));
         json!({"engines": self.engines(), "canvases": self.canvases(),
                "defaults": {"seconds": 10, "steps": 10, "width": 768, "height": 576, "engine": "INT8"},

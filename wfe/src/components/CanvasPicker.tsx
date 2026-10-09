@@ -1,11 +1,9 @@
-/** Resolution and engine as one grid, rather than two dropdowns that can disagree.
- *
- *  A row is a canvas, sorted by pixel count; a column is a denoiser quantization. Each cell
- *  shows what that combination costs to render at the current clip length, and cells that
- *  will not fit in VRAM are disabled rather than hidden, so the shape of the wall is visible.
- *  Cells we have actually run are served from measured timings and marked; the rest come
- *  from the model the server publishes at /api/plan. When the box's GPUs have been measured
- *  (`sycl-h3 plan measure`), each engine gets a column per GPU, timed from that GPU's curve.
+/** Canvas and clip length as one grid: a row is a canvas, sorted by pixel count; a column is a clip length. Each
+ *  cell shows what that combination costs (seconds of GPU per second of video) and its peak VRAM; cells that will
+ *  not fit are disabled rather than hidden, so the shape of the wall is visible. Two switches above it: the GPU,
+ *  and the denoiser (INT8, or a GGUF k-quant that holds less of the card - more cells fit, slower steps). The
+ *  numbers are the cells `sycl-h3 plan measure` ran on that GPU with that denoiser; unmeasured pairs fall back to
+ *  the plan's own curve.
  */
 import { jsx } from "../jsx.js";
 import { render, state } from "../state.js";
@@ -95,25 +93,40 @@ export function CanvasPicker(props: CanvasPickerProps) {
   if (!engines.length) return <div class="hint">no denoiser weights found on the box</div>;
   const engine = engines.find((e) => e.quant === props.engine) ?? engines[0]!;
 
-  // the GPU: the one picked, else the fastest measured (lowest quadratic term); none measured: the plan's own curve
-  const gpus = plan.gpus ?? [];
-  const fastest = gpus.reduce<GpuPlan | undefined>((a, g) => (!a || g.step_a < a.step_a ? g : a), undefined);
-  const gpu = gpus.find((g) => g.gpu === state.pickGpu) ?? fastest;
+  // the GPU: the one picked, else the fastest measured (lowest quadratic term); then that GPU's entry for the
+  // chosen denoiser - none measured for it: the plan's own curve
+  const all = plan.gpus ?? [];
+  const eng = (g: GpuPlan) => g.engine ?? "INT8";
+  const cards = all.filter((g, i) => all.findIndex((o) => o.gpu === g.gpu) === i);
+  const fastest = all.filter((g) => eng(g) === "INT8").reduce<GpuPlan | undefined>((a, g) => (!a || g.step_a < a.step_a ? g : a), undefined);
+  const card = state.pickGpu ?? fastest?.gpu ?? cards[0]?.gpu;
+  const gpu = all.find((g) => g.gpu === card && eng(g) === engine.quant);
+  const cardInfo = cards.find((g) => g.gpu === card);
   const short = (n: string) => n.replace(/^Intel\(R\) Arc\(TM\) /, "").replace(/ Graphics$/, "");
   const sw = (
     <div class="gpusw">
       <span class="k"><span class="i dim" props={{ innerHTML: "&#xf2db;" }} /> gpu</span>
-      {gpus.length
-        ? gpus.map((g) => (
+      {cards.length
+        ? cards.map((g) => (
           <button
             type="button"
-            class={{ on: g === gpu }}
-            attrs={{ title: `GPU ${g.gpu}${g.shared ? ", shared with the chat model" : ""} · a clip's step = ${g.step_scale.toFixed(2)} x the measured blocks` }}
+            class={{ on: g.gpu === card }}
+            attrs={{ title: `GPU ${g.gpu}${g.shared ? ", shared with the chat model" : ""}` }}
             on={{ click: () => { state.pickGpu = g.gpu; render(); } }}
           >{`${short(g.name)}${g.shared ? " (shared)" : ""}`}</button>
         ))
         : <span class="hint">not measured yet (sycl-h3 plan measure)</span>}
-      <span class="hint">{`engine ${engine.quant}`}</span>
+      <span class="k"><span class="i dim" props={{ innerHTML: "&#xf1c0;" }} /> denoiser</span>
+      {engines.map((e) => (
+        <button
+          type="button"
+          class={{ on: e === engine }}
+          attrs={{ title: `${e.file} · ${e.gib} GiB of weights${all.some((g) => g.gpu === card && eng(g) === e.quant) ? "" : " · not measured on this GPU"}` +
+            (e.quant === "INT8" ? " · the fastest steps" : " · a GGUF k-quant: less of the card, so longer clips fit; slower steps, and a different take on the same prompt") }}
+          on={{ click: () => props.onPick(props.width, props.height, e.quant, props.seconds) }}
+        >{`${e.quant} ${e.gib}G`}</button>
+      ))}
+      {cardInfo && !gpu ? <span class="hint">{`${engine.quant} not measured on this GPU: estimates`}</span> : null}
     </div>
   );
 
