@@ -9,7 +9,7 @@
 //! - `speechpct`: how much of each clip is speech.
 //!
 //! They are the legacy Python tools, ported (docs/LEGACY-API.md); two of their bugs are fixed: abbreviations
-//! ("Dr. Soong") no longer end a sentence, and `--paused` holds the project before its first clip is queued.
+//! ("Dr. Hale") no longer end a sentence, and `--paused` holds the project before its first clip is queued.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -592,10 +592,10 @@ mod tests {
 
     #[test]
     fn speech_cutting() {
-        let t = "I am Data. I was built by Dr. Soong, who gave me a cat, Spot, and a violin, which I play every evening at exactly seven. || Then I read. ||| The end.";
+        let t = "I am Ada. I was taught by Dr. Hale, who gave me a cat, Pip, and a violin, which I play every evening at exactly seven. || Then I read. ||| The end.";
         let l = speech_lines(t, "||", 12, 5);
-        // "Dr. Soong" does not end a sentence; the long sentence splits at commas, no stranded fragments; ||| breaks hard
-        assert!(l.iter().any(|x| x.contains("Dr. Soong")), "{l:?}");
+        // "Dr. Hale" does not end a sentence; the long sentence splits at commas, no stranded fragments; ||| breaks hard
+        assert!(l.iter().any(|x| x.contains("Dr. Hale")), "{l:?}");
         assert_eq!(l.last().unwrap(), "The end.");
         assert!(l.iter().all(|x| wc(x) <= 14), "{l:?}");
         assert_eq!(snap(4.0), 107.0 / 24.0);

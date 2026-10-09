@@ -2,6 +2,11 @@
 
 **MiniMax H3** (text / image -> video with sound) as a native engine for the **Intel Arc Pro B70** (32 GB, Xe2).
 
+> This engine also ships, moved in whole, as the video kind of [nextsycl](https://github.com/maxfridbe/nextsycl)
+> (`nextsycl video start | serve | job | ps | speech | scene | join | plan ...`): the same engine, daemon, studio and
+> tools beside nextsycl's language and image models, its models from nextsycl's catalog. Checked against this
+> repository's `h3d` on the B70: the same clips (within H3's own run-to-run spread) at the same speed.
+
 ## The goal
 
 H3 ran on the B70 through PyTorch and ComfyUI's model code: it works, but a 15-second clip takes about 14 minutes,

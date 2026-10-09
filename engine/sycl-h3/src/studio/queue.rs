@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(label_prefix("Borg Goodnight 03/12: I am"), "Borg Goodnight");
-        assert_eq!(label_number("Borg Goodnight 03/12: I am"), Some(3));
+        assert_eq!(label_prefix("Harbour Night 03/12: the lamp"), "Harbour Night");
+        assert_eq!(label_number("Harbour Night 03/12: the lamp"), Some(3));
         assert_eq!(label_number("no number"), None);
         assert_eq!(project_of(&json!({"label": "Speech 07/20: words"})), "Speech");
         assert_eq!(project_of(&json!({"label": "x", "project": "P"})), "P");
